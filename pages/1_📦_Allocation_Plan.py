@@ -60,6 +60,12 @@ if 'show_advanced_filters' not in st.session_state:
     st.session_state.show_advanced_filters = False
 if 'user_id' not in st.session_state:
     st.session_state.user_id = st.session_state.get('authenticated_user_id', 1)
+if 'show_allocation_history' not in st.session_state:
+    st.session_state.show_allocation_history = False
+if 'selected_oc_for_history' not in st.session_state:
+    st.session_state.selected_oc_for_history = None
+if 'selected_oc_info' not in st.session_state:
+    st.session_state.selected_oc_info = None
 
 # Initialize multiselect states
 if 'selected_customers' not in st.session_state:
@@ -753,7 +759,7 @@ def show_product_demand_details(product_id):
         return
     
     # Add headers for the OC table
-    header_cols = st.columns([2, 2, 1, 1, 1, 1.5])
+    header_cols = st.columns([2, 2, 1, 1, 1.5, 1.5])
     with header_cols[0]:
         st.markdown("**OC Number**")
     with header_cols[1]:
@@ -763,13 +769,13 @@ def show_product_demand_details(product_id):
     with header_cols[3]:
         st.markdown("**Pending Qty**")
     with header_cols[4]:
-        st.markdown("**Allocated %**")
+        st.markdown("**Total Allocated**")
     with header_cols[5]:
         st.markdown("**Action**")
     
     # Create OC table rows
     for idx, oc in ocs_df.iterrows():
-        cols = st.columns([2, 2, 1, 1, 1, 1.5])
+        cols = st.columns([2, 2, 1, 1, 1.5, 1.5])
         
         with cols[0]:
             st.text(f"📄 {oc['oc_number']}")
@@ -790,20 +796,134 @@ def show_product_demand_details(product_id):
             st.text(f"{etd_color} {format_date(oc['etd'])}")
         
         with cols[3]:
-            st.text(f"{format_number(oc['pending_quantity'])}")
+            # Show pending quantity with UOM
+            st.text(f"{format_number(oc['pending_quantity'])} {oc.get('selling_uom', '')}")
         
         with cols[4]:
-            if oc['allocated_quantity'] > 0:
-                coverage = (oc['allocated_quantity'] / oc['pending_quantity'] * 100)
-                st.text(f"{format_percentage(coverage)}")
+            # Show total allocated quantity with clickable button
+            allocated_qty = oc.get('allocated_quantity', 0)
+            allocation_count = oc.get('allocation_count', 0)
+            
+            if allocated_qty > 0:
+                button_label = f"{format_number(allocated_qty)} {oc.get('selling_uom', '')}"
+                if allocation_count > 1:
+                    button_label += f" ({allocation_count})"
+                
+                if st.button(
+                    button_label, 
+                    key=f"view_alloc_{oc['ocd_id']}", 
+                    help=f"Click to view {allocation_count} allocation(s)",
+                    use_container_width=True
+                ):
+                    st.session_state.show_allocation_history = True
+                    st.session_state.selected_oc_for_history = oc['ocd_id']
+                    st.session_state.selected_oc_info = {
+                        'oc_number': oc['oc_number'],
+                        'customer': oc['customer'],
+                        'product_name': oc['product_name'],
+                        'selling_uom': oc.get('selling_uom', '')
+                    }
+                    st.rerun()
             else:
-                st.text("0%")
+                st.text(f"0 {oc.get('selling_uom', '')}")
         
         with cols[5]:
             if st.button("Allocate", key=f"alloc_oc_{oc['ocd_id']}", use_container_width=True, type="primary"):
                 st.session_state.selected_oc_for_allocation = oc.to_dict()
                 st.session_state.show_allocation_modal = True
                 st.rerun()
+
+@st.dialog("Allocation History", width="large")
+def show_allocation_history_modal():
+    """Show allocation history for selected OC"""
+    if 'selected_oc_for_history' not in st.session_state:
+        st.error("No OC selected")
+        return
+    
+    oc_detail_id = st.session_state.selected_oc_for_history
+    oc_info = st.session_state.selected_oc_info
+    
+    # Header
+    st.markdown(f"### Allocation History for {oc_info['oc_number']}")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        st.caption(f"**Customer:** {oc_info['customer']}")
+    with col2:
+        st.caption(f"**Product:** {oc_info['product_name']}")
+    
+    st.divider()
+    
+    # Get allocation history
+    history_df = data_service.get_allocation_history(oc_detail_id)
+    
+    if history_df.empty:
+        st.info("No allocation history found")
+    else:
+        # Display each allocation
+        for idx, alloc in history_df.iterrows():
+            with st.container():
+                # Allocation header with status color
+                status_color = {
+                    'ALLOCATED': '🟢',
+                    'DRAFT': '🟡',
+                    'CANCELLED': '🔴'
+                }.get(alloc['status'], '⚪')
+                
+                col1, col2, col3 = st.columns([2, 1, 1])
+                with col1:
+                    st.markdown(f"{status_color} **{alloc['allocation_number']}**")
+                with col2:
+                    st.caption(f"Mode: {alloc['allocation_mode']}")
+                with col3:
+                    st.caption(f"Status: {alloc['status']}")
+                
+                # Allocation details
+                detail_cols = st.columns([1, 1, 1, 1])
+                
+                uom = oc_info.get('selling_uom', '')
+                
+                with detail_cols[0]:
+                    st.metric("Allocated Qty", f"{format_number(alloc['allocated_qty'])} {uom}")
+                
+                with detail_cols[1]:
+                    st.metric("Effective Qty", f"{format_number(alloc['effective_qty'])} {uom}")
+                
+                with detail_cols[2]:
+                    st.metric("Delivered Qty", f"{format_number(alloc['delivered_qty'])} {uom}")
+                
+                with detail_cols[3]:
+                    st.metric("Cancelled Qty", f"{format_number(alloc['cancelled_qty'])} {uom}")
+                
+                # Additional info
+                info_cols = st.columns([1, 1, 1])
+                
+                with info_cols[0]:
+                    st.caption(f"📅 **Date:** {format_date(alloc['allocation_date'])}")
+                
+                with info_cols[1]:
+                    st.caption(f"📅 **Allocated ETD:** {format_date(alloc['allocated_etd'])}")
+                
+                with info_cols[2]:
+                    st.caption(f"👤 **Created by:** {alloc['created_by']}")
+                
+                # Supply source and notes
+                st.caption(f"📦 **Source:** {alloc['supply_source_type']}")
+                
+                if alloc.get('notes'):
+                    st.caption(f"📝 **Notes:** {alloc['notes']}")
+                
+                if alloc.get('cancellation_info'):
+                    st.warning(f"⚠️ {alloc['cancellation_info']}")
+                
+                st.divider()
+    
+    # Close button
+    if st.button("Close", use_container_width=True):
+        st.session_state.show_allocation_history = False
+        st.session_state.selected_oc_for_history = None
+        st.session_state.selected_oc_info = None
+        st.rerun()
 
 def show_product_supply_details(product_id):
     """Show supply sources for a product"""
@@ -1077,3 +1197,7 @@ show_product_list()
 # Show allocation modal if needed
 if st.session_state.show_allocation_modal:
     show_allocation_modal()
+
+# Show allocation history modal if needed
+if st.session_state.show_allocation_history:
+    show_allocation_history_modal()

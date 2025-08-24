@@ -562,10 +562,12 @@ class AllocationDataService:
                     selling_uom,
                     standard_uom,
                     effective_allocated_qty as allocated_quantity,
+                    total_allocated_qty_standard as allocated_quantity_standard,
                     outstanding_amount_usd,
                     allocation_coverage_percent,
                     is_allocated,
-                    allocation_numbers
+                    allocation_numbers,
+                    allocation_count
                 FROM outbound_oc_pending_delivery_view
                 WHERE product_id = :product_id
                 AND pending_selling_delivery_quantity > 0
@@ -583,6 +585,53 @@ class AllocationDataService:
             
         except Exception as e:
             logger.error(f"Error loading OCs for product {product_id}: {e}")
+            return pd.DataFrame()
+    
+    def get_allocation_history(_self, oc_detail_id: int) -> pd.DataFrame:
+        """Get allocation history for an OC detail"""
+        try:
+            query = """
+                SELECT 
+                    ap.allocation_number,
+                    ap.allocation_date,
+                    u.username as created_by,
+                    ad.allocation_mode,
+                    ad.allocated_qty,
+                    ad.delivered_qty,
+                    ad.allocated_etd,
+                    ad.status,
+                    COALESCE(ad.supply_source_type, 'No specific source') as supply_source_type,
+                    ad.notes,
+                    COALESCE(ac.cancelled_qty, 0) as cancelled_qty,
+                    (ad.allocated_qty - COALESCE(ac.cancelled_qty, 0)) as effective_qty,
+                    CASE 
+                        WHEN ac.cancelled_qty > 0 THEN 
+                            CONCAT('Cancelled: ', ac.cancelled_qty, ' - ', ac.reason)
+                        ELSE ''
+                    END as cancellation_info
+                FROM allocation_details ad
+                INNER JOIN allocation_plans ap ON ad.allocation_plan_id = ap.id
+                LEFT JOIN users u ON ap.creator_id = u.id
+                LEFT JOIN (
+                    SELECT 
+                        allocation_detail_id,
+                        SUM(CASE WHEN status = 'ACTIVE' THEN cancelled_qty ELSE 0 END) as cancelled_qty,
+                        MAX(CASE WHEN status = 'ACTIVE' THEN reason ELSE NULL END) as reason
+                    FROM allocation_cancellations
+                    GROUP BY allocation_detail_id
+                ) ac ON ad.id = ac.allocation_detail_id
+                WHERE ad.demand_reference_id = :oc_detail_id
+                AND ad.demand_type = 'OC'
+                ORDER BY ap.allocation_date DESC
+            """
+            
+            with _self.engine.connect() as conn:
+                df = pd.read_sql(text(query), conn, params={'oc_detail_id': oc_detail_id})
+            
+            return df
+            
+        except Exception as e:
+            logger.error(f"Error loading allocation history: {e}")
             return pd.DataFrame()
     
     @st.cache_data(ttl=60)
