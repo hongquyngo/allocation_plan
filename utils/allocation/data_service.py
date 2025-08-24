@@ -1,11 +1,11 @@
 """
-Data Service for Allocation Module - Product Centric View
-Optimized queries for product-first approach
+Data Service for Allocation Module - Multiselect Filter Version
+Enhanced with multiselect and exclude/include logic
 """
 import pandas as pd
 from datetime import datetime, timedelta
 import logging
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 import streamlit as st
 from sqlalchemy import text
 
@@ -16,35 +16,140 @@ logger = logging.getLogger(__name__)
 
 
 class AllocationDataService:
-    """Service for fetching allocation-related data with product-centric approach"""
+    """Service for fetching allocation-related data with multiselect filters"""
     
     def __init__(self):
         self.engine = get_db_engine()
         self.cache_ttl = config.get_app_setting('CACHE_TTL_SECONDS', 300)
-        
-        # Log database connection info for debugging
-        try:
-            with self.engine.connect() as conn:
-                result = conn.execute(text("SELECT DATABASE()")).fetchone()
-                logger.info(f"Connected to database: {result[0] if result else 'Unknown'}")
-        except Exception as e:
-            logger.error(f"Error checking database connection: {e}")
     
-    # ==================== Product-Centric Queries ====================
+    # ==================== Reference Data for Multiselect ====================
+    
+    @st.cache_data(ttl=3600)
+    def get_customer_list_with_stats(_self) -> pd.DataFrame:
+        """Get list of customers with order statistics for filter"""
+        try:
+            query = """
+                SELECT DISTINCT 
+                    c.company_code as customer_code,
+                    c.english_name as customer_name,
+                    COUNT(DISTINCT ocpd.ocd_id) as order_count,
+                    COUNT(DISTINCT ocpd.product_id) as product_count
+                FROM companies c
+                INNER JOIN outbound_oc_pending_delivery_view ocpd 
+                    ON c.company_code = ocpd.customer_code
+                WHERE c.delete_flag = 0
+                AND ocpd.pending_standard_delivery_quantity > 0
+                GROUP BY c.company_code, c.english_name
+                ORDER BY c.english_name
+            """
+            
+            with _self.engine.connect() as conn:
+                df = pd.read_sql(text(query), conn)
+            
+            return df
+            
+        except Exception as e:
+            logger.error(f"Error loading customer list: {e}")
+            return pd.DataFrame()
+    
+    @st.cache_data(ttl=3600)
+    def get_brand_list_with_stats(_self) -> pd.DataFrame:
+        """Get list of brands with product count for filter"""
+        try:
+            query = """
+                SELECT DISTINCT 
+                    b.id as brand_id,
+                    b.brand_name,
+                    COUNT(DISTINCT p.id) as product_count,
+                    COUNT(DISTINCT ocpd.ocd_id) as order_count
+                FROM brands b
+                INNER JOIN products p ON b.id = p.brand_id
+                INNER JOIN outbound_oc_pending_delivery_view ocpd 
+                    ON ocpd.product_id = p.id
+                WHERE b.delete_flag = 0
+                AND ocpd.pending_standard_delivery_quantity > 0
+                GROUP BY b.id, b.brand_name
+                ORDER BY b.brand_name
+            """
+            
+            with _self.engine.connect() as conn:
+                df = pd.read_sql(text(query), conn)
+            
+            return df
+            
+        except Exception as e:
+            logger.error(f"Error loading brand list: {e}")
+            return pd.DataFrame()
+    
+    @st.cache_data(ttl=3600)
+    def get_oc_number_list(_self) -> pd.DataFrame:
+        """Get list of OC numbers with details for filter"""
+        try:
+            query = """
+                SELECT DISTINCT 
+                    oc_number,
+                    customer,
+                    COUNT(DISTINCT product_id) as product_count,
+                    SUM(pending_standard_delivery_quantity) as total_pending_qty,
+                    MIN(etd) as earliest_etd
+                FROM outbound_oc_pending_delivery_view
+                WHERE pending_standard_delivery_quantity > 0
+                GROUP BY oc_number, customer
+                ORDER BY oc_number DESC
+                LIMIT 500  -- Limit to prevent too many options
+            """
+            
+            with _self.engine.connect() as conn:
+                df = pd.read_sql(text(query), conn)
+            
+            return df
+            
+        except Exception as e:
+            logger.error(f"Error loading OC number list: {e}")
+            return pd.DataFrame()
+    
+    @st.cache_data(ttl=3600)
+    def get_product_list_for_filter(_self) -> pd.DataFrame:
+        """Get list of products (PT code + name) for filter"""
+        try:
+            query = """
+                SELECT DISTINCT 
+                    p.id as product_id,
+                    p.pt_code,
+                    p.name as product_name,
+                    b.brand_name,
+                    COUNT(DISTINCT ocpd.ocd_id) as order_count
+                FROM products p
+                LEFT JOIN brands b ON p.brand_id = b.id
+                INNER JOIN outbound_oc_pending_delivery_view ocpd 
+                    ON ocpd.product_id = p.id
+                WHERE p.delete_flag = 0
+                AND ocpd.pending_standard_delivery_quantity > 0
+                GROUP BY p.id, p.pt_code, p.name, b.brand_name
+                ORDER BY p.pt_code, p.name
+                LIMIT 1000  -- Limit to prevent too many options
+            """
+            
+            with _self.engine.connect() as conn:
+                df = pd.read_sql(text(query), conn)
+            
+            # Create display name combining PT code and product name
+            df['display_name'] = df['pt_code'] + ' - ' + df['product_name']
+            
+            return df
+            
+        except Exception as e:
+            logger.error(f"Error loading product list: {e}")
+            return pd.DataFrame()
+    
+    # ==================== Enhanced Search with Multiselect ====================
     
     @st.cache_data(ttl=300)
     def get_products_with_demand_supply(_self, filters: Dict = None, 
                                        page: int = 1, page_size: int = 50) -> pd.DataFrame:
         """
         Get products with aggregated demand and supply information
-        
-        Args:
-            filters: Filter criteria (search, supply_status, etc.)
-            page: Page number for pagination
-            page_size: Items per page
-            
-        Returns:
-            DataFrame with product-level aggregated data
+        Enhanced with multiselect and exclude/include logic
         """
         try:
             # Build WHERE conditions
@@ -55,42 +160,105 @@ class AllocationDataService:
                 'limit': page_size
             }
             
-            # Debug log
-            logger.info(f"Building query with filters: {filters}")
-            
             # Apply filters
             if filters:
-                # Search filter
+                # Search filter (single value)
                 if filters.get('search'):
-                    search_term = f"%{filters['search']}%"
+                    search_term = filters['search'].strip()
+                    search_pattern = f"%{search_term}%"
+                    params['search_pattern'] = search_pattern
+                    
                     where_conditions.append("""
-                        (p.name LIKE :search OR 
-                         p.pt_code LIKE :search OR 
-                         EXISTS (
-                            SELECT 1 FROM outbound_oc_pending_delivery_view ocpd
-                            WHERE ocpd.product_id = p.id 
-                            AND ocpd.customer LIKE :search
-                         ))
-                    """)
-                    params['search'] = search_term
-                
-                # Customer filter
-                if filters.get('customer'):
-                    where_conditions.append("""
-                        EXISTS (
-                            SELECT 1 FROM outbound_oc_pending_delivery_view ocpd
-                            WHERE ocpd.product_id = p.id 
-                            AND ocpd.customer_code = :customer_code
+                        (
+                            p.name LIKE :search_pattern OR 
+                            p.pt_code LIKE :search_pattern OR
+                            p.package_size LIKE :search_pattern OR
+                            b.brand_name LIKE :search_pattern OR
+                            EXISTS (
+                                SELECT 1 FROM outbound_oc_pending_delivery_view ocpd
+                                WHERE ocpd.product_id = p.id 
+                                AND (
+                                    ocpd.customer LIKE :search_pattern OR 
+                                    ocpd.oc_number LIKE :search_pattern
+                                )
+                            )
                         )
                     """)
-                    params['customer_code'] = filters['customer']
                 
-                # Brand filter
-                if filters.get('brand'):
-                    where_conditions.append("p.brand_id = :brand_id")
-                    params['brand_id'] = filters['brand']
+                # Customer multiselect filter
+                if filters.get('customers'):
+                    customer_list = filters['customers']
+                    exclude_customers = filters.get('exclude_customers', False)
+                    
+                    if customer_list:
+                        # Create parameter names for each customer
+                        customer_params = []
+                        for i, customer in enumerate(customer_list):
+                            param_name = f'customer_{i}'
+                            params[param_name] = customer
+                            customer_params.append(f':{param_name}')
+                        
+                        customer_condition = f"""
+                            EXISTS (
+                                SELECT 1 FROM outbound_oc_pending_delivery_view ocpd
+                                WHERE ocpd.product_id = p.id 
+                                AND ocpd.customer_code {'NOT' if exclude_customers else ''} IN ({','.join(customer_params)})
+                            )
+                        """
+                        where_conditions.append(customer_condition)
                 
-                # ETD days filter
+                # Brand multiselect filter
+                if filters.get('brands'):
+                    brand_list = filters['brands']
+                    exclude_brands = filters.get('exclude_brands', False)
+                    
+                    if brand_list:
+                        brand_params = []
+                        for i, brand in enumerate(brand_list):
+                            param_name = f'brand_{i}'
+                            params[param_name] = brand
+                            brand_params.append(f':{param_name}')
+                        
+                        brand_condition = f"p.brand_id {'NOT' if exclude_brands else ''} IN ({','.join(brand_params)})"
+                        where_conditions.append(brand_condition)
+                
+                # OC Number multiselect filter
+                if filters.get('oc_numbers'):
+                    oc_list = filters['oc_numbers']
+                    exclude_ocs = filters.get('exclude_oc_numbers', False)
+                    
+                    if oc_list:
+                        oc_params = []
+                        for i, oc in enumerate(oc_list):
+                            param_name = f'oc_{i}'
+                            params[param_name] = oc
+                            oc_params.append(f':{param_name}')
+                        
+                        oc_condition = f"""
+                            EXISTS (
+                                SELECT 1 FROM outbound_oc_pending_delivery_view ocpd
+                                WHERE ocpd.product_id = p.id 
+                                AND ocpd.oc_number {'NOT' if exclude_ocs else ''} IN ({','.join(oc_params)})
+                            )
+                        """
+                        where_conditions.append(oc_condition)
+                
+                # Product (PT code) multiselect filter
+                if filters.get('products'):
+                    product_list = filters['products']
+                    exclude_products = filters.get('exclude_products', False)
+                    
+                    if product_list:
+                        product_params = []
+                        for i, product in enumerate(product_list):
+                            param_name = f'product_{i}'
+                            params[param_name] = product
+                            product_params.append(f':{param_name}')
+                        
+                        product_condition = f"p.id {'NOT' if exclude_products else ''} IN ({','.join(product_params)})"
+                        where_conditions.append(product_condition)
+                
+                # ETD range filter (single select)
                 if filters.get('etd_days'):
                     where_conditions.append("""
                         EXISTS (
@@ -113,35 +281,7 @@ class AllocationDataService:
                     params['date_from'] = filters['date_from']
                     params['date_to'] = filters['date_to']
                 
-                # Supply status filter
-                if filters.get('supply_status') == 'low':
-                    having_conditions.append("(total_supply < total_demand * 0.5 AND total_demand > 0)")
-                
-                # ETD urgency filter
-                if filters.get('etd_urgency') == 'urgent':
-                    where_conditions.append("""
-                        EXISTS (
-                            SELECT 1 FROM outbound_oc_pending_delivery_view ocpd
-                            WHERE ocpd.product_id = p.id 
-                            AND ocpd.etd <= DATE_ADD(CURRENT_DATE, INTERVAL 7 DAY)
-                        )
-                    """)
-                
-                # Allocation status filter
-                if filters.get('allocation_status') == 'none':
-                    where_conditions.append("""
-                        EXISTS (
-                            SELECT 1 FROM outbound_oc_pending_delivery_view ocpd
-                            WHERE ocpd.product_id = p.id 
-                            AND ocpd.is_allocated = 'No'
-                        )
-                    """)
-                
-                # Has inventory filter
-                if filters.get('has_inventory'):
-                    having_conditions.append("inventory_qty > 0")
-                
-                # Coverage filter
+                # Supply coverage filter (single select)
                 if filters.get('coverage'):
                     if filters['coverage'] == 'Critical (<20%)':
                         having_conditions.append("(total_supply < total_demand * 0.2 AND total_demand > 0)")
@@ -151,27 +291,52 @@ class AllocationDataService:
                         having_conditions.append("(total_supply >= total_demand * 0.5 AND total_supply < total_demand)")
                     elif filters['coverage'] == 'Full (≥100%)':
                         having_conditions.append("(total_supply >= total_demand)")
+                
+                # Quick filter flags
+                if filters.get('supply_status') == 'low':
+                    having_conditions.append("(total_supply < total_demand * 0.5 AND total_demand > 0)")
+                
+                if filters.get('etd_urgency') == 'urgent':
+                    where_conditions.append("""
+                        EXISTS (
+                            SELECT 1 FROM outbound_oc_pending_delivery_view ocpd
+                            WHERE ocpd.product_id = p.id 
+                            AND ocpd.etd <= DATE_ADD(CURRENT_DATE, INTERVAL 7 DAY)
+                        )
+                    """)
+                
+                if filters.get('allocation_status') == 'none':
+                    where_conditions.append("""
+                        EXISTS (
+                            SELECT 1 FROM outbound_oc_pending_delivery_view ocpd
+                            WHERE ocpd.product_id = p.id 
+                            AND ocpd.is_allocated = 'No'
+                        )
+                    """)
+                
+                if filters.get('has_inventory'):
+                    having_conditions.append("inventory_qty > 0")
             
             where_clause = f"WHERE {' AND '.join(where_conditions)}" if where_conditions else ""
             having_clause = f"HAVING {' AND '.join(having_conditions)}" if having_conditions else ""
             
-            # Main query using actual view columns
+            # Main query
             query = f"""
                 WITH product_demand AS (
-                    -- Aggregate demand by product from OC view using standard UOM
                     SELECT 
                         product_id,
                         COUNT(DISTINCT ocd_id) as oc_count,
                         SUM(pending_standard_delivery_quantity) as total_demand,
                         SUM(outstanding_amount_usd) as total_value,
                         MIN(etd) as earliest_etd,
-                        COUNT(CASE WHEN etd <= DATE_ADD(CURRENT_DATE, INTERVAL 7 DAY) THEN 1 END) as urgent_ocs
+                        COUNT(CASE WHEN etd <= DATE_ADD(CURRENT_DATE, INTERVAL 7 DAY) THEN 1 END) as urgent_ocs,
+                        GROUP_CONCAT(DISTINCT oc_number SEPARATOR ', ') as oc_numbers,
+                        GROUP_CONCAT(DISTINCT customer SEPARATOR ', ') as customers
                     FROM outbound_oc_pending_delivery_view
                     WHERE pending_standard_delivery_quantity > 0
                     GROUP BY product_id
                 ),
                 product_supply AS (
-                    -- Aggregate supply from all sources using actual view columns
                     SELECT 
                         product_id,
                         SUM(inventory_qty) as inventory_qty,
@@ -180,13 +345,10 @@ class AllocationDataService:
                         SUM(wht_qty) as wht_qty,
                         SUM(total_qty) as total_supply
                     FROM (
-                        -- Inventory
                         SELECT 
                             product_id,
                             SUM(remaining_quantity) as inventory_qty,
-                            0 as can_qty,
-                            0 as po_qty,
-                            0 as wht_qty,
+                            0 as can_qty, 0 as po_qty, 0 as wht_qty,
                             SUM(remaining_quantity) as total_qty
                         FROM inventory_detailed_view
                         WHERE remaining_quantity > 0
@@ -194,13 +356,9 @@ class AllocationDataService:
                         
                         UNION ALL
                         
-                        -- Pending CAN
                         SELECT 
                             product_id,
-                            0 as inventory_qty,
-                            SUM(pending_quantity) as can_qty,
-                            0 as po_qty,
-                            0 as wht_qty,
+                            0, SUM(pending_quantity), 0, 0,
                             SUM(pending_quantity) as total_qty
                         FROM can_pending_stockin_view
                         WHERE pending_quantity > 0
@@ -208,13 +366,9 @@ class AllocationDataService:
                         
                         UNION ALL
                         
-                        -- Pending PO
                         SELECT 
                             product_id,
-                            0 as inventory_qty,
-                            0 as can_qty,
-                            SUM(pending_standard_arrival_quantity) as po_qty,
-                            0 as wht_qty,
+                            0, 0, SUM(pending_standard_arrival_quantity), 0,
                             SUM(pending_standard_arrival_quantity) as total_qty
                         FROM purchase_order_full_view
                         WHERE pending_standard_arrival_quantity > 0
@@ -222,13 +376,9 @@ class AllocationDataService:
                         
                         UNION ALL
                         
-                        -- Warehouse Transfer
                         SELECT 
                             product_id,
-                            0 as inventory_qty,
-                            0 as can_qty,
-                            0 as po_qty,
-                            SUM(transfer_quantity) as wht_qty,
+                            0, 0, 0, SUM(transfer_quantity),
                             SUM(transfer_quantity) as total_qty
                         FROM warehouse_transfer_details_view
                         WHERE is_completed = 0
@@ -240,9 +390,11 @@ class AllocationDataService:
                     p.id as product_id,
                     p.name as product_name,
                     p.pt_code,
-                    COALESCE(p.package_size, 1) as package_size,
+                    COALESCE(p.package_size, '') as package_size,
                     p.uom as standard_uom,
                     b.brand_name,
+                    pd.oc_numbers,
+                    pd.customers,
                     COALESCE(pd.oc_count, 0) as oc_count,
                     COALESCE(pd.total_demand, 0) as total_demand,
                     COALESCE(pd.total_value, 0) as total_value,
@@ -270,26 +422,126 @@ class AllocationDataService:
                 {where_clause}
                 {having_clause}
                 ORDER BY 
-                    pd.urgent_ocs DESC,  -- Urgent items first
-                    (COALESCE(ps.total_supply, 0) / NULLIF(pd.total_demand, 0)) ASC,  -- Low supply ratio
-                    pd.total_value DESC  -- High value items
+                    pd.urgent_ocs DESC,
+                    (COALESCE(ps.total_supply, 0) / NULLIF(pd.total_demand, 0)) ASC,
+                    pd.total_value DESC
                 LIMIT :limit OFFSET :offset
             """
-            
-            # Debug log query
-            logger.debug(f"Query: {query}")
-            logger.debug(f"Params: {params}")
             
             with _self.engine.connect() as conn:
                 df = pd.read_sql(text(query), conn, params=params)
             
-            logger.info(f"Query returned {len(df)} products (page {page})")
             return df
             
         except Exception as e:
             logger.error(f"Error loading products with demand/supply: {e}")
-            logger.exception(e)  # Full stack trace
+            logger.exception(e)
             return pd.DataFrame()
+    
+    # ==================== Search Suggestions ====================
+    
+    @st.cache_data(ttl=60)
+    def get_search_suggestions(_self, search_term: str, limit: int = 5) -> Dict[str, List[str]]:
+        """Get search suggestions for autocomplete"""
+        try:
+            if not search_term or len(search_term) < 2:
+                return {'products': [], 'customers': [], 'brands': [], 'oc_numbers': []}
+            
+            search_pattern = f"%{search_term}%"
+            exact_pattern = f"{search_term}%"
+            
+            suggestions = {}
+            
+            with _self.engine.connect() as conn:
+                # Product suggestions
+                product_query = text("""
+                    SELECT DISTINCT 
+                        p.name,
+                        p.pt_code,
+                        p.package_size
+                    FROM products p
+                    WHERE p.delete_flag = 0
+                    AND (
+                        p.name LIKE :exact_pattern 
+                        OR p.pt_code LIKE :exact_pattern
+                        OR p.package_size LIKE :search_pattern
+                    )
+                    ORDER BY 
+                        CASE 
+                            WHEN p.name LIKE :exact_pattern THEN 1
+                            WHEN p.pt_code LIKE :exact_pattern THEN 2
+                            ELSE 3
+                        END,
+                        p.name
+                    LIMIT :limit
+                """)
+                
+                result = conn.execute(product_query, {
+                    'search_pattern': search_pattern,
+                    'exact_pattern': exact_pattern,
+                    'limit': limit
+                })
+                suggestions['products'] = [
+                    f"{row['name']} | {row['pt_code']} | {row['package_size']}" 
+                    for row in result
+                ]
+                
+                # Brand suggestions
+                brand_query = text("""
+                    SELECT DISTINCT b.brand_name
+                    FROM brands b
+                    INNER JOIN products p ON b.id = p.brand_id
+                    WHERE b.delete_flag = 0
+                    AND b.brand_name LIKE :exact_pattern
+                    ORDER BY b.brand_name
+                    LIMIT :limit
+                """)
+                
+                result = conn.execute(brand_query, {
+                    'exact_pattern': exact_pattern,
+                    'limit': limit
+                })
+                suggestions['brands'] = [row['brand_name'] for row in result]
+                
+                # Customer suggestions
+                customer_query = text("""
+                    SELECT DISTINCT customer
+                    FROM outbound_oc_pending_delivery_view
+                    WHERE customer LIKE :exact_pattern
+                    AND pending_standard_delivery_quantity > 0
+                    ORDER BY customer
+                    LIMIT :limit
+                """)
+                
+                result = conn.execute(customer_query, {
+                    'exact_pattern': exact_pattern,
+                    'limit': limit
+                })
+                suggestions['customers'] = [row['customer'] for row in result]
+                
+                # OC Number suggestions
+                oc_query = text("""
+                    SELECT DISTINCT oc_number
+                    FROM outbound_oc_pending_delivery_view
+                    WHERE oc_number LIKE :search_pattern
+                    AND pending_standard_delivery_quantity > 0
+                    ORDER BY oc_number DESC
+                    LIMIT :limit
+                """)
+                
+                result = conn.execute(oc_query, {
+                    'search_pattern': search_pattern,
+                    'limit': limit
+                })
+                suggestions['oc_numbers'] = [row['oc_number'] for row in result]
+            
+            return suggestions
+            
+        except Exception as e:
+            logger.error(f"Error getting search suggestions: {e}")
+            return {'products': [], 'customers': [], 'brands': [], 'oc_numbers': []}
+    
+    # ==================== Rest of methods remain the same ====================
     
     @st.cache_data(ttl=300)
     def get_ocs_by_product(_self, product_id: int) -> pd.DataFrame:
@@ -333,12 +585,158 @@ class AllocationDataService:
             logger.error(f"Error loading OCs for product {product_id}: {e}")
             return pd.DataFrame()
     
+    @st.cache_data(ttl=60)
+    def get_dashboard_metrics_product_view(_self) -> Dict[str, Any]:
+        """Get dashboard metrics for product-centric view"""
+        try:
+            query = """
+                WITH product_summary AS (
+                    SELECT 
+                        p.id as product_id,
+                        COALESCE(SUM(ocpd.pending_standard_delivery_quantity), 0) as demand_qty,
+                        COALESCE(inv.inventory_qty, 0) + 
+                        COALESCE(can.can_qty, 0) + 
+                        COALESCE(po.po_qty, 0) + 
+                        COALESCE(wht.wht_qty, 0) as supply_qty,
+                        MIN(ocpd.etd) as earliest_etd
+                    FROM products p
+                    INNER JOIN outbound_oc_pending_delivery_view ocpd ON p.id = ocpd.product_id
+                    LEFT JOIN (
+                        SELECT product_id, SUM(remaining_quantity) as inventory_qty
+                        FROM inventory_detailed_view
+                        WHERE remaining_quantity > 0
+                        GROUP BY product_id
+                    ) inv ON p.id = inv.product_id
+                    LEFT JOIN (
+                        SELECT product_id, SUM(pending_quantity) as can_qty
+                        FROM can_pending_stockin_view
+                        WHERE pending_quantity > 0
+                        GROUP BY product_id
+                    ) can ON p.id = can.product_id
+                    LEFT JOIN (
+                        SELECT product_id, SUM(pending_standard_arrival_quantity) as po_qty
+                        FROM purchase_order_full_view
+                        WHERE pending_standard_arrival_quantity > 0
+                        GROUP BY product_id
+                    ) po ON p.id = po.product_id
+                    LEFT JOIN (
+                        SELECT product_id, SUM(transfer_quantity) as wht_qty
+                        FROM warehouse_transfer_details_view
+                        WHERE is_completed = 0
+                        GROUP BY product_id
+                    ) wht ON p.id = wht.product_id
+                    WHERE ocpd.pending_standard_delivery_quantity > 0
+                    GROUP BY p.id, inv.inventory_qty, can.can_qty, po.po_qty, wht.wht_qty
+                )
+                SELECT 
+                    COUNT(DISTINCT product_id) as total_products,
+                    SUM(demand_qty) as total_demand_qty,
+                    SUM(supply_qty) as total_supply_qty,
+                    COUNT(CASE WHEN supply_qty < demand_qty * 0.2 THEN 1 END) as critical_products,
+                    COUNT(CASE WHEN earliest_etd <= DATE_ADD(CURRENT_DATE, INTERVAL 7 DAY) THEN 1 END) as urgent_etd_count
+                FROM product_summary
+            """
+            
+            with _self.engine.connect() as conn:
+                result = conn.execute(text(query)).fetchone()
+                
+                if result:
+                    return dict(result._mapping)
+            
+            return {
+                'total_products': 0,
+                'total_demand_qty': 0,
+                'total_supply_qty': 0,
+                'critical_products': 0,
+                'urgent_etd_count': 0
+            }
+            
+        except Exception as e:
+            logger.error(f"Error loading dashboard metrics: {e}")
+            return {
+                'total_products': 0,
+                'total_demand_qty': 0,
+                'total_supply_qty': 0,
+                'critical_products': 0,
+                'urgent_etd_count': 0
+            }
+    
+    def check_supply_availability(self, source_type: str, source_id: int, 
+                                 product_id: int) -> Dict[str, Any]:
+        """Check current availability of a supply source"""
+        try:
+            if source_type == "INVENTORY":
+                query = """
+                    SELECT 
+                        remaining_quantity as available_qty,
+                        batch_number,
+                        expiry_date
+                    FROM inventory_detailed_view
+                    WHERE inventory_history_id = :source_id
+                    AND product_id = :product_id
+                    AND remaining_quantity > 0
+                """
+            elif source_type == "PENDING_CAN":
+                query = """
+                    SELECT 
+                        pending_quantity as available_qty,
+                        arrival_note_number,
+                        arrival_date
+                    FROM can_pending_stockin_view
+                    WHERE can_line_id = :source_id
+                    AND product_id = :product_id
+                    AND pending_quantity > 0
+                """
+            elif source_type == "PENDING_PO":
+                query = """
+                    SELECT 
+                        pending_standard_arrival_quantity as available_qty,
+                        po_number,
+                        etd
+                    FROM purchase_order_full_view
+                    WHERE po_line_id = :source_id
+                    AND product_id = :product_id
+                    AND pending_standard_arrival_quantity > 0
+                """
+            elif source_type == "PENDING_WHT":
+                query = """
+                    SELECT 
+                        transfer_quantity as available_qty,
+                        from_warehouse,
+                        to_warehouse
+                    FROM warehouse_transfer_details_view
+                    WHERE warehouse_transfer_line_id = :source_id
+                    AND product_id = :product_id
+                    AND is_completed = 0
+                    AND transfer_quantity > 0
+                """
+            else:
+                return {'available': False, 'available_qty': 0}
+            
+            with self.engine.connect() as conn:
+                result = conn.execute(
+                    text(query), 
+                    params={'source_id': source_id, 'product_id': product_id}
+                ).fetchone()
+            
+            if result:
+                return {
+                    'available': True,
+                    'available_qty': float(result._mapping['available_qty'] or 0),
+                    'details': dict(result._mapping)
+                }
+            
+            return {'available': False, 'available_qty': 0}
+            
+        except Exception as e:
+            logger.error(f"Error checking supply availability: {e}")
+            return {'available': False, 'available_qty': 0}
+    
     @st.cache_data(ttl=300)
     def get_all_supply_for_product(_self, product_id: int) -> pd.DataFrame:
         """Get all available supply sources for a product in one query"""
         try:
             query = """
-                -- Union all supply sources with actual view columns
                 SELECT 
                     'INVENTORY' as source_type,
                     inventory_history_id as source_id,
@@ -453,202 +851,9 @@ class AllocationDataService:
             logger.error(f"Error loading supply for product {product_id}: {e}")
             return pd.DataFrame()
     
-    # ==================== Dashboard Metrics - Product View ====================
-    
-    @st.cache_data(ttl=60)
-    def get_dashboard_metrics_product_view(_self) -> Dict[str, Any]:
-        """Get dashboard metrics for product-centric view"""
-        try:
-            query = """
-                WITH product_summary AS (
-                    SELECT 
-                        p.id as product_id,
-                        COALESCE(SUM(ocpd.pending_standard_delivery_quantity), 0) as demand_qty,
-                        COALESCE(inv.inventory_qty, 0) + 
-                        COALESCE(can.can_qty, 0) + 
-                        COALESCE(po.po_qty, 0) + 
-                        COALESCE(wht.wht_qty, 0) as supply_qty,
-                        MIN(ocpd.etd) as earliest_etd
-                    FROM products p
-                    INNER JOIN outbound_oc_pending_delivery_view ocpd ON p.id = ocpd.product_id
-                    LEFT JOIN (
-                        SELECT product_id, SUM(remaining_quantity) as inventory_qty
-                        FROM inventory_detailed_view
-                        WHERE remaining_quantity > 0
-                        GROUP BY product_id
-                    ) inv ON p.id = inv.product_id
-                    LEFT JOIN (
-                        SELECT product_id, SUM(pending_quantity) as can_qty
-                        FROM can_pending_stockin_view
-                        WHERE pending_quantity > 0
-                        GROUP BY product_id
-                    ) can ON p.id = can.product_id
-                    LEFT JOIN (
-                        SELECT product_id, SUM(pending_standard_arrival_quantity) as po_qty
-                        FROM purchase_order_full_view
-                        WHERE pending_standard_arrival_quantity > 0
-                        GROUP BY product_id
-                    ) po ON p.id = po.product_id
-                    LEFT JOIN (
-                        SELECT product_id, SUM(transfer_quantity) as wht_qty
-                        FROM warehouse_transfer_details_view
-                        WHERE is_completed = 0
-                        GROUP BY product_id
-                    ) wht ON p.id = wht.product_id
-                    WHERE ocpd.pending_standard_delivery_quantity > 0
-                    GROUP BY p.id, inv.inventory_qty, can.can_qty, po.po_qty, wht.wht_qty
-                )
-                SELECT 
-                    COUNT(DISTINCT product_id) as total_products,
-                    SUM(demand_qty) as total_demand_qty,
-                    SUM(supply_qty) as total_supply_qty,
-                    COUNT(CASE WHEN supply_qty < demand_qty * 0.2 THEN 1 END) as critical_products,
-                    COUNT(CASE WHEN earliest_etd <= DATE_ADD(CURRENT_DATE, INTERVAL 7 DAY) THEN 1 END) as urgent_etd_count
-                FROM product_summary
-            """
-            
-            with _self.engine.connect() as conn:
-                result = conn.execute(text(query)).fetchone()
-                
-                if result:
-                    return dict(result._mapping)
-            
-            return {
-                'total_products': 0,
-                'total_demand_qty': 0,
-                'total_supply_qty': 0,
-                'critical_products': 0,
-                'urgent_etd_count': 0
-            }
-            
-        except Exception as e:
-            logger.error(f"Error loading dashboard metrics: {e}")
-            return {
-                'total_products': 0,
-                'total_demand_qty': 0,
-                'total_supply_qty': 0,
-                'critical_products': 0,
-                'urgent_etd_count': 0
-            }
-    
-    # ==================== Existing Methods (Kept for compatibility) ====================
-    
-    def get_existing_allocations(self, oc_detail_id: int) -> pd.DataFrame:
-        """Get existing allocations for an OC detail"""
-        try:
-            query = """
-                SELECT 
-                    ad.id as allocation_detail_id,
-                    ap.allocation_number,
-                    ap.allocation_date,
-                    ad.allocation_mode,
-                    ad.allocated_qty,
-                    ad.delivered_qty,
-                    ad.allocated_etd,
-                    ad.status,
-                    COALESCE(ad.supply_source_type, 'No specific source') as supply_source_type,
-                    ad.notes,
-                    COALESCE(ac.cancelled_qty, 0) as cancelled_qty,
-                    (ad.allocated_qty - COALESCE(ac.cancelled_qty, 0)) as effective_qty
-                FROM allocation_details ad
-                INNER JOIN allocation_plans ap ON ad.allocation_plan_id = ap.id
-                LEFT JOIN (
-                    SELECT 
-                        allocation_detail_id,
-                        SUM(CASE WHEN status = 'ACTIVE' THEN cancelled_qty ELSE 0 END) as cancelled_qty
-                    FROM allocation_cancellations
-                    GROUP BY allocation_detail_id
-                ) ac ON ad.id = ac.allocation_detail_id
-                WHERE ad.demand_reference_id = :oc_detail_id
-                AND ad.demand_type = 'OC'
-                AND ad.status = 'ALLOCATED'
-                ORDER BY ap.allocation_date DESC
-            """
-            
-            with self.engine.connect() as conn:
-                df = pd.read_sql(text(query), conn, params={'oc_detail_id': oc_detail_id})
-            
-            return df
-            
-        except Exception as e:
-            logger.error(f"Error loading existing allocations: {e}")
-            return pd.DataFrame()
-    
-    def check_supply_availability(self, source_type: str, source_id: int, 
-                                 product_id: int) -> Dict[str, Any]:
-        """Check current availability of a supply source"""
-        try:
-            if source_type == "INVENTORY":
-                query = """
-                    SELECT 
-                        remaining_quantity as available_qty,
-                        batch_number,
-                        expiry_date
-                    FROM inventory_detailed_view
-                    WHERE inventory_history_id = :source_id
-                    AND product_id = :product_id
-                    AND remaining_quantity > 0
-                """
-            elif source_type == "PENDING_CAN":
-                query = """
-                    SELECT 
-                        pending_quantity as available_qty,
-                        arrival_note_number,
-                        arrival_date
-                    FROM can_pending_stockin_view
-                    WHERE can_line_id = :source_id
-                    AND product_id = :product_id
-                    AND pending_quantity > 0
-                """
-            elif source_type == "PENDING_PO":
-                query = """
-                    SELECT 
-                        pending_standard_arrival_quantity as available_qty,
-                        po_number,
-                        etd
-                    FROM purchase_order_full_view
-                    WHERE po_line_id = :source_id
-                    AND product_id = :product_id
-                    AND pending_standard_arrival_quantity > 0
-                """
-            elif source_type == "PENDING_WHT":
-                query = """
-                    SELECT 
-                        transfer_quantity as available_qty,
-                        from_warehouse,
-                        to_warehouse
-                    FROM warehouse_transfer_details_view
-                    WHERE warehouse_transfer_line_id = :source_id
-                    AND product_id = :product_id
-                    AND is_completed = 0
-                    AND transfer_quantity > 0
-                """
-            else:
-                return {'available': False, 'available_qty': 0}
-            
-            with self.engine.connect() as conn:
-                result = conn.execute(
-                    text(query), 
-                    params={'source_id': source_id, 'product_id': product_id}
-                ).fetchone()
-            
-            if result:
-                return {
-                    'available': True,
-                    'available_qty': float(result._mapping['available_qty'] or 0),
-                    'details': dict(result._mapping)
-                }
-            
-            return {'available': False, 'available_qty': 0}
-            
-        except Exception as e:
-            logger.error(f"Error checking supply availability: {e}")
-            return {'available': False, 'available_qty': 0}
-
     def get_total_available_supply(self, product_id: int) -> Dict[str, Any]:
         """Get total available supply from all sources for a product"""
         try:
-            # Use the optimized single query
             supply_df = self.get_all_supply_for_product(product_id)
             
             if supply_df.empty:
@@ -692,8 +897,7 @@ class AllocationDataService:
                 'has_supply': False
             }
     
-    # ==================== Optimized Summary Methods ====================
-    
+    # Summary methods remain the same...
     @st.cache_data(ttl=300)
     def get_inventory_summary(_self, product_id: Optional[int] = None) -> pd.DataFrame:
         """Get inventory summary optimized for product view"""
@@ -844,60 +1048,43 @@ class AllocationDataService:
             logger.error(f"Error loading WHT summary: {e}")
             return pd.DataFrame()
     
-    # ==================== Reference Data ====================
-    
-    @st.cache_data(ttl=3600)
-    def get_customer_list(_self) -> pd.DataFrame:
-        """Get list of customers for filter"""
+    def get_existing_allocations(self, oc_detail_id: int) -> pd.DataFrame:
+        """Get existing allocations for an OC detail"""
         try:
             query = """
-                SELECT DISTINCT 
-                    c.company_code as customer_code,
-                    c.english_name as customer_name
-                FROM companies c
-                INNER JOIN (
-                    SELECT DISTINCT customer_code 
-                    FROM outbound_oc_pending_delivery_view
-                    WHERE pending_selling_delivery_quantity > 0
-                ) oc ON c.company_code = oc.customer_code
-                WHERE c.delete_flag = 0
-                ORDER BY c.english_name
+                SELECT 
+                    ad.id as allocation_detail_id,
+                    ap.allocation_number,
+                    ap.allocation_date,
+                    ad.allocation_mode,
+                    ad.allocated_qty,
+                    ad.delivered_qty,
+                    ad.allocated_etd,
+                    ad.status,
+                    COALESCE(ad.supply_source_type, 'No specific source') as supply_source_type,
+                    ad.notes,
+                    COALESCE(ac.cancelled_qty, 0) as cancelled_qty,
+                    (ad.allocated_qty - COALESCE(ac.cancelled_qty, 0)) as effective_qty
+                FROM allocation_details ad
+                INNER JOIN allocation_plans ap ON ad.allocation_plan_id = ap.id
+                LEFT JOIN (
+                    SELECT 
+                        allocation_detail_id,
+                        SUM(CASE WHEN status = 'ACTIVE' THEN cancelled_qty ELSE 0 END) as cancelled_qty
+                    FROM allocation_cancellations
+                    GROUP BY allocation_detail_id
+                ) ac ON ad.id = ac.allocation_detail_id
+                WHERE ad.demand_reference_id = :oc_detail_id
+                AND ad.demand_type = 'OC'
+                AND ad.status = 'ALLOCATED'
+                ORDER BY ap.allocation_date DESC
             """
             
-            with _self.engine.connect() as conn:
-                df = pd.read_sql(text(query), conn)
+            with self.engine.connect() as conn:
+                df = pd.read_sql(text(query), conn, params={'oc_detail_id': oc_detail_id})
             
             return df
             
         except Exception as e:
-            logger.error(f"Error loading customer list: {e}")
-            return pd.DataFrame()
-    
-    @st.cache_data(ttl=3600)
-    def get_brand_list(_self) -> pd.DataFrame:
-        """Get list of brands for filter"""
-        try:
-            query = """
-                SELECT DISTINCT 
-                    b.id as brand_id,
-                    b.brand_name
-                FROM brands b
-                INNER JOIN products p ON b.id = p.brand_id
-                WHERE b.delete_flag = 0
-                AND EXISTS (
-                    SELECT 1 
-                    FROM outbound_oc_pending_delivery_view ocpd
-                    WHERE ocpd.product_id = p.id
-                    AND ocpd.pending_selling_delivery_quantity > 0
-                )
-                ORDER BY b.brand_name
-            """
-            
-            with _self.engine.connect() as conn:
-                df = pd.read_sql(text(query), conn)
-            
-            return df
-            
-        except Exception as e:
-            logger.error(f"Error loading brand list: {e}")
+            logger.error(f"Error loading existing allocations: {e}")
             return pd.DataFrame()

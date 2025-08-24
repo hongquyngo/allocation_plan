@@ -1,6 +1,6 @@
 """
-Allocation Planning System - Product Centric View
-Redesigned for better UX with product-first approach
+Allocation Planning System - Multiselect Filter Version
+Enhanced UX with multiselect filters and exclude/include options
 """
 import streamlit as st
 import pandas as pd
@@ -59,8 +59,17 @@ if 'page_number' not in st.session_state:
 if 'show_advanced_filters' not in st.session_state:
     st.session_state.show_advanced_filters = False
 if 'user_id' not in st.session_state:
-    # Assuming user_id is stored in session by auth module
-    st.session_state.user_id = st.session_state.get('authenticated_user_id', 1)  # Default to 1 if not found
+    st.session_state.user_id = st.session_state.get('authenticated_user_id', 1)
+
+# Initialize multiselect states
+if 'selected_customers' not in st.session_state:
+    st.session_state.selected_customers = []
+if 'selected_brands' not in st.session_state:
+    st.session_state.selected_brands = []
+if 'selected_oc_numbers' not in st.session_state:
+    st.session_state.selected_oc_numbers = []
+if 'selected_products' not in st.session_state:
+    st.session_state.selected_products = []
 
 # Constants
 ITEMS_PER_PAGE = 50
@@ -133,120 +142,364 @@ def show_metrics_row():
     except Exception as e:
         logger.error(f"Error loading metrics: {e}")
         st.error(f"Error loading metrics: {str(e)}")
-        # Show empty metrics
-        col1, col2, col3, col4, col5 = st.columns(5)
-        for col in [col1, col2, col3, col4, col5]:
-            with col:
-                st.metric("Loading...", "---")
 
 def show_search_and_filters():
-    """Display search bar and filter controls"""
-    # Initialize state
-    if 'show_advanced_filters' not in st.session_state:
-        st.session_state.show_advanced_filters = False
+    """Display enhanced search bar with autocomplete and multiselect filter controls"""
     
     col1, col2 = st.columns([3, 1])
     
     with col1:
-        search_query = st.text_input(
-            "🔍 Search products, PT code, customer...",
-            placeholder="Type to search...",
-            label_visibility="collapsed",
-            key="search_input"
-        )
-        if search_query:
-            st.session_state.filters['search'] = search_query
-        else:
-            st.session_state.filters.pop('search', None)
+        # Search input with clear button
+        search_container = st.container()
+        with search_container:
+            # Create columns for search input and clear button
+            search_col, clear_col = st.columns([10, 1])
+            
+            with search_col:
+                search_query = st.text_input(
+                    "🔍 Search",
+                    placeholder="Search by product name, PT code, brand, customer, OC number, or package size...",
+                    key="search_input",
+                    help="Type at least 2 characters to see suggestions",
+                    label_visibility="collapsed"
+                )
+            
+            with clear_col:
+                if search_query:
+                    if st.button("✖", key="clear_search", help="Clear search"):
+                        st.session_state.search_input = ""
+                        st.session_state.filters.pop('search', None)
+                        st.rerun()
+            
+            # Show suggestions if user is typing
+            if search_query and len(search_query) >= 2:
+                suggestions = data_service.get_search_suggestions(search_query)
+                
+                # Check if there are any suggestions
+                has_suggestions = any(suggestions.values())
+                
+                if has_suggestions:
+                    # Display suggestions in a container
+                    with st.container():
+                        # Display suggestions by category
+                        if suggestions['products']:
+                            st.markdown("**📦 Products**")
+                            for idx, product in enumerate(suggestions['products'][:5]):
+                                if st.button(
+                                    product, 
+                                    key=f"prod_suggest_{idx}",
+                                    use_container_width=True
+                                ):
+                                    product_name = product.split(" | ")[0]
+                                    st.session_state.search_input = product_name
+                                    st.rerun()
+                        
+                        if suggestions['brands']:
+                            st.markdown("**🏷️ Brands**")
+                            for idx, brand in enumerate(suggestions['brands'][:5]):
+                                if st.button(
+                                    brand,
+                                    key=f"brand_suggest_{idx}",
+                                    use_container_width=True
+                                ):
+                                    st.session_state.search_input = brand
+                                    st.rerun()
+                        
+                        if suggestions['customers']:
+                            st.markdown("**🏢 Customers**")
+                            for idx, customer in enumerate(suggestions['customers'][:5]):
+                                if st.button(
+                                    customer,
+                                    key=f"cust_suggest_{idx}",
+                                    use_container_width=True
+                                ):
+                                    st.session_state.search_input = customer
+                                    st.rerun()
+                        
+                        if suggestions['oc_numbers']:
+                            st.markdown("**📄 OC Numbers**")
+                            for idx, oc in enumerate(suggestions['oc_numbers'][:5]):
+                                if st.button(
+                                    oc,
+                                    key=f"oc_suggest_{idx}",
+                                    use_container_width=True
+                                ):
+                                    st.session_state.search_input = oc
+                                    st.rerun()
+            
+            # Update search filter
+            if search_query:
+                st.session_state.filters['search'] = search_query
+            else:
+                st.session_state.filters.pop('search', None)
     
     with col2:
         if st.button("⚙️ Advanced Filters", use_container_width=True):
             st.session_state.show_advanced_filters = not st.session_state.show_advanced_filters
     
-    # Advanced filters panel
+    # Advanced filters panel with multiselect
     if st.session_state.show_advanced_filters:
         with st.expander("Advanced Filters", expanded=True):
-            col1, col2, col3 = st.columns(3)
+            # Get filter data
+            customers_df = data_service.get_customer_list_with_stats()
+            brands_df = data_service.get_brand_list_with_stats()
+            oc_numbers_df = data_service.get_oc_number_list()
+            products_df = data_service.get_product_list_for_filter()
+            
+            # First row: Customer and Brand
+            col1, col2 = st.columns(2)
             
             with col1:
-                # Customer filter
-                customers = data_service.get_customer_list()
-                if not customers.empty:
-                    selected_customer = st.selectbox(
-                        "Customer",
-                        options=['All'] + customers['customer_name'].tolist(),
-                        key="filter_customer"
-                    )
-                    if selected_customer != 'All':
-                        customer_code = customers[customers['customer_name'] == selected_customer]['customer_code'].iloc[0]
-                        st.session_state.filters['customer'] = customer_code
-                    else:
-                        st.session_state.filters.pop('customer', None)
+                st.markdown("**Customer**")
                 
-                # Brand filter
-                brands = data_service.get_brand_list()
-                if not brands.empty:
-                    selected_brand = st.selectbox(
-                        "Brand",
-                        options=['All'] + brands['brand_name'].tolist(),
-                        key="filter_brand"
+                # Include/Exclude toggle
+                customer_mode = st.radio(
+                    "Customer filter mode",
+                    ["Include", "Exclude"],
+                    key="customer_mode",
+                    horizontal=True,
+                    label_visibility="collapsed"
+                )
+                
+                # Customer multiselect
+                if not customers_df.empty:
+                    # Format options with stats
+                    customer_options = []
+                    customer_map = {}
+                    for _, row in customers_df.iterrows():
+                        option = f"{row['customer_name']} ({row['order_count']} orders, {row['product_count']} products)"
+                        customer_options.append(option)
+                        customer_map[option] = row['customer_code']
+                    
+                    selected_customer_options = st.multiselect(
+                        "Select customers",
+                        options=customer_options,
+                        default=st.session_state.selected_customers,
+                        key="multiselect_customers",
+                        placeholder="Choose customers...",
+                        label_visibility="collapsed"
                     )
-                    if selected_brand != 'All':
-                        brand_id = brands[brands['brand_name'] == selected_brand]['brand_id'].iloc[0]
-                        st.session_state.filters['brand'] = brand_id
-                    else:
-                        st.session_state.filters.pop('brand', None)
+                    
+                    # Map back to customer codes
+                    selected_customer_codes = [customer_map[opt] for opt in selected_customer_options]
+                    st.session_state.selected_customers = selected_customer_options
             
             with col2:
-                # ETD range filter
+                st.markdown("**Brand**")
+                
+                # Include/Exclude toggle
+                brand_mode = st.radio(
+                    "Brand filter mode",
+                    ["Include", "Exclude"],
+                    key="brand_mode",
+                    horizontal=True,
+                    label_visibility="collapsed"
+                )
+                
+                # Brand multiselect
+                if not brands_df.empty:
+                    # Format options with stats
+                    brand_options = []
+                    brand_map = {}
+                    for _, row in brands_df.iterrows():
+                        option = f"{row['brand_name']} ({row['product_count']} products)"
+                        brand_options.append(option)
+                        brand_map[option] = row['brand_id']
+                    
+                    selected_brand_options = st.multiselect(
+                        "Select brands",
+                        options=brand_options,
+                        default=st.session_state.selected_brands,
+                        key="multiselect_brands",
+                        placeholder="Choose brands...",
+                        label_visibility="collapsed"
+                    )
+                    
+                    # Map back to brand IDs
+                    selected_brand_ids = [brand_map[opt] for opt in selected_brand_options]
+                    st.session_state.selected_brands = selected_brand_options
+            
+            # Second row: OC Number and Product
+            col3, col4 = st.columns(2)
+            
+            with col3:
+                st.markdown("**OC Number**")
+                
+                # Include/Exclude toggle
+                oc_mode = st.radio(
+                    "OC filter mode",
+                    ["Include", "Exclude"],
+                    key="oc_mode",
+                    horizontal=True,
+                    label_visibility="collapsed"
+                )
+                
+                # OC Number multiselect
+                if not oc_numbers_df.empty:
+                    # Format options with customer info
+                    oc_options = []
+                    oc_map = {}
+                    for _, row in oc_numbers_df.iterrows():
+                        option = f"{row['oc_number']} - {row['customer']} ({row['product_count']} items)"
+                        oc_options.append(option)
+                        oc_map[option] = row['oc_number']
+                    
+                    selected_oc_options = st.multiselect(
+                        "Select OC numbers",
+                        options=oc_options,
+                        default=st.session_state.selected_oc_numbers,
+                        key="multiselect_oc_numbers",
+                        placeholder="Choose OC numbers...",
+                        label_visibility="collapsed"
+                    )
+                    
+                    # Map back to OC numbers
+                    selected_oc_numbers = [oc_map[opt] for opt in selected_oc_options]
+                    st.session_state.selected_oc_numbers = selected_oc_options
+            
+            with col4:
+                st.markdown("**PT Code - Product Name**")
+                
+                # Include/Exclude toggle
+                product_mode = st.radio(
+                    "Product filter mode",
+                    ["Include", "Exclude"],
+                    key="product_mode",
+                    horizontal=True,
+                    label_visibility="collapsed"
+                )
+                
+                # Product multiselect
+                if not products_df.empty:
+                    # Format options
+                    product_options = []
+                    product_map = {}
+                    for _, row in products_df.iterrows():
+                        option = row['display_name']
+                        if pd.notna(row['brand_name']):
+                            option += f" [{row['brand_name']}]"
+                        product_options.append(option)
+                        product_map[option] = row['product_id']
+                    
+                    selected_product_options = st.multiselect(
+                        "Select products",
+                        options=product_options,
+                        default=st.session_state.selected_products,
+                        key="multiselect_products",
+                        placeholder="Choose products...",
+                        label_visibility="collapsed"
+                    )
+                    
+                    # Map back to product IDs
+                    selected_product_ids = [product_map[opt] for opt in selected_product_options]
+                    st.session_state.selected_products = selected_product_options
+            
+            # Third row: ETD Range and Supply Coverage (single select)
+            col5, col6 = st.columns(2)
+            
+            with col5:
+                st.markdown("**ETD Range**")
                 etd_option = st.selectbox(
                     "ETD Range",
                     ["All dates", "Next 7 days", "Next 14 days", "Next 30 days", "Custom range"],
-                    key="filter_etd_range"
+                    key="filter_etd_range",
+                    label_visibility="collapsed"
                 )
                 
-                if etd_option == "Next 7 days":
-                    st.session_state.filters['etd_days'] = 7
-                elif etd_option == "Next 14 days":
-                    st.session_state.filters['etd_days'] = 14
-                elif etd_option == "Next 30 days":
-                    st.session_state.filters['etd_days'] = 30
-                elif etd_option == "Custom range":
-                    date_from = st.date_input("From date", key="filter_date_from")
-                    date_to = st.date_input("To date", key="filter_date_to")
-                    st.session_state.filters['date_from'] = date_from
-                    st.session_state.filters['date_to'] = date_to
-                else:
-                    st.session_state.filters.pop('etd_days', None)
-                    st.session_state.filters.pop('date_from', None)
-                    st.session_state.filters.pop('date_to', None)
+                if etd_option == "Custom range":
+                    date_col1, date_col2 = st.columns(2)
+                    with date_col1:
+                        date_from = st.date_input("From date", key="filter_date_from")
+                    with date_col2:
+                        date_to = st.date_input("To date", key="filter_date_to")
             
-            with col3:
-                # Supply coverage filter
+            with col6:
+                st.markdown("**Supply Coverage**")
                 coverage_option = st.selectbox(
                     "Supply Coverage",
                     ["All", "Critical (<20%)", "Low (<50%)", "Partial (50-99%)", "Full (≥100%)"],
-                    key="filter_coverage"
+                    key="filter_coverage",
+                    label_visibility="collapsed"
                 )
-                
-                if coverage_option != "All":
-                    st.session_state.filters['coverage'] = coverage_option
-                else:
-                    st.session_state.filters.pop('coverage', None)
             
-            # Apply filters button
-            if st.button("Apply Filters", type="primary", use_container_width=True):
-                st.session_state.page_number = 1
-                st.rerun()
+            # Apply and Clear buttons
+            st.markdown("---")
+            col1, col2, col3 = st.columns([1, 1, 2])
+            
+            with col1:
+                if st.button("Apply Filters", type="primary", use_container_width=True):
+                    # Build filter dictionary
+                    new_filters = {}
+                    
+                    # Customer filter
+                    if 'selected_customer_codes' in locals() and selected_customer_codes:
+                        new_filters['customers'] = selected_customer_codes
+                        new_filters['exclude_customers'] = customer_mode == "Exclude"
+                    
+                    # Brand filter
+                    if 'selected_brand_ids' in locals() and selected_brand_ids:
+                        new_filters['brands'] = selected_brand_ids
+                        new_filters['exclude_brands'] = brand_mode == "Exclude"
+                    
+                    # OC Number filter
+                    if 'selected_oc_numbers' in locals() and selected_oc_numbers:
+                        new_filters['oc_numbers'] = selected_oc_numbers
+                        new_filters['exclude_oc_numbers'] = oc_mode == "Exclude"
+                    
+                    # Product filter
+                    if 'selected_product_ids' in locals() and selected_product_ids:
+                        new_filters['products'] = selected_product_ids
+                        new_filters['exclude_products'] = product_mode == "Exclude"
+                    
+                    # ETD filter
+                    if etd_option == "Next 7 days":
+                        new_filters['etd_days'] = 7
+                    elif etd_option == "Next 14 days":
+                        new_filters['etd_days'] = 14
+                    elif etd_option == "Next 30 days":
+                        new_filters['etd_days'] = 30
+                    elif etd_option == "Custom range":
+                        new_filters['date_from'] = date_from
+                        new_filters['date_to'] = date_to
+                    
+                    # Coverage filter
+                    if coverage_option != "All":
+                        new_filters['coverage'] = coverage_option
+                    
+                    # Keep search filter if exists
+                    if 'search' in st.session_state.filters:
+                        new_filters['search'] = st.session_state.filters['search']
+                    
+                    st.session_state.filters = new_filters
+                    st.session_state.page_number = 1
+                    st.rerun()
+            
+            with col2:
+                if st.button("Clear All", type="secondary", use_container_width=True):
+                    # Clear all multiselect states
+                    st.session_state.selected_customers = []
+                    st.session_state.selected_brands = []
+                    st.session_state.selected_oc_numbers = []
+                    st.session_state.selected_products = []
+                    
+                    # Clear filters except search
+                    search_filter = st.session_state.filters.get('search')
+                    st.session_state.filters = {}
+                    if search_filter:
+                        st.session_state.filters['search'] = search_filter
+                    
+                    st.session_state.page_number = 1
+                    st.rerun()
     
-    # Quick filters - với visual feedback
+    # Quick filters with visual feedback
     st.markdown("**Quick Filters:**")
     filter_cols = st.columns(5)
     
     # Helper function to show active state
     def is_filter_active(filter_type):
         if filter_type == 'all':
-            return len(st.session_state.filters) == 0
+            # Check if only search filter exists
+            return len([k for k in st.session_state.filters.keys() if k != 'search']) == 0
         elif filter_type == 'low_supply':
             return st.session_state.filters.get('supply_status') == 'low'
         elif filter_type == 'urgent':
@@ -260,100 +513,97 @@ def show_search_and_filters():
     with filter_cols[0]:
         button_type = "primary" if is_filter_active('all') else "secondary"
         if st.button("All", use_container_width=True, type=button_type):
+            # Keep search filter
+            search_filter = st.session_state.filters.get('search')
             st.session_state.filters = {}
+            if search_filter:
+                st.session_state.filters['search'] = search_filter
             st.session_state.page_number = 1
             st.rerun()
     
     with filter_cols[1]:
         button_type = "primary" if is_filter_active('low_supply') else "secondary"
         if st.button("⚠️ Low Supply", use_container_width=True, type=button_type):
-            st.session_state.filters = {'supply_status': 'low'}
+            st.session_state.filters['supply_status'] = 'low'
             st.session_state.page_number = 1
             st.rerun()
     
     with filter_cols[2]:
         button_type = "primary" if is_filter_active('urgent') else "secondary"
         if st.button("🔴 Urgent ETD", use_container_width=True, type=button_type):
-            st.session_state.filters = {'etd_urgency': 'urgent'}
+            st.session_state.filters['etd_urgency'] = 'urgent'
             st.session_state.page_number = 1
             st.rerun()
     
     with filter_cols[3]:
         button_type = "primary" if is_filter_active('not_allocated') else "secondary"
         if st.button("❌ Not Allocated", use_container_width=True, type=button_type):
-            st.session_state.filters = {'allocation_status': 'none'}
+            st.session_state.filters['allocation_status'] = 'none'
             st.session_state.page_number = 1
             st.rerun()
     
     with filter_cols[4]:
         button_type = "primary" if is_filter_active('has_inventory') else "secondary"
         if st.button("📦 Has Inventory", use_container_width=True, type=button_type):
-            st.session_state.filters = {'has_inventory': True}
+            st.session_state.filters['has_inventory'] = True
             st.session_state.page_number = 1
             st.rerun()
     
-    # Show active filters với clear button cho từng filter
-    if st.session_state.filters:
+    # Show active filters with clear button for each
+    active_filters = [(k, v) for k, v in st.session_state.filters.items() if k != 'search']
+    if active_filters:
         st.markdown("**Active Filters:**")
         filter_container = st.container()
         with filter_container:
-            cols = st.columns([1, 1, 1, 1, 1])
-            col_idx = 0
+            # Display multiselect filters with exclude/include info
+            display_filters = []
             
-            for key, value in st.session_state.filters.items():
-                if key != 'search' and col_idx < 5:
-                    with cols[col_idx]:
-                        filter_label = {
-                            'supply_status': '⚠️ Low Supply',
-                            'etd_urgency': '🔴 Urgent ETD',
-                            'allocation_status': '❌ Not Allocated',
-                            'has_inventory': '📦 Has Inventory',
-                            'customer': f'Customer: {value}',
-                            'brand': f'Brand: {value}',
-                            'etd_days': f'ETD: Next {value} days',
-                            'coverage': f'Coverage: {value}'
-                        }.get(key, f"{key}: {value}")
-                        
-                        if st.button(f"{filter_label} ✕", key=f"clear_{key}"):
-                            st.session_state.filters.pop(key)
-                            st.session_state.page_number = 1
-                            st.rerun()
-                    col_idx += 1
+            # Format filter display
+            for key, value in active_filters:
+                if key == 'customers':
+                    mode = "Exclude" if st.session_state.filters.get('exclude_customers') else "Include"
+                    display_filters.append((f"Customers ({mode}): {len(value)} selected", key))
+                elif key == 'brands':
+                    mode = "Exclude" if st.session_state.filters.get('exclude_brands') else "Include"
+                    display_filters.append((f"Brands ({mode}): {len(value)} selected", key))
+                elif key == 'oc_numbers':
+                    mode = "Exclude" if st.session_state.filters.get('exclude_oc_numbers') else "Include"
+                    display_filters.append((f"OC Numbers ({mode}): {len(value)} selected", key))
+                elif key == 'products':
+                    mode = "Exclude" if st.session_state.filters.get('exclude_products') else "Include"
+                    display_filters.append((f"Products ({mode}): {len(value)} selected", key))
+                elif key not in ['exclude_customers', 'exclude_brands', 'exclude_oc_numbers', 'exclude_products']:
+                    # Other filters
+                    filter_label = {
+                        'supply_status': '⚠️ Low Supply',
+                        'etd_urgency': '🔴 Urgent ETD',
+                        'allocation_status': '❌ Not Allocated',
+                        'has_inventory': '📦 Has Inventory',
+                        'etd_days': f'ETD: Next {value} days',
+                        'coverage': f'Coverage: {value}'
+                    }.get(key, f"{key}: {value}")
+                    display_filters.append((filter_label, key))
             
-            # Clear all button
-            if st.button("Clear All Filters", type="secondary"):
-                st.session_state.filters = {}
-                st.session_state.page_number = 1
-                st.rerun()
+            # Display in columns
+            cols = st.columns(5)
+            for idx, (label, key) in enumerate(display_filters[:5]):
+                with cols[idx % 5]:
+                    if st.button(f"{label} ✕", key=f"clear_{key}"):
+                        # Remove filter and related exclude flag
+                        st.session_state.filters.pop(key, None)
+                        if key == 'customers':
+                            st.session_state.filters.pop('exclude_customers', None)
+                        elif key == 'brands':
+                            st.session_state.filters.pop('exclude_brands', None)
+                        elif key == 'oc_numbers':
+                            st.session_state.filters.pop('exclude_oc_numbers', None)
+                        elif key == 'products':
+                            st.session_state.filters.pop('exclude_products', None)
+                        st.session_state.page_number = 1
+                        st.rerun()
 
 def show_product_list():
     """Display product list with demand/supply summary"""
-    # Debug info (remove in production)
-    with st.expander("Debug Info", expanded=False):
-        st.write("Current Filters:", st.session_state.filters)
-        st.write("Page Number:", st.session_state.page_number)
-        
-        # Test database connection
-        try:
-            test_query = """
-                SELECT COUNT(*) as product_count FROM products WHERE delete_flag = 0
-            """
-            with data_service.engine.connect() as conn:
-                result = conn.execute(text(test_query)).fetchone()
-                st.write(f"Total products in database: {result[0] if result else 'Error'}")
-                
-            # Test OC view
-            test_oc_query = """
-                SELECT COUNT(*) as oc_count 
-                FROM outbound_oc_pending_delivery_view 
-                WHERE pending_standard_delivery_quantity > 0
-            """
-            with data_service.engine.connect() as conn:
-                result = conn.execute(text(test_oc_query)).fetchone()
-                st.write(f"Total pending OCs: {result[0] if result else 'Error'}")
-        except Exception as e:
-            st.error(f"Database test error: {str(e)}")
-    
     # Get product data
     try:
         products_df = data_service.get_products_with_demand_supply(
@@ -362,35 +612,31 @@ def show_product_list():
             page_size=ITEMS_PER_PAGE
         )
         
-        # Debug: Show query result info
-        if products_df is not None:
-            st.caption(f"Found {len(products_df)} products")
+        if products_df is not None and not products_df.empty:
+            st.caption(f"Found {len(products_df)} products (Page {st.session_state.page_number})")
     except Exception as e:
         st.error(f"Error loading products: {str(e)}")
         logger.error(f"Error in show_product_list: {e}")
         products_df = pd.DataFrame()
     
     if products_df.empty:
-        # Show more helpful message
-        st.info("No products found with current filters")
-        
-        # Suggest actions
-        if st.session_state.filters:
-            st.write("Try:")
-            st.write("- Clearing some filters")
-            st.write("- Using different search terms")
-            st.write("- Checking if there are pending orders in the selected date range")
+        # Show helpful message
+        col1, col2, col3 = st.columns([1, 2, 1])
+        with col2:
+            st.info("No products found with current filters")
             
-            if st.button("Clear All Filters and Retry"):
-                st.session_state.filters = {}
-                st.session_state.page_number = 1
-                st.rerun()
-        else:
-            st.write("No products with pending demand found.")
-            st.write("This could mean:")
-            st.write("- All orders are already fully allocated")
-            st.write("- No pending orders in the system")
-            st.write("- Data sync issue")
+            if st.session_state.filters:
+                st.write("**Try:**")
+                st.write("• Clearing some filters")
+                st.write("• Changing include/exclude mode")
+                st.write("• Using different search terms")
+                
+                if st.button("🔄 Clear All Filters and Retry", use_container_width=True):
+                    st.session_state.filters = {}
+                    st.session_state.page_number = 1
+                    st.rerun()
+            else:
+                st.write("**No products with pending demand found**")
         return
     
     # Create header
@@ -428,7 +674,30 @@ def show_product_list():
                     st.session_state.expanded_products.add(product_id)
                 st.rerun()
 
-            st.caption(f"{row['pt_code']} | {row['package_size']} | {row['standard_uom']}")
+            # Show additional info with brand
+            info_parts = [row['pt_code']]
+            if pd.notna(row.get('brand_name')):
+                info_parts.append(row['brand_name'])
+            if pd.notna(row.get('package_size')) and row['package_size']:
+                info_parts.append(row['package_size'])
+            info_parts.append(row['standard_uom'])
+            
+            st.caption(" | ".join(info_parts))
+            
+            # Show customer and OC info if available
+            if pd.notna(row.get('customers')) and row['customers']:
+                customer_list = row['customers'].split(', ')
+                if len(customer_list) > 2:
+                    st.caption(f"🏢 {', '.join(customer_list[:2])}... (+{len(customer_list)-2} more)")
+                else:
+                    st.caption(f"🏢 {row['customers']}")
+            
+            if pd.notna(row.get('oc_numbers')) and row['oc_numbers']:
+                oc_list = row['oc_numbers'].split(', ')
+                if len(oc_list) > 3:
+                    st.caption(f"📄 OCs: {', '.join(oc_list[:3])}... (+{len(oc_list)-3} more)")
+                else:
+                    st.caption(f"📄 OCs: {row['oc_numbers']}")
 
         with cols[1]:
             # Demand info
@@ -497,9 +766,6 @@ def show_product_demand_details(product_id):
         st.markdown("**Allocated %**")
     with header_cols[5]:
         st.markdown("**Action**")
-    
-    # Divider after header
-    # st.markdown("---")
     
     # Create OC table rows
     for idx, oc in ocs_df.iterrows():
@@ -789,7 +1055,6 @@ def show_allocation_modal():
                     st.balloons()
                     
                     # Close modal after short delay
-                    import time
                     time.sleep(2)
                     st.session_state.show_allocation_modal = False
                     st.cache_data.clear()
