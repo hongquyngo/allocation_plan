@@ -1,11 +1,11 @@
 """
-Data Service for Allocation Module - Multiselect Filter Version
-Enhanced with multiselect and exclude/include logic
+Data Service for Allocation Module - Cleaned Version
+Removed duplicates and unused methods
 """
 import pandas as pd
 from datetime import datetime, timedelta
 import logging
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, List, Optional, Any
 import streamlit as st
 from sqlalchemy import text
 
@@ -16,13 +16,13 @@ logger = logging.getLogger(__name__)
 
 
 class AllocationDataService:
-    """Service for fetching allocation-related data with multiselect filters"""
+    """Service for fetching allocation-related data"""
     
     def __init__(self):
         self.engine = get_db_engine()
         self.cache_ttl = config.get_app_setting('CACHE_TTL_SECONDS', 300)
     
-    # ==================== Reference Data for Multiselect ====================
+    # ==================== Reference Data for Filters ====================
     
     @st.cache_data(ttl=3600)
     def get_customer_list_with_stats(_self) -> pd.DataFrame:
@@ -96,7 +96,7 @@ class AllocationDataService:
                 WHERE pending_standard_delivery_quantity > 0
                 GROUP BY oc_number, customer
                 ORDER BY oc_number DESC
-                LIMIT 500  -- Limit to prevent too many options
+                LIMIT 500
             """
             
             with _self.engine.connect() as conn:
@@ -110,7 +110,7 @@ class AllocationDataService:
     
     @st.cache_data(ttl=3600)
     def get_product_list_for_filter(_self) -> pd.DataFrame:
-        """Get list of products (PT code + name) for filter"""
+        """Get list of products for filter"""
         try:
             query = """
                 SELECT DISTINCT 
@@ -127,13 +127,13 @@ class AllocationDataService:
                 AND ocpd.pending_standard_delivery_quantity > 0
                 GROUP BY p.id, p.pt_code, p.name, b.brand_name
                 ORDER BY p.pt_code, p.name
-                LIMIT 1000  -- Limit to prevent too many options
+                LIMIT 1000
             """
             
             with _self.engine.connect() as conn:
                 df = pd.read_sql(text(query), conn)
             
-            # Create display name combining PT code and product name
+            # Create display name
             df['display_name'] = df['pt_code'] + ' - ' + df['product_name']
             
             return df
@@ -142,15 +142,12 @@ class AllocationDataService:
             logger.error(f"Error loading product list: {e}")
             return pd.DataFrame()
     
-    # ==================== Enhanced Search with Multiselect ====================
+    # ==================== Main Product List ====================
     
     @st.cache_data(ttl=300)
     def get_products_with_demand_supply(_self, filters: Dict = None, 
                                        page: int = 1, page_size: int = 50) -> pd.DataFrame:
-        """
-        Get products with aggregated demand and supply information
-        Enhanced with multiselect and exclude/include logic
-        """
+        """Get products with aggregated demand and supply information"""
         try:
             # Build WHERE conditions
             where_conditions = ["p.delete_flag = 0"]
@@ -162,7 +159,7 @@ class AllocationDataService:
             
             # Apply filters
             if filters:
-                # Search filter (single value)
+                # Search filter
                 if filters.get('search'):
                     search_term = filters['search'].strip()
                     search_pattern = f"%{search_term}%"
@@ -185,13 +182,12 @@ class AllocationDataService:
                         )
                     """)
                 
-                # Customer multiselect filter
+                # Customer filter
                 if filters.get('customers'):
                     customer_list = filters['customers']
                     exclude_customers = filters.get('exclude_customers', False)
                     
                     if customer_list:
-                        # Create parameter names for each customer
                         customer_params = []
                         for i, customer in enumerate(customer_list):
                             param_name = f'customer_{i}'
@@ -207,7 +203,7 @@ class AllocationDataService:
                         """
                         where_conditions.append(customer_condition)
                 
-                # Brand multiselect filter
+                # Brand filter
                 if filters.get('brands'):
                     brand_list = filters['brands']
                     exclude_brands = filters.get('exclude_brands', False)
@@ -222,7 +218,7 @@ class AllocationDataService:
                         brand_condition = f"p.brand_id {'NOT' if exclude_brands else ''} IN ({','.join(brand_params)})"
                         where_conditions.append(brand_condition)
                 
-                # OC Number multiselect filter
+                # OC Number filter
                 if filters.get('oc_numbers'):
                     oc_list = filters['oc_numbers']
                     exclude_ocs = filters.get('exclude_oc_numbers', False)
@@ -243,7 +239,7 @@ class AllocationDataService:
                         """
                         where_conditions.append(oc_condition)
                 
-                # Product (PT code) multiselect filter
+                # Product filter
                 if filters.get('products'):
                     product_list = filters['products']
                     exclude_products = filters.get('exclude_products', False)
@@ -258,7 +254,7 @@ class AllocationDataService:
                         product_condition = f"p.id {'NOT' if exclude_products else ''} IN ({','.join(product_params)})"
                         where_conditions.append(product_condition)
                 
-                # ETD range filter (single select)
+                # ETD days filter
                 if filters.get('etd_days'):
                     where_conditions.append("""
                         EXISTS (
@@ -281,7 +277,7 @@ class AllocationDataService:
                     params['date_from'] = filters['date_from']
                     params['date_to'] = filters['date_to']
                 
-                # Supply coverage filter (single select)
+                # Coverage filter
                 if filters.get('coverage'):
                     if filters['coverage'] == 'Critical (<20%)':
                         having_conditions.append("(total_supply < total_demand * 0.2 AND total_demand > 0)")
@@ -292,7 +288,45 @@ class AllocationDataService:
                     elif filters['coverage'] == 'Full (≥100%)':
                         having_conditions.append("(total_supply >= total_demand)")
                 
-                # Quick filter flags
+                # Allocation status filter
+                if filters.get('allocation_status_detail'):
+                    status = filters['allocation_status_detail']
+                    if status == 'Not Allocated':
+                        where_conditions.append("""
+                            EXISTS (
+                                SELECT 1 FROM outbound_oc_pending_delivery_view ocpd
+                                WHERE ocpd.product_id = p.id 
+                                AND ocpd.is_allocated = 'No'
+                            )
+                        """)
+                    elif status == 'Partially Allocated':
+                        where_conditions.append("""
+                            EXISTS (
+                                SELECT 1 FROM outbound_oc_pending_delivery_view ocpd
+                                WHERE ocpd.product_id = p.id 
+                                AND ocpd.is_allocated = 'Yes'
+                                AND ocpd.allocation_coverage_percent < 100
+                            )
+                        """)
+                    elif status == 'Fully Allocated':
+                        where_conditions.append("""
+                            EXISTS (
+                                SELECT 1 FROM outbound_oc_pending_delivery_view ocpd
+                                WHERE ocpd.product_id = p.id 
+                                AND ocpd.is_allocated = 'Yes'
+                                AND ocpd.allocation_coverage_percent = 100
+                            )
+                        """)
+                    elif status == 'Over Allocated':
+                        where_conditions.append("""
+                            EXISTS (
+                                SELECT 1 FROM outbound_oc_pending_delivery_view ocpd
+                                WHERE ocpd.product_id = p.id 
+                                AND ocpd.is_over_allocated = 'Yes'
+                            )
+                        """)
+                
+                # Quick filters
                 if filters.get('supply_status') == 'low':
                     having_conditions.append("(total_supply < total_demand * 0.5 AND total_demand > 0)")
                 
@@ -316,6 +350,15 @@ class AllocationDataService:
                 
                 if filters.get('has_inventory'):
                     having_conditions.append("inventory_qty > 0")
+                
+                if filters.get('over_allocated'):
+                    where_conditions.append("""
+                        EXISTS (
+                            SELECT 1 FROM outbound_oc_pending_delivery_view ocpd
+                            WHERE ocpd.product_id = p.id 
+                            AND ocpd.is_over_allocated = 'Yes'
+                        )
+                    """)
             
             where_clause = f"WHERE {' AND '.join(where_conditions)}" if where_conditions else ""
             having_clause = f"HAVING {' AND '.join(having_conditions)}" if having_conditions else ""
@@ -331,7 +374,9 @@ class AllocationDataService:
                         MIN(etd) as earliest_etd,
                         COUNT(CASE WHEN etd <= DATE_ADD(CURRENT_DATE, INTERVAL 7 DAY) THEN 1 END) as urgent_ocs,
                         GROUP_CONCAT(DISTINCT oc_number SEPARATOR ', ') as oc_numbers,
-                        GROUP_CONCAT(DISTINCT customer SEPARATOR ', ') as customers
+                        GROUP_CONCAT(DISTINCT customer SEPARATOR ', ') as customers,
+                        SUM(CASE WHEN is_over_allocated = 'Yes' THEN 1 ELSE 0 END) as over_allocated_count,
+                        MAX(CASE WHEN is_over_allocated = 'Yes' THEN 1 ELSE 0 END) as has_over_allocation
                     FROM outbound_oc_pending_delivery_view
                     WHERE pending_standard_delivery_quantity > 0
                     GROUP BY product_id
@@ -414,7 +459,9 @@ class AllocationDataService:
                     CASE 
                         WHEN pd.earliest_etd <= DATE_ADD(CURRENT_DATE, INTERVAL 7 DAY) THEN 1
                         ELSE 0
-                    END as is_urgent
+                    END as is_urgent,
+                    COALESCE(pd.over_allocated_count, 0) as over_allocated_count,
+                    COALESCE(pd.has_over_allocation, 0) as has_over_allocation
                 FROM products p
                 LEFT JOIN brands b ON p.brand_id = b.id
                 INNER JOIN product_demand pd ON p.id = pd.product_id
@@ -422,6 +469,7 @@ class AllocationDataService:
                 {where_clause}
                 {having_clause}
                 ORDER BY 
+                    pd.over_allocated_count DESC,
                     pd.urgent_ocs DESC,
                     (COALESCE(ps.total_supply, 0) / NULLIF(pd.total_demand, 0)) ASC,
                     pd.total_value DESC
@@ -541,7 +589,7 @@ class AllocationDataService:
             logger.error(f"Error getting search suggestions: {e}")
             return {'products': [], 'customers': [], 'brands': [], 'oc_numbers': []}
     
-    # ==================== Rest of methods remain the same ====================
+    # ==================== OC Details ====================
     
     @st.cache_data(ttl=300)
     def get_ocs_by_product(_self, product_id: int) -> pd.DataFrame:
@@ -567,11 +615,18 @@ class AllocationDataService:
                     allocation_coverage_percent,
                     is_allocated,
                     allocation_numbers,
-                    allocation_count
+                    allocation_count,
+                    is_over_allocated,
+                    over_allocated_qty,
+                    over_allocation_percent,
+                    allocation_warning
                 FROM outbound_oc_pending_delivery_view
                 WHERE product_id = :product_id
                 AND pending_selling_delivery_quantity > 0
-                ORDER BY etd ASC, outstanding_amount_usd DESC
+                ORDER BY 
+                    is_over_allocated DESC,
+                    etd ASC, 
+                    outstanding_amount_usd DESC
             """
             
             with _self.engine.connect() as conn:
@@ -587,14 +642,17 @@ class AllocationDataService:
             logger.error(f"Error loading OCs for product {product_id}: {e}")
             return pd.DataFrame()
     
-    def get_allocation_history(_self, oc_detail_id: int) -> pd.DataFrame:
-        """Get allocation history for an OC detail"""
+    # ==================== Allocation History ====================
+    
+    def get_allocation_history_with_details(_self, oc_detail_id: int) -> pd.DataFrame:
+        """Get allocation history with full details including cancellation info"""
         try:
             query = """
                 SELECT 
                     ap.allocation_number,
                     ap.allocation_date,
                     u.username as created_by,
+                    ad.id as allocation_detail_id,
                     ad.allocation_mode,
                     ad.allocated_qty,
                     ad.delivered_qty,
@@ -608,15 +666,19 @@ class AllocationDataService:
                         WHEN ac.cancelled_qty > 0 THEN 
                             CONCAT('Cancelled: ', ac.cancelled_qty, ' - ', ac.reason)
                         ELSE ''
-                    END as cancellation_info
+                    END as cancellation_info,
+                    CASE WHEN ac.has_cancellations > 0 THEN 1 ELSE 0 END as has_cancellations,
+                    ocd.selling_uom
                 FROM allocation_details ad
                 INNER JOIN allocation_plans ap ON ad.allocation_plan_id = ap.id
                 LEFT JOIN users u ON ap.creator_id = u.id
+                LEFT JOIN outbound_oc_pending_delivery_view ocd ON ad.demand_reference_id = ocd.ocd_id
                 LEFT JOIN (
                     SELECT 
                         allocation_detail_id,
                         SUM(CASE WHEN status = 'ACTIVE' THEN cancelled_qty ELSE 0 END) as cancelled_qty,
-                        MAX(CASE WHEN status = 'ACTIVE' THEN reason ELSE NULL END) as reason
+                        MAX(CASE WHEN status = 'ACTIVE' THEN reason ELSE NULL END) as reason,
+                        COUNT(*) as has_cancellations
                     FROM allocation_cancellations
                     GROUP BY allocation_detail_id
                 ) ac ON ad.id = ac.allocation_detail_id
@@ -631,8 +693,41 @@ class AllocationDataService:
             return df
             
         except Exception as e:
-            logger.error(f"Error loading allocation history: {e}")
+            logger.error(f"Error loading allocation history with details: {e}")
             return pd.DataFrame()
+    
+    def get_cancellation_history(_self, allocation_detail_id: int) -> pd.DataFrame:
+        """Get cancellation history for an allocation detail"""
+        try:
+            query = """
+                SELECT 
+                    ac.id as cancellation_id,
+                    ac.cancelled_qty,
+                    ac.reason,
+                    ac.reason_category,
+                    ac.cancelled_date,
+                    cancel_user.username as cancelled_by,
+                    ac.status,
+                    ac.reversed_date,
+                    reverse_user.username as reversed_by,
+                    ac.reversal_reason
+                FROM allocation_cancellations ac
+                LEFT JOIN users cancel_user ON ac.cancelled_by_user_id = cancel_user.id
+                LEFT JOIN users reverse_user ON ac.reversed_by_user_id = reverse_user.id
+                WHERE ac.allocation_detail_id = :allocation_detail_id
+                ORDER BY ac.cancelled_date DESC
+            """
+            
+            with _self.engine.connect() as conn:
+                df = pd.read_sql(text(query), conn, params={'allocation_detail_id': allocation_detail_id})
+            
+            return df
+            
+        except Exception as e:
+            logger.error(f"Error loading cancellation history: {e}")
+            return pd.DataFrame()
+    
+    # ==================== Dashboard Metrics ====================
     
     @st.cache_data(ttl=60)
     def get_dashboard_metrics_product_view(_self) -> Dict[str, Any]:
@@ -647,7 +742,8 @@ class AllocationDataService:
                         COALESCE(can.can_qty, 0) + 
                         COALESCE(po.po_qty, 0) + 
                         COALESCE(wht.wht_qty, 0) as supply_qty,
-                        MIN(ocpd.etd) as earliest_etd
+                        MIN(ocpd.etd) as earliest_etd,
+                        MAX(CASE WHEN ocpd.is_over_allocated = 'Yes' THEN 1 ELSE 0 END) as has_over_allocation
                     FROM products p
                     INNER JOIN outbound_oc_pending_delivery_view ocpd ON p.id = ocpd.product_id
                     LEFT JOIN (
@@ -682,7 +778,8 @@ class AllocationDataService:
                     SUM(demand_qty) as total_demand_qty,
                     SUM(supply_qty) as total_supply_qty,
                     COUNT(CASE WHEN supply_qty < demand_qty * 0.2 THEN 1 END) as critical_products,
-                    COUNT(CASE WHEN earliest_etd <= DATE_ADD(CURRENT_DATE, INTERVAL 7 DAY) THEN 1 END) as urgent_etd_count
+                    COUNT(CASE WHEN earliest_etd <= DATE_ADD(CURRENT_DATE, INTERVAL 7 DAY) THEN 1 END) as urgent_etd_count,
+                    SUM(has_over_allocation) as over_allocated_count
                 FROM product_summary
             """
             
@@ -697,7 +794,8 @@ class AllocationDataService:
                 'total_demand_qty': 0,
                 'total_supply_qty': 0,
                 'critical_products': 0,
-                'urgent_etd_count': 0
+                'urgent_etd_count': 0,
+                'over_allocated_count': 0
             }
             
         except Exception as e:
@@ -707,8 +805,11 @@ class AllocationDataService:
                 'total_demand_qty': 0,
                 'total_supply_qty': 0,
                 'critical_products': 0,
-                'urgent_etd_count': 0
+                'urgent_etd_count': 0,
+                'over_allocated_count': 0
             }
+    
+    # ==================== Supply Availability ====================
     
     def check_supply_availability(self, source_type: str, source_id: int, 
                                  product_id: int) -> Dict[str, Any]:
@@ -783,7 +884,7 @@ class AllocationDataService:
     
     @st.cache_data(ttl=300)
     def get_all_supply_for_product(_self, product_id: int) -> pd.DataFrame:
-        """Get all available supply sources for a product in one query"""
+        """Get all available supply sources for a product"""
         try:
             query = """
                 SELECT 
@@ -946,10 +1047,11 @@ class AllocationDataService:
                 'has_supply': False
             }
     
-    # Summary methods remain the same...
+    # ==================== Supply Summary Methods ====================
+    
     @st.cache_data(ttl=300)
     def get_inventory_summary(_self, product_id: Optional[int] = None) -> pd.DataFrame:
-        """Get inventory summary optimized for product view"""
+        """Get inventory summary for product view"""
         try:
             params = {}
             where_clause = "WHERE remaining_quantity > 0"
@@ -986,7 +1088,7 @@ class AllocationDataService:
     
     @st.cache_data(ttl=300)
     def get_can_summary(_self, product_id: Optional[int] = None) -> pd.DataFrame:
-        """Get CAN summary optimized for product view"""
+        """Get CAN summary for product view"""
         try:
             params = {}
             where_clause = "WHERE pending_quantity > 0"
@@ -1023,7 +1125,7 @@ class AllocationDataService:
     
     @st.cache_data(ttl=300)
     def get_po_summary(_self, product_id: Optional[int] = None) -> pd.DataFrame:
-        """Get PO summary optimized for product view"""
+        """Get PO summary for product view"""
         try:
             params = {}
             where_clause = "WHERE pending_standard_arrival_quantity > 0"
@@ -1059,7 +1161,7 @@ class AllocationDataService:
     
     @st.cache_data(ttl=300)
     def get_wht_summary(_self, product_id: Optional[int] = None) -> pd.DataFrame:
-        """Get warehouse transfer summary optimized for product view"""
+        """Get warehouse transfer summary for product view"""
         try:
             params = {}
             where_clause = "WHERE is_completed = 0 AND transfer_quantity > 0"
@@ -1095,45 +1197,4 @@ class AllocationDataService:
             
         except Exception as e:
             logger.error(f"Error loading WHT summary: {e}")
-            return pd.DataFrame()
-    
-    def get_existing_allocations(self, oc_detail_id: int) -> pd.DataFrame:
-        """Get existing allocations for an OC detail"""
-        try:
-            query = """
-                SELECT 
-                    ad.id as allocation_detail_id,
-                    ap.allocation_number,
-                    ap.allocation_date,
-                    ad.allocation_mode,
-                    ad.allocated_qty,
-                    ad.delivered_qty,
-                    ad.allocated_etd,
-                    ad.status,
-                    COALESCE(ad.supply_source_type, 'No specific source') as supply_source_type,
-                    ad.notes,
-                    COALESCE(ac.cancelled_qty, 0) as cancelled_qty,
-                    (ad.allocated_qty - COALESCE(ac.cancelled_qty, 0)) as effective_qty
-                FROM allocation_details ad
-                INNER JOIN allocation_plans ap ON ad.allocation_plan_id = ap.id
-                LEFT JOIN (
-                    SELECT 
-                        allocation_detail_id,
-                        SUM(CASE WHEN status = 'ACTIVE' THEN cancelled_qty ELSE 0 END) as cancelled_qty
-                    FROM allocation_cancellations
-                    GROUP BY allocation_detail_id
-                ) ac ON ad.id = ac.allocation_detail_id
-                WHERE ad.demand_reference_id = :oc_detail_id
-                AND ad.demand_type = 'OC'
-                AND ad.status = 'ALLOCATED'
-                ORDER BY ap.allocation_date DESC
-            """
-            
-            with self.engine.connect() as conn:
-                df = pd.read_sql(text(query), conn, params={'oc_detail_id': oc_detail_id})
-            
-            return df
-            
-        except Exception as e:
-            logger.error(f"Error loading existing allocations: {e}")
             return pd.DataFrame()

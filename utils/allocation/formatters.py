@@ -1,10 +1,10 @@
 """
-Formatting utilities for Allocation module
-Handles display formatting for UI
+Formatting utilities for Allocation module - Cleaned Version
+Only formatters used in the UI
 """
 import pandas as pd
 from datetime import datetime, date
-from typing import Union, Optional, Any
+from typing import Union, Optional
 import logging
 
 logger = logging.getLogger(__name__)
@@ -89,17 +89,21 @@ def format_date(value: Union[str, datetime, date, None],
         
         # Handle different input types
         if isinstance(value, str):
-            # Try to parse string date
             if value.strip() == "":
                 return "-"
             # Try common formats
-            for fmt in ["%Y-%m-%d", "%d/%m/%Y", "%Y-%m-%d %H:%M:%S"]:
+            for fmt in ["%Y-%m-%d", "%d/%m/%Y", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"]:
                 try:
-                    dt = datetime.strptime(value, fmt)
+                    dt = datetime.strptime(value.split('.')[0], fmt)  # Remove microseconds
                     return dt.strftime(format_str)
                 except ValueError:
                     continue
-            return value  # Return as-is if can't parse
+            # Try pandas parsing as last resort
+            try:
+                dt = pd.to_datetime(value)
+                return dt.strftime(format_str)
+            except:
+                return value  # Return as-is if can't parse
             
         elif isinstance(value, datetime):
             return value.strftime(format_str)
@@ -107,42 +111,14 @@ def format_date(value: Union[str, datetime, date, None],
         elif isinstance(value, date):
             return value.strftime(format_str)
             
+        elif isinstance(value, pd.Timestamp):
+            return value.strftime(format_str)
+            
         else:
             return str(value)
             
     except Exception as e:
         logger.debug(f"Error formatting date {value}: {e}")
-        return "-"
-
-
-def format_datetime(value: Union[str, datetime, None], 
-                   format_str: str = "%d/%m/%Y %H:%M") -> str:
-    """
-    Format datetime with time
-    
-    Args:
-        value: Datetime value to format
-        format_str: Output format string
-        
-    Returns:
-        Formatted datetime string
-    """
-    try:
-        if value is None or pd.isna(value):
-            return "-"
-        
-        if isinstance(value, str):
-            if value.strip() == "":
-                return "-"
-            # Try to parse
-            dt = pd.to_datetime(value)
-            return dt.strftime(format_str)
-        elif isinstance(value, datetime):
-            return value.strftime(format_str)
-        else:
-            return str(value)
-            
-    except Exception:
         return "-"
 
 
@@ -190,29 +166,6 @@ def format_percentage(value: Union[int, float, None], decimals: int = 1) -> str:
         return "-"
 
 
-def format_quantity_with_uom(quantity: Union[int, float, None], 
-                            uom: Optional[str] = None) -> str:
-    """
-    Format quantity with unit of measure
-    
-    Args:
-        quantity: Quantity value
-        uom: Unit of measure
-        
-    Returns:
-        Formatted string with UOM
-    """
-    qty_str = format_number(quantity, 2 if quantity and quantity != int(quantity) else 0)
-    
-    if qty_str == "-":
-        return "-"
-    
-    if uom:
-        return f"{qty_str} {uom}"
-    else:
-        return qty_str
-
-
 def format_allocation_mode(mode: str) -> str:
     """
     Format allocation mode with icon
@@ -229,128 +182,6 @@ def format_allocation_mode(mode: str) -> str:
     }
     
     return mode_map.get(mode, mode)
-
-
-def format_etd_variance(oc_etd: Union[date, None], 
-                       allocated_etd: Union[date, None]) -> str:
-    """
-    Format ETD variance between OC and allocation
-    
-    Args:
-        oc_etd: Original OC ETD
-        allocated_etd: Allocated ETD
-        
-    Returns:
-        Formatted variance string
-    """
-    try:
-        if not oc_etd or not allocated_etd or pd.isna(oc_etd) or pd.isna(allocated_etd):
-            return "-"
-        
-        # Ensure date objects
-        if isinstance(oc_etd, str):
-            oc_etd = pd.to_datetime(oc_etd).date()
-        if isinstance(allocated_etd, str):
-            allocated_etd = pd.to_datetime(allocated_etd).date()
-        
-        # Calculate difference
-        diff = (allocated_etd - oc_etd).days
-        
-        if diff == 0:
-            return "✅ On time"
-        elif diff < 0:
-            return f"⚡ {abs(diff)} days earlier"
-        else:
-            return f"⚠️ {diff} days later"
-            
-    except Exception:
-        return "-"
-
-
-def format_days_ago(value: Union[int, float, None]) -> str:
-    """
-    Format days ago in human-readable format
-    
-    Args:
-        value: Number of days
-        
-    Returns:
-        Formatted string
-    """
-    try:
-        if value is None or pd.isna(value):
-            return "-"
-        
-        days = int(value)
-        
-        if days == 0:
-            return "Today"
-        elif days == 1:
-            return "Yesterday"
-        elif days < 7:
-            return f"{days} days ago"
-        elif days < 30:
-            weeks = days // 7
-            return f"{weeks} week{'s' if weeks > 1 else ''} ago"
-        elif days < 365:
-            months = days // 30
-            return f"{months} month{'s' if months > 1 else ''} ago"
-        else:
-            years = days // 365
-            return f"{years} year{'s' if years > 1 else ''} ago"
-            
-    except (ValueError, TypeError):
-        return "-"
-
-
-def format_file_size(size_bytes: Union[int, float, None]) -> str:
-    """
-    Format file size in human-readable format
-    
-    Args:
-        size_bytes: Size in bytes
-        
-    Returns:
-        Formatted size string
-    """
-    try:
-        if size_bytes is None or pd.isna(size_bytes):
-            return "-"
-        
-        size = float(size_bytes)
-        
-        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
-            if size < 1024.0:
-                return f"{size:.1f} {unit}"
-            size /= 1024.0
-        
-        return f"{size:.1f} PB"
-        
-    except (ValueError, TypeError):
-        return "-"
-
-
-def format_supply_source(source_type: Optional[str]) -> str:
-    """
-    Format supply source type with icon
-    
-    Args:
-        source_type: Supply source type (can be None for SOFT allocation)
-        
-    Returns:
-        Formatted source string
-    """
-    if source_type is None or source_type == 'No specific source':
-        return '🔄 No specific source (SOFT)'
-    
-    source_map = {
-        'INVENTORY': '📦 Inventory',
-        'PENDING_CAN': '🚢 Pending CAN',
-        'PENDING_PO': '📋 Pending PO',
-        'PENDING_WHT': '🚚 WH Transfer'
-    }
-    
-    return source_map.get(source_type, source_type)
 
 
 def format_reason_category(category: str) -> str:
@@ -372,106 +203,3 @@ def format_reason_category(category: str) -> str:
     }
     
     return category_map.get(category, category)
-
-
-def truncate_text(text: str, max_length: int = 50, suffix: str = "...") -> str:
-    """
-    Truncate text to maximum length
-    
-    Args:
-        text: Text to truncate
-        max_length: Maximum length
-        suffix: Suffix to add if truncated
-        
-    Returns:
-        Truncated text
-    """
-    if not text:
-        return ""
-    
-    if len(text) <= max_length:
-        return text
-    
-    return text[:max_length - len(suffix)] + suffix
-
-
-def format_list_display(items: list, max_items: int = 3, 
-                       separator: str = ", ") -> str:
-    """
-    Format list for display with truncation
-    
-    Args:
-        items: List of items
-        max_items: Maximum items to show
-        separator: Item separator
-        
-    Returns:
-        Formatted list string
-    """
-    if not items:
-        return "-"
-    
-    if len(items) <= max_items:
-        return separator.join(str(item) for item in items)
-    else:
-        displayed = separator.join(str(item) for item in items[:max_items])
-        remaining = len(items) - max_items
-        return f"{displayed} (+{remaining} more)"
-
-
-def get_status_color(status: str) -> str:
-    """
-    Get color for status display
-    
-    Args:
-        status: Status string
-        
-    Returns:
-        Color name for Streamlit
-    """
-    color_map = {
-        'Not Allocated': 'gray',
-        'Partially Allocated': 'orange',
-        'Fully Allocated': 'green',
-        'Over Allocated': 'red',
-        'COMPLETED': 'green',
-        'IN_PROCESS': 'blue',
-        'PENDING': 'gray',
-        'CANCELLED': 'red'
-    }
-    
-    return color_map.get(status, 'gray')
-
-
-def format_comparison(actual: Union[int, float], 
-                     target: Union[int, float], 
-                     format_type: str = "number") -> str:
-    """
-    Format comparison between actual and target
-    
-    Args:
-        actual: Actual value
-        target: Target value
-        format_type: Type of formatting (number, currency, percentage)
-        
-    Returns:
-        Formatted comparison string
-    """
-    try:
-        if pd.isna(actual) or pd.isna(target):
-            return "-"
-        
-        if format_type == "currency":
-            actual_str = format_currency(actual)
-            target_str = format_currency(target)
-        elif format_type == "percentage":
-            actual_str = format_percentage(actual)
-            target_str = format_percentage(target)
-        else:
-            actual_str = format_number(actual)
-            target_str = format_number(target)
-        
-        return f"{actual_str} / {target_str}"
-        
-    except Exception:
-        return "-"

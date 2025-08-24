@@ -1,6 +1,6 @@
 """
-Allocation Planning System - Multiselect Filter Version
-Enhanced UX with multiselect filters and exclude/include options
+Allocation Planning System - Cleaned Version
+Product-centric view with complete allocation management
 """
 import streamlit as st
 import pandas as pd
@@ -16,7 +16,8 @@ from utils.allocation.data_service import AllocationDataService
 from utils.allocation.allocation_service import AllocationService
 from utils.allocation.formatters import (
     format_number, format_date, format_status, 
-    format_percentage, format_currency
+    format_percentage, format_currency, format_allocation_mode,
+    format_reason_category
 )
 from utils.allocation.validators import AllocationValidator
 
@@ -43,39 +44,41 @@ if not auth.check_session():
     st.switch_page("app.py")
     st.stop()
 
-# Initialize session state
-if 'selected_product' not in st.session_state:
-    st.session_state.selected_product = None
-if 'show_allocation_modal' not in st.session_state:
-    st.session_state.show_allocation_modal = False
-if 'selected_oc_for_allocation' not in st.session_state:
-    st.session_state.selected_oc_for_allocation = None
-if 'filters' not in st.session_state:
-    st.session_state.filters = {}
-if 'expanded_products' not in st.session_state:
-    st.session_state.expanded_products = set()
-if 'page_number' not in st.session_state:
-    st.session_state.page_number = 1
-if 'show_advanced_filters' not in st.session_state:
-    st.session_state.show_advanced_filters = False
-if 'user_id' not in st.session_state:
-    st.session_state.user_id = st.session_state.get('authenticated_user_id', 1)
-if 'show_allocation_history' not in st.session_state:
-    st.session_state.show_allocation_history = False
-if 'selected_oc_for_history' not in st.session_state:
-    st.session_state.selected_oc_for_history = None
-if 'selected_oc_info' not in st.session_state:
-    st.session_state.selected_oc_info = None
+# Initialize session state with default values
+DEFAULT_SESSION_STATE = {
+    'selected_product': None,
+    'show_allocation_modal': False,
+    'selected_oc_for_allocation': None,
+    'filters': {},
+    'expanded_products': set(),
+    'page_number': 1,
+    'show_advanced_filters': False,
+    'user_id': None,
+    'user_role': 'viewer',
+    'show_allocation_history': False,
+    'selected_oc_for_history': None,
+    'selected_oc_info': None,
+    'selected_customers': [],
+    'selected_brands': [],
+    'selected_oc_numbers': [],
+    'selected_products': [],
+    'show_cancel_modal': False,
+    'selected_allocation_for_cancel': None,
+    'show_update_etd_modal': False,
+    'selected_allocation_for_update': None,
+    'show_reverse_modal': False,
+    'selected_cancellation_for_reverse': None
+}
 
-# Initialize multiselect states
-if 'selected_customers' not in st.session_state:
-    st.session_state.selected_customers = []
-if 'selected_brands' not in st.session_state:
-    st.session_state.selected_brands = []
-if 'selected_oc_numbers' not in st.session_state:
-    st.session_state.selected_oc_numbers = []
-if 'selected_products' not in st.session_state:
-    st.session_state.selected_products = []
+for key, default_value in DEFAULT_SESSION_STATE.items():
+    if key not in st.session_state:
+        st.session_state[key] = default_value
+
+# Set user info if not already set
+if st.session_state.user_id is None:
+    st.session_state.user_id = st.session_state.get('authenticated_user_id', 1)
+if st.session_state.user_role == 'viewer':
+    st.session_state.user_role = st.session_state.get('user_role', 'viewer')
 
 # Constants
 ITEMS_PER_PAGE = 50
@@ -84,14 +87,14 @@ ITEMS_PER_PAGE = 50
 col1, col2 = st.columns([6, 1])
 with col1:
     st.title("📦 Allocation Planning System")
-    st.caption("Product-centric view for efficient allocation management")
+    st.caption("Product-centric view with complete allocation management")
 with col2:
     if st.button("🚪 Logout", use_container_width=True):
         auth.logout()
         st.switch_page("app.py")
 
 # User info
-st.caption(f"👤 {auth.get_user_display_name()} | 🕐 {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+st.caption(f"👤 {auth.get_user_display_name()} ({st.session_state.user_role}) | 🕐 {datetime.now().strftime('%Y-%m-%d %H:%M')}")
 
 def get_supply_status_indicator(total_demand, total_supply):
     """Get visual status indicator for supply vs demand"""
@@ -109,7 +112,7 @@ def show_metrics_row():
     try:
         metrics = data_service.get_dashboard_metrics_product_view()
         
-        col1, col2, col3, col4, col5 = st.columns(5)
+        col1, col2, col3, col4, col5, col6 = st.columns(6)
         
         with col1:
             st.metric(
@@ -129,7 +132,7 @@ def show_metrics_row():
             st.metric(
                 "Total Supply",
                 format_number(metrics.get('total_supply_qty', 0)),
-                help="Total available quantity from all sources: Inventory + CAN + PO + Transfer"
+                help="Total available quantity from all sources"
             )
         
         with col4:
@@ -145,6 +148,14 @@ def show_metrics_row():
                 format_number(metrics.get('urgent_etd_count', 0)),
                 help="Products with at least one order due within the next 7 days"
             )
+        
+        with col6:
+            st.metric(
+                "⚡ Over-Allocated",
+                format_number(metrics.get('over_allocated_count', 0)),
+                help="Number of orders that are over-allocated",
+                delta="Needs attention" if metrics.get('over_allocated_count', 0) > 0 else None
+            )
     except Exception as e:
         logger.error(f"Error loading metrics: {e}")
         st.error(f"Error loading metrics: {str(e)}")
@@ -158,7 +169,6 @@ def show_search_and_filters():
         # Search input with clear button
         search_container = st.container()
         with search_container:
-            # Create columns for search input and clear button
             search_col, clear_col = st.columns([10, 1])
             
             with search_col:
@@ -181,11 +191,9 @@ def show_search_and_filters():
             if search_query and len(search_query) >= 2:
                 suggestions = data_service.get_search_suggestions(search_query)
                 
-                # Check if there are any suggestions
                 has_suggestions = any(suggestions.values())
                 
                 if has_suggestions:
-                    # Display suggestions in a container
                     with st.container():
                         # Display suggestions by category
                         if suggestions['products']:
@@ -233,7 +241,6 @@ def show_search_and_filters():
                                     st.session_state.search_input = oc
                                     st.rerun()
             
-            # Update search filter
             if search_query:
                 st.session_state.filters['search'] = search_query
             else:
@@ -258,7 +265,6 @@ def show_search_and_filters():
             with col1:
                 st.markdown("**Customer**")
                 
-                # Include/Exclude toggle
                 customer_mode = st.radio(
                     "Customer filter mode",
                     ["Include", "Exclude"],
@@ -267,9 +273,7 @@ def show_search_and_filters():
                     label_visibility="collapsed"
                 )
                 
-                # Customer multiselect
                 if not customers_df.empty:
-                    # Format options with stats
                     customer_options = []
                     customer_map = {}
                     for _, row in customers_df.iterrows():
@@ -286,14 +290,12 @@ def show_search_and_filters():
                         label_visibility="collapsed"
                     )
                     
-                    # Map back to customer codes
                     selected_customer_codes = [customer_map[opt] for opt in selected_customer_options]
                     st.session_state.selected_customers = selected_customer_options
             
             with col2:
                 st.markdown("**Brand**")
                 
-                # Include/Exclude toggle
                 brand_mode = st.radio(
                     "Brand filter mode",
                     ["Include", "Exclude"],
@@ -302,9 +304,7 @@ def show_search_and_filters():
                     label_visibility="collapsed"
                 )
                 
-                # Brand multiselect
                 if not brands_df.empty:
-                    # Format options with stats
                     brand_options = []
                     brand_map = {}
                     for _, row in brands_df.iterrows():
@@ -321,7 +321,6 @@ def show_search_and_filters():
                         label_visibility="collapsed"
                     )
                     
-                    # Map back to brand IDs
                     selected_brand_ids = [brand_map[opt] for opt in selected_brand_options]
                     st.session_state.selected_brands = selected_brand_options
             
@@ -331,7 +330,6 @@ def show_search_and_filters():
             with col3:
                 st.markdown("**OC Number**")
                 
-                # Include/Exclude toggle
                 oc_mode = st.radio(
                     "OC filter mode",
                     ["Include", "Exclude"],
@@ -340,9 +338,7 @@ def show_search_and_filters():
                     label_visibility="collapsed"
                 )
                 
-                # OC Number multiselect
                 if not oc_numbers_df.empty:
-                    # Format options with customer info
                     oc_options = []
                     oc_map = {}
                     for _, row in oc_numbers_df.iterrows():
@@ -359,14 +355,12 @@ def show_search_and_filters():
                         label_visibility="collapsed"
                     )
                     
-                    # Map back to OC numbers
                     selected_oc_numbers = [oc_map[opt] for opt in selected_oc_options]
                     st.session_state.selected_oc_numbers = selected_oc_options
             
             with col4:
                 st.markdown("**PT Code - Product Name**")
                 
-                # Include/Exclude toggle
                 product_mode = st.radio(
                     "Product filter mode",
                     ["Include", "Exclude"],
@@ -375,9 +369,7 @@ def show_search_and_filters():
                     label_visibility="collapsed"
                 )
                 
-                # Product multiselect
                 if not products_df.empty:
-                    # Format options
                     product_options = []
                     product_map = {}
                     for _, row in products_df.iterrows():
@@ -396,12 +388,11 @@ def show_search_and_filters():
                         label_visibility="collapsed"
                     )
                     
-                    # Map back to product IDs
                     selected_product_ids = [product_map[opt] for opt in selected_product_options]
                     st.session_state.selected_products = selected_product_options
             
-            # Third row: ETD Range and Supply Coverage (single select)
-            col5, col6 = st.columns(2)
+            # Third row: ETD Range, Supply Coverage, and Allocation Status
+            col5, col6, col7 = st.columns(3)
             
             with col5:
                 st.markdown("**ETD Range**")
@@ -425,6 +416,15 @@ def show_search_and_filters():
                     "Supply Coverage",
                     ["All", "Critical (<20%)", "Low (<50%)", "Partial (50-99%)", "Full (≥100%)"],
                     key="filter_coverage",
+                    label_visibility="collapsed"
+                )
+            
+            with col7:
+                st.markdown("**Allocation Status**")
+                allocation_status = st.selectbox(
+                    "Allocation Status",
+                    ["All", "Not Allocated", "Partially Allocated", "Fully Allocated", "Over Allocated"],
+                    key="filter_allocation_status",
                     label_visibility="collapsed"
                 )
             
@@ -472,6 +472,10 @@ def show_search_and_filters():
                     if coverage_option != "All":
                         new_filters['coverage'] = coverage_option
                     
+                    # Allocation status filter
+                    if allocation_status != "All":
+                        new_filters['allocation_status_detail'] = allocation_status
+                    
                     # Keep search filter if exists
                     if 'search' in st.session_state.filters:
                         new_filters['search'] = st.session_state.filters['search']
@@ -499,12 +503,11 @@ def show_search_and_filters():
     
     # Quick filters with visual feedback
     st.markdown("**Quick Filters:**")
-    filter_cols = st.columns(5)
+    filter_cols = st.columns(6)
     
     # Helper function to show active state
     def is_filter_active(filter_type):
         if filter_type == 'all':
-            # Check if only search filter exists
             return len([k for k in st.session_state.filters.keys() if k != 'search']) == 0
         elif filter_type == 'low_supply':
             return st.session_state.filters.get('supply_status') == 'low'
@@ -514,12 +517,13 @@ def show_search_and_filters():
             return st.session_state.filters.get('allocation_status') == 'none'
         elif filter_type == 'has_inventory':
             return st.session_state.filters.get('has_inventory') == True
+        elif filter_type == 'over_allocated':
+            return st.session_state.filters.get('over_allocated') == True
         return False
     
     with filter_cols[0]:
         button_type = "primary" if is_filter_active('all') else "secondary"
         if st.button("All", use_container_width=True, type=button_type):
-            # Keep search filter
             search_filter = st.session_state.filters.get('search')
             st.session_state.filters = {}
             if search_filter:
@@ -543,7 +547,7 @@ def show_search_and_filters():
     
     with filter_cols[3]:
         button_type = "primary" if is_filter_active('not_allocated') else "secondary"
-        if st.button("❌ Not Allocated", use_container_width=True, type=button_type):
+        if st.button("⏳ Not Allocated", use_container_width=True, type=button_type):
             st.session_state.filters['allocation_status'] = 'none'
             st.session_state.page_number = 1
             st.rerun()
@@ -555,16 +559,21 @@ def show_search_and_filters():
             st.session_state.page_number = 1
             st.rerun()
     
+    with filter_cols[5]:
+        button_type = "primary" if is_filter_active('over_allocated') else "secondary"
+        if st.button("⚡ Over Allocated", use_container_width=True, type=button_type):
+            st.session_state.filters['over_allocated'] = True
+            st.session_state.page_number = 1
+            st.rerun()
+    
     # Show active filters with clear button for each
     active_filters = [(k, v) for k, v in st.session_state.filters.items() if k != 'search']
     if active_filters:
         st.markdown("**Active Filters:**")
         filter_container = st.container()
         with filter_container:
-            # Display multiselect filters with exclude/include info
             display_filters = []
             
-            # Format filter display
             for key, value in active_filters:
                 if key == 'customers':
                     mode = "Exclude" if st.session_state.filters.get('exclude_customers') else "Include"
@@ -579,23 +588,22 @@ def show_search_and_filters():
                     mode = "Exclude" if st.session_state.filters.get('exclude_products') else "Include"
                     display_filters.append((f"Products ({mode}): {len(value)} selected", key))
                 elif key not in ['exclude_customers', 'exclude_brands', 'exclude_oc_numbers', 'exclude_products']:
-                    # Other filters
                     filter_label = {
                         'supply_status': '⚠️ Low Supply',
                         'etd_urgency': '🔴 Urgent ETD',
-                        'allocation_status': '❌ Not Allocated',
+                        'allocation_status': '⏳ Not Allocated',
                         'has_inventory': '📦 Has Inventory',
+                        'over_allocated': '⚡ Over Allocated',
                         'etd_days': f'ETD: Next {value} days',
-                        'coverage': f'Coverage: {value}'
+                        'coverage': f'Coverage: {value}',
+                        'allocation_status_detail': f'Status: {value}'
                     }.get(key, f"{key}: {value}")
                     display_filters.append((filter_label, key))
             
-            # Display in columns
             cols = st.columns(5)
             for idx, (label, key) in enumerate(display_filters[:5]):
                 with cols[idx % 5]:
                     if st.button(f"{label} ✕", key=f"clear_{key}"):
-                        # Remove filter and related exclude flag
                         st.session_state.filters.pop(key, None)
                         if key == 'customers':
                             st.session_state.filters.pop('exclude_customers', None)
@@ -610,7 +618,6 @@ def show_search_and_filters():
 
 def show_product_list():
     """Display product list with demand/supply summary"""
-    # Get product data
     try:
         products_df = data_service.get_products_with_demand_supply(
             filters=st.session_state.filters,
@@ -626,7 +633,6 @@ def show_product_list():
         products_df = pd.DataFrame()
     
     if products_df.empty:
-        # Show helpful message
         col1, col2, col3 = st.columns([1, 2, 1])
         with col2:
             st.info("No products found with current filters")
@@ -704,6 +710,10 @@ def show_product_list():
                     st.caption(f"📄 OCs: {', '.join(oc_list[:3])}... (+{len(oc_list)-3} more)")
                 else:
                     st.caption(f"📄 OCs: {row['oc_numbers']}")
+            
+            # Show over-allocation warning if exists
+            if row.get('has_over_allocation'):
+                st.warning(f"⚡ {row.get('over_allocated_count', 0)} OCs are over-allocated")
 
         with cols[1]:
             # Demand info
@@ -751,7 +761,7 @@ def show_product_details(product_row):
             show_product_supply_details(product_row['product_id'])
 
 def show_product_demand_details(product_id):
-    """Show OCs for a product"""
+    """Show OCs for a product with over-allocation warnings"""
     ocs_df = data_service.get_ocs_by_product(product_id)
     
     if ocs_df.empty:
@@ -775,6 +785,13 @@ def show_product_demand_details(product_id):
     
     # Create OC table rows
     for idx, oc in ocs_df.iterrows():
+        # Check for over-allocation
+        is_over_allocated = oc.get('is_over_allocated') == 'Yes'
+        
+        # Show warning if over-allocated
+        if is_over_allocated:
+            st.error(f"⚡ {oc.get('allocation_warning', 'Over-allocated')}")
+        
         cols = st.columns([2, 2, 1, 1, 1.5, 1.5])
         
         with cols[0]:
@@ -809,11 +826,18 @@ def show_product_demand_details(product_id):
                 if allocation_count > 1:
                     button_label += f" ({allocation_count})"
                 
+                # Color coding for allocation status
+                if is_over_allocated:
+                    button_type = "secondary"  # Red for over-allocated
+                else:
+                    button_type = "secondary"
+                
                 if st.button(
                     button_label, 
                     key=f"view_alloc_{oc['ocd_id']}", 
                     help=f"Click to view {allocation_count} allocation(s)",
-                    use_container_width=True
+                    use_container_width=True,
+                    type=button_type
                 ):
                     st.session_state.show_allocation_history = True
                     st.session_state.selected_oc_for_history = oc['ocd_id']
@@ -821,7 +845,10 @@ def show_product_demand_details(product_id):
                         'oc_number': oc['oc_number'],
                         'customer': oc['customer'],
                         'product_name': oc['product_name'],
-                        'selling_uom': oc.get('selling_uom', '')
+                        'selling_uom': oc.get('selling_uom', ''),
+                        'pending_quantity': oc['pending_quantity'],
+                        'is_over_allocated': is_over_allocated,
+                        'allocation_warning': oc.get('allocation_warning', '')
                     }
                     st.rerun()
             else:
@@ -835,7 +862,7 @@ def show_product_demand_details(product_id):
 
 @st.dialog("Allocation History", width="large")
 def show_allocation_history_modal():
-    """Show allocation history for selected OC"""
+    """Show allocation history for selected OC with management actions"""
     if 'selected_oc_for_history' not in st.session_state:
         st.error("No OC selected")
         return
@@ -846,17 +873,38 @@ def show_allocation_history_modal():
     # Header
     st.markdown(f"### Allocation History for {oc_info['oc_number']}")
     
+    # Show over-allocation warning if applicable
+    if oc_info.get('is_over_allocated'):
+        st.error(f"⚡ {oc_info.get('allocation_warning', 'This OC is over-allocated')}")
+    
     col1, col2 = st.columns(2)
     with col1:
         st.caption(f"**Customer:** {oc_info['customer']}")
     with col2:
         st.caption(f"**Product:** {oc_info['product_name']}")
     
+    # Summary metrics
+    metrics_cols = st.columns(3)
+    with metrics_cols[0]:
+        st.metric("Pending Qty", f"{format_number(oc_info['pending_quantity'])} {oc_info['selling_uom']}")
+    with metrics_cols[1]:
+        # Get total allocated from history
+        history_df = data_service.get_allocation_history_with_details(oc_detail_id)
+        if not history_df.empty:
+            total_effective = history_df['effective_qty'].sum()
+            st.metric("Total Allocated", f"{format_number(total_effective)} {oc_info['selling_uom']}")
+        else:
+            st.metric("Total Allocated", f"0 {oc_info['selling_uom']}")
+    with metrics_cols[2]:
+        if not history_df.empty:
+            coverage = (total_effective / oc_info['pending_quantity'] * 100) if oc_info['pending_quantity'] > 0 else 0
+            st.metric("Coverage", format_percentage(coverage))
+        else:
+            st.metric("Coverage", "0%")
+    
     st.divider()
     
-    # Get allocation history
-    history_df = data_service.get_allocation_history(oc_detail_id)
-    
+    # Get allocation history with cancellation details
     if history_df.empty:
         st.info("No allocation history found")
     else:
@@ -874,7 +922,7 @@ def show_allocation_history_modal():
                 with col1:
                     st.markdown(f"{status_color} **{alloc['allocation_number']}**")
                 with col2:
-                    st.caption(f"Mode: {alloc['allocation_mode']}")
+                    st.caption(f"Mode: {format_allocation_mode(alloc['allocation_mode'])}")
                 with col3:
                     st.caption(f"Status: {alloc['status']}")
                 
@@ -908,13 +956,59 @@ def show_allocation_history_modal():
                     st.caption(f"👤 **Created by:** {alloc['created_by']}")
                 
                 # Supply source and notes
-                st.caption(f"📦 **Source:** {alloc['supply_source_type']}")
+                st.caption(f"📦 **Source:** {alloc['supply_source_type'] or 'No specific source (SOFT)'}")
                 
                 if alloc.get('notes'):
                     st.caption(f"📝 **Notes:** {alloc['notes']}")
                 
+                # Show cancellation info if any
                 if alloc.get('cancellation_info'):
-                    st.warning(f"⚠️ {alloc['cancellation_info']}")
+                    st.warning(f"❌ {alloc['cancellation_info']}")
+                
+                # Action buttons based on permissions and status
+                if alloc['status'] == 'ALLOCATED':
+                    action_cols = st.columns([1, 1, 2])
+                    
+                    # Update ETD button (only for SOFT allocations)
+                    with action_cols[0]:
+                        if alloc['allocation_mode'] == 'SOFT' and alloc['delivered_qty'] == 0:
+                            if validator.check_permission(st.session_state.user_role, 'update'):
+                                if st.button("📅 Update ETD", key=f"update_etd_{alloc['allocation_detail_id']}"):
+                                    st.session_state.show_update_etd_modal = True
+                                    st.session_state.selected_allocation_for_update = alloc.to_dict()
+                                    st.rerun()
+                    
+                    # Cancel button
+                    with action_cols[1]:
+                        if alloc['effective_qty'] > 0:
+                            if validator.check_permission(st.session_state.user_role, 'cancel'):
+                                if st.button("❌ Cancel", key=f"cancel_{alloc['allocation_detail_id']}"):
+                                    st.session_state.show_cancel_modal = True
+                                    st.session_state.selected_allocation_for_cancel = alloc.to_dict()
+                                    st.rerun()
+                
+                # Show cancellation history if exists
+                if alloc.get('has_cancellations'):
+                    with st.expander("View Cancellation History"):
+                        cancellations = data_service.get_cancellation_history(alloc['allocation_detail_id'])
+                        for _, cancel in cancellations.iterrows():
+                            cancel_cols = st.columns([2, 1, 1, 1])
+                            with cancel_cols[0]:
+                                st.text(f"Cancelled {format_number(cancel['cancelled_qty'])} {uom}")
+                            with cancel_cols[1]:
+                                st.text(format_date(cancel['cancelled_date']))
+                            with cancel_cols[2]:
+                                st.text(format_reason_category(cancel['reason_category']))
+                            with cancel_cols[3]:
+                                if cancel['status'] == 'ACTIVE' and validator.check_permission(st.session_state.user_role, 'reverse'):
+                                    if st.button("↩️ Reverse", key=f"reverse_{cancel['cancellation_id']}"):
+                                        st.session_state.show_reverse_modal = True
+                                        st.session_state.selected_cancellation_for_reverse = cancel.to_dict()
+                                        st.rerun()
+                            
+                            st.caption(f"Reason: {cancel['reason']}")
+                            if cancel['status'] == 'REVERSED':
+                                st.info(f"✅ Reversed on {format_date(cancel['reversed_date'])} by {cancel['reversed_by']}")
                 
                 st.divider()
     
@@ -924,6 +1018,222 @@ def show_allocation_history_modal():
         st.session_state.selected_oc_for_history = None
         st.session_state.selected_oc_info = None
         st.rerun()
+
+@st.dialog("Cancel Allocation", width="medium")
+def show_cancel_allocation_modal():
+    """Modal for cancelling allocation"""
+    allocation = st.session_state.selected_allocation_for_cancel
+    
+    if not allocation:
+        st.error("No allocation selected")
+        return
+    
+    st.markdown(f"### Cancel Allocation {allocation['allocation_number']}")
+    
+    # Show allocation info
+    st.info(f"Current effective quantity: {format_number(allocation['effective_qty'])} {allocation.get('selling_uom', '')}")
+    
+    # Validate if can cancel
+    if allocation['allocation_mode'] == 'HARD':
+        st.error("❌ Cannot cancel HARD allocation. Please contact manager for approval.")
+        if st.button("Close"):
+            st.session_state.show_cancel_modal = False
+            st.rerun()
+        return
+    
+    if allocation.get('delivered_qty', 0) > 0:
+        st.warning(f"⚠️ {format_number(allocation['delivered_qty'])} already delivered. You can only cancel undelivered quantity.")
+    
+    # Cancel quantity input
+    max_cancel = allocation['effective_qty'] - allocation.get('delivered_qty', 0)
+    
+    cancel_qty = st.number_input(
+        "Quantity to Cancel",
+        min_value=0.0,
+        max_value=float(max_cancel),
+        value=float(max_cancel),
+        step=1.0,
+        help=f"Maximum cancellable: {format_number(max_cancel)}"
+    )
+    
+    # Reason category
+    reason_category = st.selectbox(
+        "Reason Category",
+        options=['CUSTOMER_REQUEST', 'SUPPLY_ISSUE', 'QUALITY_ISSUE', 'BUSINESS_DECISION', 'OTHER'],
+        format_func=lambda x: format_reason_category(x)
+    )
+    
+    # Detailed reason
+    reason = st.text_area(
+        "Detailed Reason", 
+        help="Please provide a detailed reason (minimum 10 characters)",
+        placeholder="Explain why this allocation is being cancelled..."
+    )
+    
+    # Validation
+    errors = validator.validate_cancel_allocation(
+        allocation,
+        cancel_qty,
+        reason,
+        reason_category,
+        st.session_state.user_role
+    )
+    
+    if errors:
+        for error in errors:
+            st.error(f"❌ {error}")
+    
+    # Action buttons
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("Cancel Allocation", type="primary", disabled=len(errors) > 0):
+            result = allocation_service.cancel_allocation(
+                allocation['allocation_detail_id'],
+                cancel_qty,
+                reason,
+                reason_category,
+                st.session_state.user_id
+            )
+            
+            if result['success']:
+                st.success(f"✅ Successfully cancelled {format_number(cancel_qty)} units")
+                time.sleep(1)
+                st.session_state.show_cancel_modal = False
+                st.cache_data.clear()
+                st.rerun()
+            else:
+                st.error(f"❌ {result['error']}")
+    
+    with col2:
+        if st.button("Close"):
+            st.session_state.show_cancel_modal = False
+            st.rerun()
+
+@st.dialog("Update Allocated ETD", width="medium")
+def show_update_etd_modal():
+    """Modal for updating allocated ETD"""
+    allocation = st.session_state.selected_allocation_for_update
+    
+    if not allocation:
+        st.error("No allocation selected")
+        return
+    
+    st.markdown(f"### Update ETD for {allocation['allocation_number']}")
+    
+    # Show current ETD
+    st.info(f"Current Allocated ETD: {format_date(allocation['allocated_etd'])}")
+    
+    # Validate if can update
+    valid, error = validator.validate_update_etd(
+        allocation,
+        allocation['allocated_etd'],  # Dummy for initial check
+        st.session_state.user_role
+    )
+    
+    if not valid and error != "Invalid ETD format" and error != "New ETD is the same as current ETD":
+        st.error(f"❌ {error}")
+        if st.button("Close"):
+            st.session_state.show_update_etd_modal = False
+            st.rerun()
+        return
+    
+    # New ETD input
+    current_etd = pd.to_datetime(allocation['allocated_etd']).date()
+    new_etd = st.date_input(
+        "New Allocated ETD",
+        value=current_etd,
+        min_value=datetime.now().date() - timedelta(days=30),
+        max_value=datetime.now().date() + timedelta(days=365)
+    )
+    
+    # Show ETD change
+    if new_etd != current_etd:
+        diff_days = (new_etd - current_etd).days
+        if diff_days > 0:
+            st.warning(f"⚠️ Delaying by {diff_days} days")
+        else:
+            st.success(f"✅ Advancing by {abs(diff_days)} days")
+    
+    # Action buttons
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("Update ETD", type="primary", disabled=(new_etd == current_etd)):
+            result = allocation_service.update_allocation_etd(
+                allocation['allocation_detail_id'],
+                new_etd,
+                st.session_state.user_id
+            )
+            
+            if result['success']:
+                st.success("✅ ETD updated successfully")
+                time.sleep(1)
+                st.session_state.show_update_etd_modal = False
+                st.cache_data.clear()
+                st.rerun()
+            else:
+                st.error(f"❌ {result['error']}")
+    
+    with col2:
+        if st.button("Close"):
+            st.session_state.show_update_etd_modal = False
+            st.rerun()
+
+@st.dialog("Reverse Cancellation", width="medium")
+def show_reverse_cancellation_modal():
+    """Modal for reversing a cancellation"""
+    cancellation = st.session_state.selected_cancellation_for_reverse
+    
+    if not cancellation:
+        st.error("No cancellation selected")
+        return
+    
+    st.markdown("### Reverse Cancellation")
+    
+    # Show cancellation info
+    st.info(f"Cancelled Quantity: {format_number(cancellation['cancelled_qty'])}")
+    st.caption(f"Cancelled on: {format_date(cancellation['cancelled_date'])} by {cancellation['cancelled_by']}")
+    st.caption(f"Original reason: {cancellation['reason']}")
+    
+    # Reversal reason
+    reversal_reason = st.text_area(
+        "Reversal Reason",
+        help="Please explain why this cancellation is being reversed (minimum 10 characters)",
+        placeholder="Explain why you are reversing this cancellation..."
+    )
+    
+    # Validation
+    valid, error = validator.validate_reverse_cancellation(
+        cancellation,
+        reversal_reason,
+        st.session_state.user_role
+    )
+    
+    if not valid:
+        st.error(f"❌ {error}")
+    
+    # Action buttons
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("Reverse Cancellation", type="primary", disabled=not valid):
+            result = allocation_service.reverse_cancellation(
+                cancellation['cancellation_id'],
+                reversal_reason,
+                st.session_state.user_id
+            )
+            
+            if result['success']:
+                st.success("✅ Cancellation reversed successfully")
+                time.sleep(1)
+                st.session_state.show_reverse_modal = False
+                st.cache_data.clear()
+                st.rerun()
+            else:
+                st.error(f"❌ {result['error']}")
+    
+    with col2:
+        if st.button("Close"):
+            st.session_state.show_reverse_modal = False
+            st.rerun()
 
 def show_product_supply_details(product_id):
     """Show supply sources for a product"""
@@ -1012,6 +1322,10 @@ def show_allocation_modal():
     # Header info
     st.markdown(f"### Allocate to {oc['oc_number']}")
     
+    # Show warning if OC is already over-allocated
+    if oc.get('is_over_allocated') == 'Yes':
+        st.warning(f"⚠️ This OC is already over-allocated! {oc.get('allocation_warning', '')}")
+    
     col1, col2, col3 = st.columns(3)
     with col1:
         st.metric("Customer", oc['customer'])
@@ -1026,7 +1340,7 @@ def show_allocation_modal():
     supply_details = data_service.get_all_supply_for_product(oc['product_id'])
     
     if supply_details.empty:
-        st.error("❌ No available supply for this product")
+        st.error("⏳ No available supply for this product")
         if st.button("Close"):
             st.session_state.show_allocation_modal = False
             st.rerun()
@@ -1119,13 +1433,19 @@ def show_allocation_modal():
     
     st.divider()
     
-    # Summary
+    # Summary with over-allocation warning
     col1, col2 = st.columns(2)
     with col1:
         st.metric("Total Selected", format_number(total_selected))
     with col2:
         coverage = (total_selected / oc['pending_quantity'] * 100) if oc['pending_quantity'] > 0 else 0
         st.metric("Coverage", format_percentage(coverage))
+    
+    # Show over-allocation warning if applicable
+    if total_selected > oc['pending_quantity']:
+        over_qty = total_selected - oc['pending_quantity']
+        over_pct = (over_qty / oc['pending_quantity'] * 100)
+        st.error(f"⚡ Over-allocating by {format_number(over_qty)} ({format_percentage(over_pct)})! Maximum allowed is 110%.")
     
     # Additional fields
     allocated_etd = st.date_input("Allocated ETD", value=oc['etd'])
@@ -1137,24 +1457,12 @@ def show_allocation_modal():
     with col1:
         if st.button("💾 Save Allocation", type="primary", use_container_width=True, disabled=total_selected == 0):
             # Validate allocation
-            errors = []
-            
-            # Basic validation
-            if total_selected > oc['pending_quantity']:
-                errors.append(f"Cannot allocate more than required ({format_number(oc['pending_quantity'])})")
-            
-            if not use_soft:
-                # Check supply availability
-                for supply in selected_supplies:
-                    availability = data_service.check_supply_availability(
-                        supply['source_type'],
-                        supply['source_id'],
-                        oc['product_id']
-                    )
-                    if not availability['available']:
-                        errors.append(f"Supply {supply['source_type']} is no longer available")
-                    elif supply['quantity'] > availability['available_qty']:
-                        errors.append(f"Insufficient {supply['source_type']} (available: {availability['available_qty']})")
+            errors = validator.validate_create_allocation(
+                selected_supplies,
+                oc,
+                'SOFT' if use_soft else 'HARD',
+                st.session_state.user_role
+            )
             
             if errors:
                 for error in errors:
@@ -1194,10 +1502,18 @@ show_search_and_filters()
 st.divider()
 show_product_list()
 
-# Show allocation modal if needed
+# Show modals based on state
 if st.session_state.show_allocation_modal:
     show_allocation_modal()
 
-# Show allocation history modal if needed
 if st.session_state.show_allocation_history:
     show_allocation_history_modal()
+
+if st.session_state.show_cancel_modal:
+    show_cancel_allocation_modal()
+
+if st.session_state.show_update_etd_modal:
+    show_update_etd_modal()
+
+if st.session_state.show_reverse_modal:
+    show_reverse_cancellation_modal()

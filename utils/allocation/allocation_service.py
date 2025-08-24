@@ -1,6 +1,6 @@
 """
-Allocation Service for Business Logic - Improved Version
-Enhanced validation and better error handling
+Allocation Service for Business Logic - Cleaned Version
+Core business logic for allocation operations
 """
 import logging
 from datetime import datetime
@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 
 class AllocationService:
-    """Service for handling allocation business logic with improved validation"""
+    """Service for handling allocation business logic"""
     
     def __init__(self):
         self.engine = get_db_engine()
@@ -46,7 +46,7 @@ class AllocationService:
                          mode: str, etd: datetime, notes: str, 
                          user_id: int) -> Dict[str, Any]:
         """
-        Create new allocation with improved validation
+        Create new allocation with validation
         
         Args:
             oc_detail_id: OC detail ID to allocate for
@@ -198,102 +198,9 @@ class AllocationService:
                 'error': f"Failed to create allocation: {str(e)}"
             }
     
-    def _validate_allocation_request(self, conn, oc_info: Dict, 
-                                   allocations: List[Dict], mode: str) -> Dict[str, Any]:
-        """
-        Comprehensive validation for allocation request
-        
-        Returns:
-            Dict with 'valid' boolean and 'error' message if invalid
-        """
-        # Check if allocations list is empty
-        if not allocations:
-            return {
-                'valid': False,
-                'error': 'No allocation items provided'
-            }
-        
-        # Calculate total to be allocated
-        total_to_allocate = sum(alloc['quantity'] for alloc in allocations)
-        
-        # Basic quantity validation
-        if total_to_allocate <= 0:
-            return {
-                'valid': False,
-                'error': 'Total allocation quantity must be positive'
-            }
-        
-        # Check over-allocation
-        pending_qty = float(oc_info['pending_quantity'])
-        max_allowed = pending_qty * (self.MAX_OVER_ALLOCATION_PERCENT / 100)
-        
-        if total_to_allocate > max_allowed:
-            return {
-                'valid': False,
-                'error': f'Cannot allocate {total_to_allocate:.0f}. Maximum allowed is {max_allowed:.0f} ({self.MAX_OVER_ALLOCATION_PERCENT}% of {pending_qty:.0f})'
-            }
-        
-        # For SOFT allocation, just check total supply availability
-        if mode == 'SOFT':
-            total_supply = self.data_service.get_total_available_supply(oc_info['product_id'])
-            if not total_supply['has_supply']:
-                return {
-                    'valid': False,
-                    'error': 'No available supply for this product'
-                }
-            
-            if total_to_allocate > total_supply['total_available']:
-                return {
-                    'valid': False,
-                    'error': f'Insufficient supply. Available: {total_supply["total_available"]:.0f}, Requested: {total_to_allocate:.0f}'
-                }
-        else:
-            # For HARD allocation, validate each specific source
-            for alloc in allocations:
-                if not alloc.get('source_type') or not alloc.get('source_id'):
-                    return {
-                        'valid': False,
-                        'error': 'HARD allocation requires specific supply source'
-                    }
-                
-                # Check availability
-                availability = self.data_service.check_supply_availability(
-                    alloc['source_type'],
-                    alloc['source_id'],
-                    oc_info['product_id']
-                )
-                
-                if not availability['available']:
-                    return {
-                        'valid': False,
-                        'error': f'{alloc["source_type"]} source is no longer available'
-                    }
-                
-                if alloc['quantity'] > availability['available_qty']:
-                    return {
-                        'valid': False,
-                        'error': f'Insufficient {alloc["source_type"]}. Available: {availability["available_qty"]:.0f}, Requested: {alloc["quantity"]:.0f}'
-                    }
-        
-        # Check for duplicate allocations in the same request
-        if mode == 'HARD':
-            source_keys = []
-            for alloc in allocations:
-                key = f"{alloc['source_type']}_{alloc['source_id']}"
-                if key in source_keys:
-                    return {
-                        'valid': False,
-                        'error': 'Cannot allocate from the same source multiple times'
-                    }
-                source_keys.append(key)
-        
-        return {'valid': True}
-    
     def cancel_allocation(self, allocation_detail_id: int, cancelled_qty: float,
                          reason: str, reason_category: str, user_id: int) -> Dict[str, Any]:
-        """
-        Cancel allocation with improved validation
-        """
+        """Cancel allocation with validation"""
         try:
             with self.db_transaction() as conn:
                 # Get allocation detail info
@@ -332,7 +239,7 @@ class AllocationService:
                 if cancelled_qty > detail['effective_qty']:
                     return {
                         'success': False,
-                        'error': f'Cannot cancel {cancelled_qty:.0f}. Only {detail["effective_qty"]:.0f} available to cancel'
+                        'error': f'Cannot cancel {cancelled_qty:.0f}. Only {detail["effective_qty"]:.0f} available'
                     }
                 
                 # Check if already delivered
@@ -521,6 +428,97 @@ class AllocationService:
     
     # ==================== Helper Methods ====================
     
+    def _validate_allocation_request(self, conn, oc_info: Dict, 
+                                   allocations: List[Dict], mode: str) -> Dict[str, Any]:
+        """
+        Comprehensive validation for allocation request
+        
+        Returns:
+            Dict with 'valid' boolean and 'error' message if invalid
+        """
+        # Check if allocations list is empty
+        if not allocations:
+            return {
+                'valid': False,
+                'error': 'No allocation items provided'
+            }
+        
+        # Calculate total to be allocated
+        total_to_allocate = sum(alloc['quantity'] for alloc in allocations)
+        
+        # Basic quantity validation
+        if total_to_allocate <= 0:
+            return {
+                'valid': False,
+                'error': 'Total allocation quantity must be positive'
+            }
+        
+        # Check over-allocation
+        pending_qty = float(oc_info['pending_quantity'])
+        max_allowed = pending_qty * (self.MAX_OVER_ALLOCATION_PERCENT / 100)
+        
+        if total_to_allocate > max_allowed:
+            return {
+                'valid': False,
+                'error': f'Cannot allocate {total_to_allocate:.0f}. Maximum allowed is {max_allowed:.0f} ({self.MAX_OVER_ALLOCATION_PERCENT}% of {pending_qty:.0f})'
+            }
+        
+        # For SOFT allocation, just check total supply availability
+        if mode == 'SOFT':
+            total_supply = self.data_service.get_total_available_supply(oc_info['product_id'])
+            if not total_supply['has_supply']:
+                return {
+                    'valid': False,
+                    'error': 'No available supply for this product'
+                }
+            
+            if total_to_allocate > total_supply['total_available']:
+                return {
+                    'valid': False,
+                    'error': f'Insufficient supply. Available: {total_supply["total_available"]:.0f}, Requested: {total_to_allocate:.0f}'
+                }
+        else:
+            # For HARD allocation, validate each specific source
+            for alloc in allocations:
+                if not alloc.get('source_type') or not alloc.get('source_id'):
+                    return {
+                        'valid': False,
+                        'error': 'HARD allocation requires specific supply source'
+                    }
+                
+                # Check availability
+                availability = self.data_service.check_supply_availability(
+                    alloc['source_type'],
+                    alloc['source_id'],
+                    oc_info['product_id']
+                )
+                
+                if not availability['available']:
+                    return {
+                        'valid': False,
+                        'error': f'{alloc["source_type"]} source is no longer available'
+                    }
+                
+                if alloc['quantity'] > availability['available_qty']:
+                    return {
+                        'valid': False,
+                        'error': f'Insufficient {alloc["source_type"]}. Available: {availability["available_qty"]:.0f}, Requested: {alloc["quantity"]:.0f}'
+                    }
+        
+        # Check for duplicate allocations in the same request
+        if mode == 'HARD':
+            source_keys = []
+            for alloc in allocations:
+                key = f"{alloc['source_type']}_{alloc['source_id']}"
+                if key in source_keys:
+                    return {
+                        'valid': False,
+                        'error': 'Cannot allocate from the same source multiple times'
+                    }
+                source_keys.append(key)
+        
+        return {'valid': True}
+    
     def _generate_allocation_number(self, conn) -> str:
         """Generate unique allocation number"""
         try:
@@ -601,120 +599,3 @@ class AllocationService:
             return f"Transfer {supply_info.get('from_warehouse', 'N/A')} → {supply_info.get('to_warehouse', 'N/A')}"
         else:
             return source_type
-    
-    def get_allocation_summary(self, allocation_plan_id: int) -> Dict[str, Any]:
-        """Get comprehensive summary of an allocation plan"""
-        try:
-            with self.engine.connect() as conn:
-                # Get plan info with creator details
-                plan_query = text("""
-                    SELECT 
-                        ap.*,
-                        u.username as creator_username,
-                        COUNT(DISTINCT ad.id) as detail_count,
-                        SUM(ad.allocated_qty) as total_allocated,
-                        SUM(ad.delivered_qty) as total_delivered,
-                        SUM(ad.allocated_qty - COALESCE(ac.cancelled_qty, 0)) as effective_allocated
-                    FROM allocation_plans ap
-                    LEFT JOIN users u ON ap.creator_id = u.id
-                    LEFT JOIN allocation_details ad ON ap.id = ad.allocation_plan_id
-                    LEFT JOIN (
-                        SELECT 
-                            allocation_detail_id,
-                            SUM(CASE WHEN status = 'ACTIVE' THEN cancelled_qty ELSE 0 END) as cancelled_qty
-                        FROM allocation_cancellations
-                        GROUP BY allocation_detail_id
-                    ) ac ON ad.id = ac.allocation_detail_id
-                    WHERE ap.id = :plan_id
-                    GROUP BY ap.id, u.username
-                """)
-                
-                result = conn.execute(plan_query, {'plan_id': allocation_plan_id}).fetchone()
-                
-                if not result:
-                    return {}
-                
-                summary = dict(result._mapping)
-                
-                # Get allocation details
-                details_query = text("""
-                    SELECT 
-                        ad.*,
-                        p.name as product_name,
-                        COALESCE(ac.cancelled_qty, 0) as cancelled_qty,
-                        (ad.allocated_qty - COALESCE(ac.cancelled_qty, 0)) as effective_qty
-                    FROM allocation_details ad
-                    LEFT JOIN products p ON ad.product_id = p.id
-                    LEFT JOIN (
-                        SELECT 
-                            allocation_detail_id,
-                            SUM(CASE WHEN status = 'ACTIVE' THEN cancelled_qty ELSE 0 END) as cancelled_qty
-                        FROM allocation_cancellations
-                        GROUP BY allocation_detail_id
-                    ) ac ON ad.id = ac.allocation_detail_id
-                    WHERE ad.allocation_plan_id = :plan_id
-                """)
-                
-                details_result = conn.execute(details_query, {'plan_id': allocation_plan_id})
-                summary['details'] = [dict(row._mapping) for row in details_result]
-                
-                # Calculate summary statistics
-                summary['stats'] = {
-                    'total_items': len(summary['details']),
-                    'total_allocated': float(summary.get('total_allocated', 0)),
-                    'total_delivered': float(summary.get('total_delivered', 0)),
-                    'total_cancelled': sum(d['cancelled_qty'] for d in summary['details']),
-                    'delivery_progress': (
-                        float(summary.get('total_delivered', 0)) / 
-                        float(summary.get('effective_allocated', 1)) * 100
-                        if summary.get('effective_allocated', 0) > 0 else 0
-                    )
-                }
-                
-                return summary
-                
-        except Exception as e:
-            logger.error(f"Error getting allocation summary: {e}")
-            return {}
-    
-    def get_allocation_history(self, oc_detail_id: int) -> List[Dict]:
-        """Get complete allocation history for an OC detail"""
-        try:
-            with self.engine.connect() as conn:
-                query = text("""
-                    SELECT 
-                        ap.allocation_number,
-                        ap.allocation_date,
-                        ad.allocation_mode,
-                        ad.allocated_qty,
-                        ad.delivered_qty,
-                        ad.status,
-                        ad.supply_source_type,
-                        u.username as created_by,
-                        COALESCE(ac.cancelled_qty, 0) as cancelled_qty,
-                        ac.cancelled_date,
-                        ac.reason as cancel_reason
-                    FROM allocation_details ad
-                    INNER JOIN allocation_plans ap ON ad.allocation_plan_id = ap.id
-                    LEFT JOIN users u ON ap.creator_id = u.id
-                    LEFT JOIN (
-                        SELECT 
-                            allocation_detail_id,
-                            SUM(cancelled_qty) as cancelled_qty,
-                            MAX(cancelled_date) as cancelled_date,
-                            GROUP_CONCAT(reason SEPARATOR '; ') as reason
-                        FROM allocation_cancellations
-                        WHERE status = 'ACTIVE'
-                        GROUP BY allocation_detail_id
-                    ) ac ON ad.id = ac.allocation_detail_id
-                    WHERE ad.demand_reference_id = :oc_detail_id
-                    AND ad.demand_type = 'OC'
-                    ORDER BY ap.allocation_date DESC
-                """)
-                
-                result = conn.execute(query, {'oc_detail_id': oc_detail_id})
-                return [dict(row._mapping) for row in result]
-                
-        except Exception as e:
-            logger.error(f"Error getting allocation history: {e}")
-            return []

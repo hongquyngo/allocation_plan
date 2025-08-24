@@ -1,17 +1,17 @@
 """
-Validation utilities for Allocation module - Simplified but Complete
-Focuses on core business rules with clear error messages
+Validation utilities for Allocation module - Cleaned Version
+Core validation logic for allocation operations
 """
-import re
 from datetime import datetime, date, timedelta
 from typing import Dict, List, Optional, Any, Tuple
+import pandas as pd
 import logging
 
 logger = logging.getLogger(__name__)
 
 
 class AllocationValidator:
-    """Simplified validator for allocation operations"""
+    """Validator for allocation operations"""
     
     def __init__(self):
         # Configuration constants
@@ -31,12 +31,17 @@ class AllocationValidator:
             'OTHER'
         ]
         
-        # Permission matrix
+        # Permission matrix (based on users table role field)
         self.PERMISSIONS = {
-            'admin': ['create', 'update', 'cancel', 'reverse', 'delete'],
-            'manager': ['create', 'update', 'cancel', 'reverse'],
-            'user': ['create', 'update', 'cancel'],
-            'viewer': ['view']
+            'admin': ['create', 'update', 'cancel', 'reverse', 'delete', 'view'],
+            'GM': ['create', 'update', 'cancel', 'reverse', 'view'],
+            'MD': ['create', 'update', 'cancel', 'reverse', 'view'],
+            'sales_manager': ['create', 'update', 'cancel', 'view'],
+            'sales': ['create', 'update', 'cancel', 'view'],
+            'supply_chain': ['create', 'update', 'cancel', 'view'],
+            'viewer': ['view'],
+            'customer': ['view'],
+            'vendor': ['view']
         }
     
     # ==================== Create Allocation Validation ====================
@@ -45,7 +50,7 @@ class AllocationValidator:
                                  allocations: List[Dict],
                                  oc_info: Dict,
                                  mode: str,
-                                 user_role: str = 'user') -> List[str]:
+                                 user_role: str = 'viewer') -> List[str]:
         """
         Validate allocation creation request
         
@@ -106,6 +111,15 @@ class AllocationValidator:
                     f"({max_allowed:.0f} = {self.MAX_OVER_ALLOCATION_PERCENT}% of {pending_qty:.0f})"
                 )
         
+        # 6. Warning for over-allocation (not an error, just a warning)
+        if total_quantity > 0 and oc_info.get('pending_quantity'):
+            pending_qty = float(oc_info['pending_quantity'])
+            if total_quantity > pending_qty and total_quantity <= max_allowed:
+                logger.warning(
+                    f"Over-allocating by {total_quantity - pending_qty:.0f} "
+                    f"({((total_quantity - pending_qty) / pending_qty * 100):.1f}%)"
+                )
+        
         return errors
     
     # ==================== Update Allocation Validation ====================
@@ -113,7 +127,7 @@ class AllocationValidator:
     def validate_update_etd(self,
                           allocation_detail: Dict,
                           new_etd: Any,
-                          user_role: str = 'user') -> Tuple[bool, str]:
+                          user_role: str = 'viewer') -> Tuple[bool, str]:
         """
         Validate ETD update request
         
@@ -137,9 +151,42 @@ class AllocationValidator:
             return False, "Cannot update ETD for delivered allocation"
         
         # Validate ETD date
-        valid, error = self.validate_date(new_etd, 'ETD')
-        if not valid:
-            return False, error
+        if not new_etd:
+            return False, "ETD is required"
+        
+        # Convert to date object if needed
+        try:
+            if isinstance(new_etd, str):
+                new_etd_date = datetime.strptime(new_etd, "%Y-%m-%d").date()
+            elif isinstance(new_etd, datetime):
+                new_etd_date = new_etd.date()
+            elif isinstance(new_etd, date):
+                new_etd_date = new_etd
+            else:
+                return False, "Invalid ETD format"
+        except ValueError:
+            return False, "Invalid ETD format. Use YYYY-MM-DD"
+        
+        # Check not too far in the past (30 days)
+        min_date = date.today() - timedelta(days=30)
+        if new_etd_date < min_date:
+            return False, "ETD cannot be more than 30 days in the past"
+        
+        # Check not too far in the future
+        max_date = date.today() + timedelta(days=self.MAX_ETD_DAYS_FUTURE)
+        if new_etd_date > max_date:
+            return False, f"ETD cannot be more than {self.MAX_ETD_DAYS_FUTURE} days in the future"
+        
+        # Check if new ETD is different from current
+        current_etd = allocation_detail.get('allocated_etd')
+        if current_etd:
+            if isinstance(current_etd, str):
+                current_etd = pd.to_datetime(current_etd).date()
+            elif isinstance(current_etd, datetime):
+                current_etd = current_etd.date()
+            
+            if current_etd == new_etd_date:
+                return False, "New ETD is the same as current ETD"
         
         return True, ""
     
@@ -150,7 +197,7 @@ class AllocationValidator:
                                  cancel_qty: float,
                                  reason: str,
                                  reason_category: str,
-                                 user_role: str = 'user') -> List[str]:
+                                 user_role: str = 'viewer') -> List[str]:
         """
         Validate cancellation request
         
@@ -202,14 +249,14 @@ class AllocationValidator:
     def validate_reverse_cancellation(self,
                                     cancellation: Dict,
                                     reversal_reason: str,
-                                    user_role: str = 'user') -> Tuple[bool, str]:
+                                    user_role: str = 'viewer') -> Tuple[bool, str]:
         """
         Validate cancellation reversal
         
         Returns:
             Tuple of (is_valid, error_message)
         """
-        # Check permission - only manager and admin
+        # Check permission - only GM, MD, and admin
         if not self.check_permission(user_role, 'reverse'):
             return False, "Only managers and admins can reverse cancellations"
         
@@ -221,223 +268,15 @@ class AllocationValidator:
         if not reversal_reason or len(reversal_reason.strip()) < self.MIN_REASON_LENGTH:
             return False, f"Please provide reversal reason (minimum {self.MIN_REASON_LENGTH} characters)"
         
-        return True, ""
-    
-    # ==================== Delete Allocation Validation ====================
-    
-    def validate_delete_allocation(self,
-                                 allocation_detail: Dict,
-                                 user_role: str = 'user') -> Tuple[bool, str]:
-        """
-        Validate allocation deletion
-        
-        Returns:
-            Tuple of (is_valid, error_message)
-        """
-        # Check permission - only admin
-        if not self.check_permission(user_role, 'delete'):
-            return False, "Only admins can delete allocations"
-        
-        # Check status - only DRAFT can be deleted
-        if allocation_detail.get('status') != 'DRAFT':
-            return False, "Can only delete DRAFT allocations"
-        
-        # Check if any delivery linked
-        if allocation_detail.get('delivered_qty', 0) > 0:
-            return False, "Cannot delete allocation with delivery history"
+        # Validate reason length
+        if len(reversal_reason) > self.MAX_STRING_LENGTH:
+            return False, f"Reversal reason too long (maximum {self.MAX_STRING_LENGTH} characters)"
         
         return True, ""
     
-    # ==================== Common Validation Methods ====================
-    
-    def validate_quantity(self, quantity: Any, max_quantity: float = None) -> Tuple[bool, str]:
-        """Validate quantity input"""
-        # Check if quantity is provided
-        if quantity is None or quantity == "":
-            return False, "Quantity is required"
-        
-        # Convert to float
-        try:
-            qty = float(quantity)
-        except (ValueError, TypeError):
-            return False, "Quantity must be a number"
-        
-        # Check if positive
-        if qty <= 0:
-            return False, "Quantity must be positive"
-        
-        # Check minimum
-        if qty < self.MIN_ALLOCATION_QTY:
-            return False, f"Minimum quantity is {self.MIN_ALLOCATION_QTY}"
-        
-        # Check maximum if provided
-        if max_quantity is not None and qty > max_quantity:
-            return False, f"Quantity cannot exceed {max_quantity:.0f}"
-        
-        return True, ""
-    
-    def validate_date(self, date_value: Any, field_name: str = "Date") -> Tuple[bool, str]:
-        """Validate date input"""
-        if not date_value:
-            return False, f"{field_name} is required"
-        
-        # Convert to date object if needed
-        try:
-            if isinstance(date_value, str):
-                date_obj = datetime.strptime(date_value, "%Y-%m-%d").date()
-            elif isinstance(date_value, datetime):
-                date_obj = date_value.date()
-            elif isinstance(date_value, date):
-                date_obj = date_value
-            else:
-                return False, f"Invalid {field_name} format"
-        except ValueError:
-            return False, f"Invalid {field_name} format. Use YYYY-MM-DD"
-        
-        # Check not too far in the past (30 days)
-        min_date = date.today() - timedelta(days=30)
-        if date_obj < min_date:
-            return False, f"{field_name} cannot be more than 30 days in the past"
-        
-        # Check not too far in the future
-        max_date = date.today() + timedelta(days=self.MAX_ETD_DAYS_FUTURE)
-        if date_obj > max_date:
-            return False, f"{field_name} cannot be more than {self.MAX_ETD_DAYS_FUTURE} days in the future"
-        
-        return True, ""
+    # ==================== Permission Check ====================
     
     def check_permission(self, user_role: str, action: str) -> bool:
         """Check if user role has permission for action"""
         allowed_actions = self.PERMISSIONS.get(user_role.lower(), [])
         return action in allowed_actions
-    
-    def sanitize_input(self, value: str) -> str:
-        """Sanitize user input to prevent injection attacks"""
-        if not value:
-            return ""
-        
-        # Convert to string
-        value = str(value)
-        
-        # Remove potentially dangerous characters
-        # Keep alphanumeric, spaces, and common punctuation
-        sanitized = re.sub(r'[<>\"\'%;()&+\-=]', '', value)
-        
-        # Trim whitespace
-        sanitized = sanitized.strip()
-        
-        # Limit length
-        if len(sanitized) > self.MAX_STRING_LENGTH:
-            sanitized = sanitized[:self.MAX_STRING_LENGTH]
-        
-        return sanitized
-    
-    # ==================== Supply Validation Methods ====================
-    
-    def validate_supply_availability(self,
-                                   supply_info: Dict,
-                                   requested_qty: float) -> Tuple[bool, str]:
-        """Validate if supply is available for allocation"""
-        available_qty = supply_info.get('available_qty', 0)
-        
-        if available_qty <= 0:
-            return False, "Supply source is not available"
-        
-        if requested_qty > available_qty:
-            return False, f"Insufficient supply. Available: {available_qty:.0f}, Requested: {requested_qty:.0f}"
-        
-        # Check expiry for inventory
-        if supply_info.get('source_type') == 'INVENTORY':
-            expiry_date = supply_info.get('expiry_date')
-            if expiry_date:
-                try:
-                    if isinstance(expiry_date, str):
-                        expiry = datetime.strptime(expiry_date, "%Y-%m-%d").date()
-                    else:
-                        expiry = expiry_date
-                    
-                    if expiry < date.today():
-                        return False, "Cannot allocate expired inventory"
-                    elif expiry < date.today() + timedelta(days=30):
-                        logger.warning(f"Inventory expires soon: {expiry}")
-                except:
-                    pass
-        
-        return True, ""
-    
-    # ==================== Batch Operation Validation ====================
-    
-    def validate_batch_allocations(self, batch_data: List[Dict]) -> Dict[str, Any]:
-        """
-        Validate batch allocation data
-        
-        Returns:
-            Dictionary with validation results
-        """
-        results = {
-            'valid_count': 0,
-            'error_count': 0,
-            'errors': []
-        }
-        
-        # Check batch size
-        if not batch_data:
-            results['errors'].append("No data provided for batch allocation")
-            return results
-        
-        if len(batch_data) > 100:
-            results['errors'].append("Batch size cannot exceed 100 items")
-            return results
-        
-        # Validate each item
-        for idx, item in enumerate(batch_data):
-            item_errors = []
-            
-            # Check required fields
-            if not item.get('oc_detail_id'):
-                item_errors.append("Missing OC detail ID")
-            
-            if not item.get('allocations'):
-                item_errors.append("Missing allocation items")
-            else:
-                # Validate allocations
-                alloc_errors = self.validate_create_allocation(
-                    item['allocations'],
-                    item.get('oc_info', {}),
-                    item.get('mode', 'SOFT')
-                )
-                item_errors.extend(alloc_errors)
-            
-            # Add to results
-            if item_errors:
-                results['error_count'] += 1
-                results['errors'].append({
-                    'index': idx,
-                    'oc_number': item.get('oc_info', {}).get('oc_number', 'Unknown'),
-                    'errors': item_errors
-                })
-            else:
-                results['valid_count'] += 1
-        
-        return results
-    
-    # ==================== Helper Methods ====================
-    
-    def format_validation_errors(self, errors: List[str]) -> str:
-        """Format validation errors for display"""
-        if not errors:
-            return ""
-        
-        if len(errors) == 1:
-            return errors[0]
-        
-        return "Please fix the following errors:\n" + "\n".join(f"• {error}" for error in errors)
-    
-    def get_validation_summary(self, errors: List[str]) -> Dict[str, Any]:
-        """Get summary of validation results"""
-        return {
-            'is_valid': len(errors) == 0,
-            'error_count': len(errors),
-            'errors': errors,
-            'message': self.format_validation_errors(errors)
-        }
