@@ -1,5 +1,5 @@
 """
-Allocation Planning System - Cleaned Version with Improved UOM Handling
+Allocation Planning System - Fixed UOM Conversion Version
 Product-centric view with complete allocation management
 """
 import streamlit as st
@@ -20,6 +20,7 @@ from utils.allocation.formatters import (
     format_reason_category
 )
 from utils.allocation.validators import AllocationValidator
+from utils.allocation.uom_converter import UOMConverter  # NEW: UOM converter utility
 
 # Setup logging
 logger = logging.getLogger(__name__)
@@ -37,6 +38,7 @@ auth = AuthManager()
 data_service = AllocationDataService()
 allocation_service = AllocationService()
 validator = AllocationValidator()
+uom_converter = UOMConverter()  # NEW: Initialize UOM converter
 
 # Check authentication
 if not auth.check_session():
@@ -815,7 +817,7 @@ def show_product_demand_details(product_id):
             st.text(f"{etd_color} {format_date(oc['etd'])}")
         
         with cols[3]:
-            # IMPROVED: Show pending quantity with both UOMs
+            # FIXED: Show pending quantity with both UOMs
             selling_qty_str = f"{format_number(oc['pending_quantity'])} {oc.get('selling_uom', '')}"
             standard_qty_str = f"{format_number(oc.get('pending_standard_delivery_quantity', 0))} {oc.get('standard_uom', '')}"
             
@@ -826,8 +828,8 @@ def show_product_demand_details(product_id):
                 help="Pending delivery quantity"
             )
             
-            # If UOMs are different, show conversion
-            if oc.get('selling_uom') != oc.get('standard_uom'):
+            # FIXED: Check conversion ratio instead of comparing UOM strings
+            if uom_converter.needs_conversion(oc.get('uom_conversion', '1')):
                 st.caption(f"= {standard_qty_str}")
         
         with cols[4]:
@@ -865,7 +867,7 @@ def show_product_demand_details(product_id):
                         'pending_standard_delivery_quantity': oc.get('pending_standard_delivery_quantity', 0),
                         'is_over_allocated': is_over_allocated,
                         'allocation_warning': oc.get('allocation_warning', ''),
-                        'uom_conversion': oc.get('uom_conversion', '')
+                        'uom_conversion': oc.get('uom_conversion', '1')
                     }
                     st.rerun()
             else:
@@ -908,7 +910,8 @@ def show_allocation_history_modal():
         selling_qty = f"{format_number(oc_info['pending_quantity'])} {oc_info['selling_uom']}"
         st.metric("Pending Qty", selling_qty)
         
-        if oc_info.get('selling_uom') != oc_info.get('standard_uom'):
+        # FIXED: Check conversion ratio instead of comparing UOM strings
+        if uom_converter.needs_conversion(oc_info.get('uom_conversion', '1')):
             standard_qty = f"{format_number(oc_info.get('pending_standard_delivery_quantity', 0))} {oc_info['standard_uom']}"
             st.caption(f"= {standard_qty}")
     
@@ -919,17 +922,20 @@ def show_allocation_history_modal():
             # Total effective is in standard UOM from allocation table
             total_effective_standard = history_df['effective_qty'].sum()
             
-            # Convert to selling UOM for display
-            if oc_info.get('selling_uom') == oc_info.get('standard_uom'):
-                total_effective_selling = total_effective_standard
+            # FIXED: Convert to selling UOM for display
+            if uom_converter.needs_conversion(oc_info.get('uom_conversion', '1')):
+                total_effective_selling = uom_converter.convert_quantity(
+                    total_effective_standard,
+                    'standard',
+                    'selling',
+                    oc_info.get('uom_conversion', '1')
+                )
             else:
-                # Need conversion factor - would come from OC data
-                # For now, just show standard UOM
                 total_effective_selling = total_effective_standard
             
             st.metric("Total Allocated", f"{format_number(total_effective_selling)} {oc_info['selling_uom']}")
             
-            if oc_info.get('selling_uom') != oc_info.get('standard_uom'):
+            if uom_converter.needs_conversion(oc_info.get('uom_conversion', '1')):
                 st.caption(f"= {format_number(total_effective_standard)} {oc_info['standard_uom']}")
         else:
             st.metric("Total Allocated", f"0 {oc_info['selling_uom']}")
@@ -970,7 +976,7 @@ def show_allocation_history_modal():
                 # Allocation details - quantities are in standard UOM in allocation table
                 detail_cols = st.columns([1, 1, 1, 1])
                 
-                # Use selling UOM from OC info for display
+                # FIXED: Use standard UOM for display since allocation table stores in standard
                 display_uom = oc_info.get('standard_uom', '')
                 
                 with detail_cols[0]:
@@ -1056,7 +1062,7 @@ def show_allocation_history_modal():
                 st.divider()
     
     # Note about UOM conversion
-    if oc_info.get('selling_uom') != oc_info.get('standard_uom'):
+    if uom_converter.needs_conversion(oc_info.get('uom_conversion', '1')):
         st.info(f"ℹ️ Note: Allocation quantities are stored in {oc_info.get('standard_uom', 'standard UOM')}. " +
                 f"Conversion: {oc_info.get('uom_conversion', 'N/A')}")
     
@@ -1310,11 +1316,12 @@ def show_product_supply_details(product_id):
         can_df = data_service.get_can_summary(product_id)
         if not can_df.empty:
             for _, can in can_df.iterrows():
-                # IMPROVED: Show both buying and standard UOM if different
+                # FIXED: Show both buying and standard UOM if different
                 qty_str = f"{format_number(can['pending_quantity'])} {can.get('standard_uom', '')}"
                 
+                # Check if conversion is needed using ratio
                 if pd.notna(can.get('buying_quantity')) and pd.notna(can.get('buying_uom')):
-                    if can.get('buying_uom') != can.get('standard_uom'):
+                    if uom_converter.needs_conversion(can.get('uom_conversion', '1')):
                         qty_str = f"{format_number(can['buying_quantity'])} {can['buying_uom']}"
                         standard_str = f"{format_number(can['pending_quantity'])} {can['standard_uom']}"
                         
@@ -1325,7 +1332,7 @@ def show_product_supply_details(product_id):
                 )
                 
                 # Show conversion if UOMs are different
-                if pd.notna(can.get('buying_uom')) and can.get('buying_uom') != can.get('standard_uom'):
+                if pd.notna(can.get('buying_uom')) and uom_converter.needs_conversion(can.get('uom_conversion', '1')):
                     st.caption(f"= {standard_str}")
         else:
             st.caption("No pending CAN")
@@ -1335,11 +1342,12 @@ def show_product_supply_details(product_id):
         po_df = data_service.get_po_summary(product_id)
         if not po_df.empty:
             for _, po in po_df.iterrows():
-                # IMPROVED: Show both buying and standard UOM if different
+                # FIXED: Show both buying and standard UOM if different
                 qty_str = f"{format_number(po['pending_quantity'])} {po.get('standard_uom', '')}"
                 
+                # Check if conversion is needed using ratio
                 if pd.notna(po.get('buying_quantity')) and pd.notna(po.get('buying_uom')):
-                    if po.get('buying_uom') != po.get('standard_uom'):
+                    if uom_converter.needs_conversion(po.get('uom_conversion', '1')):
                         qty_str = f"{format_number(po['buying_quantity'])} {po['buying_uom']}"
                         standard_str = f"{format_number(po['pending_quantity'])} {po['standard_uom']}"
                 
@@ -1350,7 +1358,7 @@ def show_product_supply_details(product_id):
                 )
                 
                 # Show conversion if UOMs are different
-                if pd.notna(po.get('buying_uom')) and po.get('buying_uom') != po.get('standard_uom'):
+                if pd.notna(po.get('buying_uom')) and uom_converter.needs_conversion(po.get('uom_conversion', '1')):
                     st.caption(f"= {standard_str}")
         else:
             st.caption("No pending PO")
@@ -1410,12 +1418,12 @@ def show_allocation_modal():
     with col2:
         st.metric("Product", oc['product_name'][:30])
     with col3:
-        # IMPROVED: Show both selling and standard UOM
+        # FIXED: Show both selling and standard UOM
         selling_qty = f"{format_number(oc['pending_quantity'])} {oc.get('selling_uom', 'pcs')}"
         standard_qty = f"{format_number(oc.get('pending_standard_delivery_quantity', 0))} {oc.get('standard_uom', 'pcs')}"
         
         st.metric("Required", selling_qty)
-        if oc.get('selling_uom') != oc.get('standard_uom'):
+        if uom_converter.needs_conversion(oc.get('uom_conversion', '1')):
             st.caption(f"= {standard_qty}")
     
     st.divider()
@@ -1460,15 +1468,15 @@ def show_allocation_modal():
                         qty_display = f"{format_number(supply['available_quantity'])} {supply.get('uom', 'pcs')}"
                     elif source_type == 'PENDING_CAN':
                         info = f"{supply['arrival_note_number']} - Arr: {format_date(supply['arrival_date'])}"
-                        # IMPROVED: Show buying UOM if different from standard
-                        if pd.notna(supply.get('buying_uom')) and supply['buying_uom'] != supply['uom']:
+                        # FIXED: Show buying UOM if different from standard
+                        if pd.notna(supply.get('buying_uom')) and uom_converter.needs_conversion(supply.get('uom_conversion', '1')):
                             qty_display = f"{format_number(supply['available_quantity'])} {supply['uom']} (Buying: {supply['buying_uom']})"
                         else:
                             qty_display = f"{format_number(supply['available_quantity'])} {supply.get('uom', 'pcs')}"
                     elif source_type == 'PENDING_PO':
                         info = f"{supply['po_number']} - ETD: {format_date(supply['etd'])}"
-                        # IMPROVED: Show buying UOM if different from standard
-                        if pd.notna(supply.get('buying_uom')) and supply['buying_uom'] != supply['uom']:
+                        # FIXED: Show buying UOM if different from standard
+                        if pd.notna(supply.get('buying_uom')) and uom_converter.needs_conversion(supply.get('uom_conversion', '1')):
                             qty_display = f"{format_number(supply['available_quantity'])} {supply['uom']} (Buying: {supply['buying_uom']})"
                         else:
                             qty_display = f"{format_number(supply['available_quantity'])} {supply.get('uom', 'pcs')}"
@@ -1512,7 +1520,7 @@ def show_allocation_modal():
     
     # SOFT allocation option
     st.markdown("**OR**")
-    use_soft = st.checkbox("📄 SOFT Allocation (no specific source)")
+    use_soft = st.checkbox("🔄 SOFT Allocation (no specific source)")
     
     if use_soft:
         # IMPROVED: Show input with proper UOM context
@@ -1542,19 +1550,17 @@ def show_allocation_modal():
     # Summary with over-allocation warning
     col1, col2 = st.columns(2)
     with col1:
-        # IMPROVED: Show in both UOMs if different
+        # FIXED: Show in both UOMs if different
         st.metric("Total Selected", f"{format_number(total_selected)} {oc.get('standard_uom', 'pcs')}")
         
         # Convert to selling UOM for display if different
-        if oc.get('selling_uom') != oc.get('standard_uom') and oc.get('uom_conversion'):
-            # Parse conversion ratio
-            if '/' in str(oc.get('uom_conversion', '')):
-                parts = str(oc['uom_conversion']).split('/')
-                conversion_factor = float(parts[0]) / float(parts[1])
-            else:
-                conversion_factor = float(oc.get('uom_conversion', 1))
-            
-            selling_qty_selected = total_selected / conversion_factor
+        if uom_converter.needs_conversion(oc.get('uom_conversion', '1')):
+            selling_qty_selected = uom_converter.convert_quantity(
+                total_selected,
+                'standard',
+                'selling',
+                oc.get('uom_conversion', '1')
+            )
             st.caption(f"= {format_number(selling_qty_selected)} {oc['selling_uom']}")
     
     with col2:

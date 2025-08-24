@@ -1,6 +1,6 @@
 """
-Data Service for Allocation Module - Cleaned Version with Improved UOM Handling
-Removed duplicates and unused methods
+Data Service for Allocation Module - Fixed UOM Conversion Version
+Removed duplicates and unused methods, fixed UOM comparisons
 """
 import pandas as pd
 from datetime import datetime, timedelta
@@ -11,6 +11,7 @@ from sqlalchemy import text
 
 from ..db import get_db_engine
 from ..config import config
+from .uom_converter import UOMConverter
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +22,7 @@ class AllocationDataService:
     def __init__(self):
         self.engine = get_db_engine()
         self.cache_ttl = config.get_app_setting('CACHE_TTL_SECONDS', 300)
+        self.uom_converter = UOMConverter()  # Initialize UOM converter
     
     # ==================== Reference Data for Filters ====================
     

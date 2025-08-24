@@ -1,5 +1,5 @@
 """
-Allocation Service for Business Logic - Cleaned Version with Improved UOM Handling
+Allocation Service for Business Logic - Fixed UOM Conversion Version
 Core business logic for allocation operations
 """
 import logging
@@ -13,6 +13,7 @@ import streamlit as st
 from ..db import get_db_engine
 from ..config import config
 from .data_service import AllocationDataService
+from .uom_converter import UOMConverter
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +24,7 @@ class AllocationService:
     def __init__(self):
         self.engine = get_db_engine()
         self.data_service = AllocationDataService()
+        self.uom_converter = UOMConverter()  # Initialize UOM converter
         
         # Configuration
         self.MAX_OVER_ALLOCATION_PERCENT = 110  # Allow max 10% over-allocation
@@ -83,15 +85,16 @@ class AllocationService:
                 # Generate allocation number
                 allocation_number = self._generate_allocation_number(conn)
                 
-                # IMPROVED: Create allocation context with full UOM information
+                # FIXED: Create allocation context with correct field names and UOM info
                 allocation_context = {
                     'oc_detail': {
                         'id': oc_info['ocd_id'],
                         'oc_number': oc_info['oc_number'],
                         'customer': oc_info['customer_name'],
                         'product': oc_info['product_name'],
-                        'pending_qty': float(oc_info['pending_quantity']),
-                        'pending_qty_selling': float(oc_info.get('pending_selling_quantity', oc_info['pending_quantity'])),
+                        'pending_qty_standard': float(oc_info['pending_quantity']),  # This is standard qty
+                        'pending_qty_selling': float(oc_info.get('pending_selling_quantity', 
+                                                                 oc_info['pending_quantity'])),
                         'standard_uom': oc_info['standard_uom'],
                         'selling_uom': oc_info.get('selling_uom', oc_info['standard_uom']),
                         'uom_conversion': oc_info.get('uom_conversion', '1')
@@ -103,7 +106,8 @@ class AllocationService:
                             'quantity': float(alloc['quantity']),  # Always in standard UOM
                             'source_info': {
                                 k: v for k, v in alloc.get('supply_info', {}).items() 
-                                if k in ['buying_uom', 'standard_uom', 'uom_conversion', 'reference']
+                                if k in ['buying_uom', 'standard_uom', 'uom_conversion', 'reference',
+                                        'batch_number', 'arrival_note_number', 'po_number']
                             }
                         } for alloc in allocations
                     ],
@@ -461,14 +465,17 @@ class AllocationService:
                 'error': 'Total allocation quantity must be positive'
             }
         
-        # Check over-allocation (using standard UOM for accurate comparison)
-        pending_qty = float(oc_info['pending_quantity'])
-        max_allowed = pending_qty * (self.MAX_OVER_ALLOCATION_PERCENT / 100)
+        # FIXED: Ensure we're comparing standard quantities
+        # oc_info['pending_quantity'] should already be standard quantity from SQL
+        pending_qty_standard = float(oc_info['pending_quantity'])
+        max_allowed = pending_qty_standard * (self.MAX_OVER_ALLOCATION_PERCENT / 100)
         
         if total_to_allocate > max_allowed:
+            # FIXED: Include UOM in error message
+            standard_uom = oc_info.get('standard_uom', '')
             return {
                 'valid': False,
-                'error': f'Cannot allocate {total_to_allocate:.0f}. Maximum allowed is {max_allowed:.0f} ({self.MAX_OVER_ALLOCATION_PERCENT}% of {pending_qty:.0f})'
+                'error': f'Cannot allocate {total_to_allocate:.0f} {standard_uom}. Maximum allowed is {max_allowed:.0f} {standard_uom} ({self.MAX_OVER_ALLOCATION_PERCENT}% of {pending_qty_standard:.0f} {standard_uom})'
             }
         
         # For SOFT allocation, just check total supply availability
@@ -481,9 +488,10 @@ class AllocationService:
                 }
             
             if total_to_allocate > total_supply['total_available']:
+                standard_uom = oc_info.get('standard_uom', '')
                 return {
                     'valid': False,
-                    'error': f'Insufficient supply. Available: {total_supply["total_available"]:.0f}, Requested: {total_to_allocate:.0f}'
+                    'error': f'Insufficient supply. Available: {total_supply["total_available"]:.0f} {standard_uom}, Requested: {total_to_allocate:.0f} {standard_uom}'
                 }
         else:
             # For HARD allocation, validate each specific source
@@ -508,9 +516,10 @@ class AllocationService:
                     }
                 
                 if alloc['quantity'] > availability['available_qty']:
+                    standard_uom = oc_info.get('standard_uom', '')
                     return {
                         'valid': False,
-                        'error': f'Insufficient {alloc["source_type"]}. Available: {availability["available_qty"]:.0f}, Requested: {alloc["quantity"]:.0f}'
+                        'error': f'Insufficient {alloc["source_type"]}. Available: {availability["available_qty"]:.0f} {standard_uom}, Requested: {alloc["quantity"]:.0f} {standard_uom}'
                     }
         
         # Check for duplicate allocations in the same request
@@ -563,7 +572,7 @@ class AllocationService:
     def _get_oc_detail_info(self, conn, oc_detail_id: int) -> Optional[Dict]:
         """Get OC detail information for allocation with full UOM info"""
         try:
-            # IMPROVED: Get both selling and standard quantities/UOMs
+            # FIXED: Get all necessary UOM fields from view
             query = text("""
                 SELECT 
                     ocd_id,
@@ -604,12 +613,14 @@ class AllocationService:
             return f"Inventory Batch {supply_info.get('batch_number', 'N/A')}"
         elif source_type == 'PENDING_CAN':
             desc = f"CAN {supply_info.get('arrival_note_number', 'N/A')}"
-            if supply_info.get('buying_uom') and supply_info.get('buying_uom') != supply_info.get('standard_uom'):
+            # FIXED: Check if conversion is needed instead of string comparison
+            if supply_info.get('buying_uom') and self.uom_converter.needs_conversion(supply_info.get('uom_conversion', '1')):
                 desc += f" (Buying: {supply_info['buying_uom']})"
             return desc
         elif source_type == 'PENDING_PO':
             desc = f"PO {supply_info.get('po_number', 'N/A')}"
-            if supply_info.get('buying_uom') and supply_info.get('buying_uom') != supply_info.get('standard_uom'):
+            # FIXED: Check if conversion is needed instead of string comparison
+            if supply_info.get('buying_uom') and self.uom_converter.needs_conversion(supply_info.get('uom_conversion', '1')):
                 desc += f" (Buying: {supply_info['buying_uom']})"
             return desc
         elif source_type == 'PENDING_WHT':
