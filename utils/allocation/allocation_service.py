@@ -1,5 +1,5 @@
 """
-Allocation Service for Business Logic - Fixed UOM Conversion Version
+Allocation Service for Business Logic - Updated Version with Partial Delivery Support
 Core business logic for allocation operations
 """
 import logging
@@ -150,6 +150,7 @@ class AllocationService:
                         source_description = self._get_source_description(alloc)
                     
                     # Insert allocation detail (quantities are in standard UOM)
+                    # NEW: Initialize etd_update_count to 0 for new allocations
                     detail_query = text("""
                         INSERT INTO allocation_details (
                             allocation_plan_id, allocation_mode, demand_type, 
@@ -157,14 +158,16 @@ class AllocationService:
                             customer_code, customer_name, legal_entity_name,
                             requested_qty, allocated_qty, delivered_qty,
                             etd, allocated_etd, status, notes,
-                            supply_source_type, supply_source_id
+                            supply_source_type, supply_source_id,
+                            etd_update_count, last_updated_etd_date
                         ) VALUES (
                             :allocation_plan_id, :allocation_mode, 'OC',
                             :demand_reference_id, :demand_number, :product_id, :pt_code,
                             :customer_code, :customer_name, :legal_entity_name,
                             :requested_qty, :allocated_qty, 0,
                             :etd, :allocated_etd, 'ALLOCATED', :notes,
-                            :supply_source_type, :supply_source_id
+                            :supply_source_type, :supply_source_id,
+                            0, NULL
                         )
                     """)
                     
@@ -212,14 +215,15 @@ class AllocationService:
     
     def cancel_allocation(self, allocation_detail_id: int, cancelled_qty: float,
                          reason: str, reason_category: str, user_id: int) -> Dict[str, Any]:
-        """Cancel allocation with validation"""
+        """Cancel allocation with validation - Updated for partial delivery support"""
         try:
             with self.db_transaction() as conn:
-                # Get allocation detail info
+                # Get allocation detail info with pending quantity
                 detail_query = text("""
                     SELECT 
-                        ad.*, 
-                        (ad.allocated_qty - COALESCE(ac.cancelled_qty, 0)) as effective_qty
+                        ad.*,
+                        (ad.allocated_qty - COALESCE(ac.cancelled_qty, 0)) as effective_qty,
+                        (ad.allocated_qty - COALESCE(ac.cancelled_qty, 0) - COALESCE(adl.delivered_qty, 0)) as pending_qty
                     FROM allocation_details ad
                     LEFT JOIN (
                         SELECT 
@@ -228,6 +232,13 @@ class AllocationService:
                         FROM allocation_cancellations
                         GROUP BY allocation_detail_id
                     ) ac ON ad.id = ac.allocation_detail_id
+                    LEFT JOIN (
+                        SELECT 
+                            allocation_detail_id,
+                            SUM(delivered_qty) as delivered_qty
+                        FROM allocation_delivery_links
+                        GROUP BY allocation_detail_id
+                    ) adl ON ad.id = adl.allocation_detail_id
                     WHERE ad.id = :detail_id
                 """)
                 
@@ -248,20 +259,20 @@ class AllocationService:
                         'error': 'Cancel quantity must be positive'
                     }
                 
-                if cancelled_qty > detail['effective_qty']:
+                # NEW: Check against pending quantity (not effective quantity)
+                pending_qty = detail.get('pending_qty', 0)
+                if cancelled_qty > pending_qty:
                     return {
                         'success': False,
-                        'error': f'Cannot cancel {cancelled_qty:.0f}. Only {detail["effective_qty"]:.0f} available'
+                        'error': f'Cannot cancel {cancelled_qty:.0f}. Only {pending_qty:.0f} pending (not yet delivered)'
                     }
                 
-                # Check if already delivered
-                if detail['delivered_qty'] > 0:
-                    max_cancellable = detail['effective_qty'] - detail['delivered_qty']
-                    if cancelled_qty > max_cancellable:
-                        return {
-                            'success': False,
-                            'error': f'Cannot cancel delivered quantity. Maximum cancellable: {max_cancellable:.0f}'
-                        }
+                # Check if all has been delivered
+                if pending_qty <= 0:
+                    return {
+                        'success': False,
+                        'error': 'Cannot cancel - all quantity has been delivered'
+                    }
                 
                 # Check allocation mode
                 if detail['allocation_mode'] == 'HARD':
@@ -293,12 +304,18 @@ class AllocationService:
                 # Clear cache
                 st.cache_data.clear()
                 
-                logger.info(f"Cancelled {cancelled_qty} from allocation detail {allocation_detail_id}")
+                # Log with updated info
+                delivered_qty = detail.get('delivered_qty', 0) or 0
+                logger.info(
+                    f"Cancelled {cancelled_qty} from allocation detail {allocation_detail_id}. "
+                    f"Delivered: {delivered_qty}, Remaining pending: {pending_qty - cancelled_qty}"
+                )
                 
                 return {
                     'success': True,
                     'cancelled_qty': cancelled_qty,
-                    'remaining_qty': detail['effective_qty'] - cancelled_qty
+                    'remaining_pending_qty': pending_qty - cancelled_qty,
+                    'delivered_qty': delivered_qty
                 }
                 
         except Exception as e:
@@ -310,17 +327,34 @@ class AllocationService:
     
     def update_allocation_etd(self, allocation_detail_id: int, new_etd: datetime,
                              user_id: int) -> Dict[str, Any]:
-        """Update allocated ETD with validation"""
+        """Update allocated ETD with validation - Updated for partial delivery support"""
         try:
             with self.db_transaction() as conn:
-                # Check if allocation exists and is SOFT mode
+                # Check allocation details with pending quantity
                 check_query = text("""
                     SELECT 
-                        allocation_mode, 
-                        status,
-                        delivered_qty
-                    FROM allocation_details 
-                    WHERE id = :detail_id
+                        ad.allocation_mode,
+                        ad.status,
+                        ad.delivered_qty,
+                        ad.etd_update_count,
+                        ad.allocated_etd,
+                        (ad.allocated_qty - COALESCE(ac.cancelled_qty, 0) - COALESCE(adl.delivered_qty, 0)) as pending_qty
+                    FROM allocation_details ad
+                    LEFT JOIN (
+                        SELECT 
+                            allocation_detail_id,
+                            SUM(CASE WHEN status = 'ACTIVE' THEN cancelled_qty ELSE 0 END) as cancelled_qty
+                        FROM allocation_cancellations
+                        GROUP BY allocation_detail_id
+                    ) ac ON ad.id = ac.allocation_detail_id
+                    LEFT JOIN (
+                        SELECT 
+                            allocation_detail_id,
+                            SUM(delivered_qty) as delivered_qty
+                        FROM allocation_delivery_links
+                        GROUP BY allocation_detail_id
+                    ) adl ON ad.id = adl.allocation_detail_id
+                    WHERE ad.id = :detail_id
                 """)
                 
                 result = conn.execute(check_query, {'detail_id': allocation_detail_id}).fetchone()
@@ -337,7 +371,7 @@ class AllocationService:
                 if detail['allocation_mode'] == 'HARD':
                     return {
                         'success': False,
-                        'error': 'Cannot update ETD for HARD allocation'
+                        'error': 'Cannot update ETD for HARD allocation without manager approval'
                     }
                 
                 if detail['status'] != 'ALLOCATED':
@@ -346,16 +380,21 @@ class AllocationService:
                         'error': 'Can only update ETD for ALLOCATED status'
                     }
                 
-                if detail['delivered_qty'] > 0:
+                # NEW: Check pending quantity instead of delivered quantity
+                pending_qty = detail.get('pending_qty', 0)
+                if pending_qty <= 0:
                     return {
                         'success': False,
-                        'error': 'Cannot update ETD for partially delivered allocation'
+                        'error': 'Cannot update ETD - all quantity has been delivered'
                     }
                 
-                # Update ETD
+                # Update ETD with tracking fields
                 update_query = text("""
                     UPDATE allocation_details 
-                    SET allocated_etd = :new_etd
+                    SET 
+                        allocated_etd = :new_etd,
+                        last_updated_etd_date = NOW(),
+                        etd_update_count = etd_update_count + 1
                     WHERE id = :detail_id
                 """)
                 
@@ -367,9 +406,20 @@ class AllocationService:
                 # Clear cache
                 st.cache_data.clear()
                 
-                logger.info(f"Updated ETD for allocation detail {allocation_detail_id} to {new_etd}")
+                # Log with updated info
+                delivered_qty = detail.get('delivered_qty', 0) or 0
+                update_count = (detail.get('etd_update_count', 0) or 0) + 1
+                logger.info(
+                    f"Updated ETD for allocation detail {allocation_detail_id} to {new_etd}. "
+                    f"Update #{update_count}. Delivered: {delivered_qty}, Pending: {pending_qty}"
+                )
                 
-                return {'success': True}
+                return {
+                    'success': True,
+                    'new_etd': new_etd,
+                    'update_count': update_count,
+                    'pending_qty_affected': pending_qty
+                }
                 
         except Exception as e:
             logger.error(f"Error updating allocation ETD: {e}")
@@ -387,6 +437,8 @@ class AllocationService:
                 check_query = text("""
                     SELECT 
                         ac.status,
+                        ac.allocation_detail_id,
+                        ac.cancelled_qty,
                         ad.delivered_qty
                     FROM allocation_cancellations ac
                     INNER JOIN allocation_details ad ON ac.allocation_detail_id = ad.id
@@ -427,9 +479,15 @@ class AllocationService:
                 # Clear cache
                 st.cache_data.clear()
                 
-                logger.info(f"Reversed cancellation {cancellation_id}")
+                logger.info(
+                    f"Reversed cancellation {cancellation_id}. "
+                    f"Restored quantity: {result._mapping['cancelled_qty']}"
+                )
                 
-                return {'success': True}
+                return {
+                    'success': True,
+                    'restored_qty': result._mapping['cancelled_qty']
+                }
                 
         except Exception as e:
             logger.error(f"Error reversing cancellation: {e}")
@@ -627,3 +685,71 @@ class AllocationService:
             return f"Transfer {supply_info.get('from_warehouse', 'N/A')} → {supply_info.get('to_warehouse', 'N/A')}"
         else:
             return source_type
+    
+    def get_allocation_summary_for_oc(self, oc_detail_id: int) -> Dict[str, Any]:
+        """
+        Get allocation summary for an OC with pending quantity info
+        
+        Returns:
+            Dict with allocation summary including pending quantities
+        """
+        try:
+            with self.engine.connect() as conn:
+                query = text("""
+                    SELECT 
+                        COUNT(DISTINCT ad.id) as allocation_count,
+                        SUM(ad.allocated_qty) as total_allocated,
+                        SUM(COALESCE(ac.cancelled_qty, 0)) as total_cancelled,
+                        SUM(COALESCE(adl.delivered_qty, 0)) as total_delivered,
+                        SUM(ad.allocated_qty - COALESCE(ac.cancelled_qty, 0)) as effective_allocated,
+                        SUM(ad.allocated_qty - COALESCE(ac.cancelled_qty, 0) - COALESCE(adl.delivered_qty, 0)) as pending_allocated,
+                        COUNT(DISTINCT CASE WHEN ad.allocation_mode = 'SOFT' THEN ad.id END) as soft_count,
+                        COUNT(DISTINCT CASE WHEN ad.allocation_mode = 'HARD' THEN ad.id END) as hard_count
+                    FROM allocation_details ad
+                    LEFT JOIN (
+                        SELECT 
+                            allocation_detail_id,
+                            SUM(CASE WHEN status = 'ACTIVE' THEN cancelled_qty ELSE 0 END) as cancelled_qty
+                        FROM allocation_cancellations
+                        GROUP BY allocation_detail_id
+                    ) ac ON ad.id = ac.allocation_detail_id
+                    LEFT JOIN (
+                        SELECT 
+                            allocation_detail_id,
+                            SUM(delivered_qty) as delivered_qty
+                        FROM allocation_delivery_links
+                        GROUP BY allocation_detail_id
+                    ) adl ON ad.id = adl.allocation_detail_id
+                    WHERE ad.demand_reference_id = :oc_detail_id
+                    AND ad.demand_type = 'OC'
+                    AND ad.status = 'ALLOCATED'
+                """)
+                
+                result = conn.execute(query, {'oc_detail_id': oc_detail_id}).fetchone()
+                
+                if result:
+                    return dict(result._mapping)
+                
+                return {
+                    'allocation_count': 0,
+                    'total_allocated': 0,
+                    'total_cancelled': 0,
+                    'total_delivered': 0,
+                    'effective_allocated': 0,
+                    'pending_allocated': 0,
+                    'soft_count': 0,
+                    'hard_count': 0
+                }
+                
+        except Exception as e:
+            logger.error(f"Error getting allocation summary: {e}")
+            return {
+                'allocation_count': 0,
+                'total_allocated': 0,
+                'total_cancelled': 0,
+                'total_delivered': 0,
+                'effective_allocated': 0,
+                'pending_allocated': 0,
+                'soft_count': 0,
+                'hard_count': 0
+            }

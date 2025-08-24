@@ -1,6 +1,6 @@
 """
-Validation utilities for Allocation module - Cleaned Version
-Core validation logic for allocation operations
+Validation utilities for Allocation module - Updated Version
+Core validation logic for allocation operations with partial delivery support
 """
 from datetime import datetime, date, timedelta
 from typing import Dict, List, Optional, Any, Tuple
@@ -129,7 +129,7 @@ class AllocationValidator:
                           new_etd: Any,
                           user_role: str = 'viewer') -> Tuple[bool, str]:
         """
-        Validate ETD update request
+        Validate ETD update request with partial delivery support
         
         Returns:
             Tuple of (is_valid, error_message)
@@ -140,15 +140,18 @@ class AllocationValidator:
         
         # Check allocation mode
         if allocation_detail.get('allocation_mode') == 'HARD':
-            return False, "Cannot update ETD for HARD allocation"
+            # For HARD allocation, need manager approval
+            if user_role not in ['GM', 'MD', 'admin', 'sales_manager']:
+                return False, "HARD allocation ETD update requires manager approval"
         
         # Check status
         if allocation_detail.get('status') != 'ALLOCATED':
             return False, "Can only update ETD for ALLOCATED status"
         
-        # Check if already delivered
-        if allocation_detail.get('delivered_qty', 0) > 0:
-            return False, "Cannot update ETD for delivered allocation"
+        # NEW: Check if there's pending quantity (not yet delivered)
+        pending_qty = allocation_detail.get('pending_allocated_qty', 0)
+        if pending_qty <= 0:
+            return False, "Cannot update ETD - all quantity has been delivered"
         
         # Validate ETD date
         if not new_etd:
@@ -188,6 +191,15 @@ class AllocationValidator:
             if current_etd == new_etd_date:
                 return False, "New ETD is the same as current ETD"
         
+        # NEW: Add info message about partial delivery
+        delivered_qty = allocation_detail.get('delivered_qty', 0)
+        if delivered_qty > 0:
+            logger.info(
+                f"ETD update for partially delivered allocation: "
+                f"{delivered_qty:.0f} already delivered, "
+                f"{pending_qty:.0f} pending"
+            )
+        
         return True, ""
     
     # ==================== Cancel Allocation Validation ====================
@@ -199,7 +211,7 @@ class AllocationValidator:
                                  reason_category: str,
                                  user_role: str = 'viewer') -> List[str]:
         """
-        Validate cancellation request
+        Validate cancellation request with partial delivery support
         
         Returns:
             List of error messages
@@ -215,22 +227,23 @@ class AllocationValidator:
         if cancel_qty <= 0:
             errors.append("Cancel quantity must be positive")
         
-        effective_qty = allocation_detail.get('effective_qty', 0)
-        if cancel_qty > effective_qty:
-            errors.append(f"Cannot cancel {cancel_qty:.0f}. Only {effective_qty:.0f} available")
+        # NEW: Use pending_allocated_qty instead of effective_qty
+        pending_qty = allocation_detail.get('pending_allocated_qty', 0)
+        if cancel_qty > pending_qty:
+            errors.append(
+                f"Cannot cancel {cancel_qty:.0f}. "
+                f"Only {pending_qty:.0f} pending (not yet delivered)"
+            )
         
-        # Check if already delivered
-        delivered_qty = allocation_detail.get('delivered_qty', 0)
-        if delivered_qty > 0:
-            max_cancellable = effective_qty - delivered_qty
-            if cancel_qty > max_cancellable:
-                errors.append(
-                    f"Cannot cancel delivered quantity. Maximum cancellable: {max_cancellable:.0f}"
-                )
+        # Check if all has been delivered
+        if pending_qty <= 0:
+            errors.append("Cannot cancel - all quantity has been delivered")
         
         # Check allocation mode
         if allocation_detail.get('allocation_mode') == 'HARD':
-            errors.append("Cannot cancel HARD allocation. Please contact manager")
+            # For HARD allocation, need manager approval
+            if user_role not in ['GM', 'MD', 'admin', 'sales_manager']:
+                errors.append("HARD allocation cancellation requires manager approval")
         
         # Validate reason
         if not reason or len(reason.strip()) < self.MIN_REASON_LENGTH:
@@ -240,6 +253,15 @@ class AllocationValidator:
         if reason_category not in self.VALID_REASON_CATEGORIES:
             errors.append(
                 f"Invalid reason category. Must be one of: {', '.join(self.VALID_REASON_CATEGORIES)}"
+            )
+        
+        # NEW: Add info about partial delivery
+        delivered_qty = allocation_detail.get('delivered_qty', 0)
+        if delivered_qty > 0 and not errors:
+            logger.info(
+                f"Cancelling from partially delivered allocation: "
+                f"{delivered_qty:.0f} already delivered, "
+                f"cancelling {cancel_qty:.0f} of {pending_qty:.0f} pending"
             )
         
         return errors
@@ -274,9 +296,57 @@ class AllocationValidator:
         
         return True, ""
     
-    # ==================== Permission Check ====================
+    # ==================== Helper Methods ====================
     
     def check_permission(self, user_role: str, action: str) -> bool:
         """Check if user role has permission for action"""
         allowed_actions = self.PERMISSIONS.get(user_role.lower(), [])
         return action in allowed_actions
+    
+    def validate_allocation_from_view_data(self, 
+                                         oc_data: Dict,
+                                         action: str) -> Dict[str, Any]:
+        """
+        Validate allocation action based on view data (with new flags)
+        
+        Args:
+            oc_data: Data from outbound_oc_pending_delivery_view
+            action: 'update_etd' or 'cancel'
+            
+        Returns:
+            Dict with 'valid' boolean and 'message' if invalid
+        """
+        # Use the new flags from view
+        if action == 'update_etd':
+            if oc_data.get('can_update_etd') == 'Yes':
+                return {'valid': True}
+            else:
+                if oc_data.get('pending_allocated_qty_standard', 0) <= 0:
+                    return {
+                        'valid': False,
+                        'message': 'Cannot update ETD - all quantity has been delivered'
+                    }
+                elif not oc_data.get('has_soft_allocation'):
+                    return {
+                        'valid': False,
+                        'message': 'Cannot update ETD - no SOFT allocation found'
+                    }
+                else:
+                    return {
+                        'valid': False,
+                        'message': 'Cannot update ETD for this allocation'
+                    }
+        
+        elif action == 'cancel':
+            if oc_data.get('can_cancel') == 'Yes':
+                return {
+                    'valid': True,
+                    'max_qty': oc_data.get('max_cancellable_qty', 0)
+                }
+            else:
+                return {
+                    'valid': False,
+                    'message': 'Cannot cancel - all quantity has been delivered'
+                }
+        
+        return {'valid': False, 'message': 'Unknown action'}

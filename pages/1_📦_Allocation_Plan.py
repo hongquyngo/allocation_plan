@@ -1,5 +1,5 @@
 """
-Allocation Planning System - Fixed UOM Conversion Version
+Allocation Planning System - Updated with Partial Delivery Support
 Product-centric view with complete allocation management
 """
 import streamlit as st
@@ -867,7 +867,11 @@ def show_product_demand_details(product_id):
                         'pending_standard_delivery_quantity': oc.get('pending_standard_delivery_quantity', 0),
                         'is_over_allocated': is_over_allocated,
                         'allocation_warning': oc.get('allocation_warning', ''),
-                        'uom_conversion': oc.get('uom_conversion', '1')
+                        'uom_conversion': oc.get('uom_conversion', '1'),
+                        # NEW: Add flags from view
+                        'can_update_etd': oc.get('can_update_etd', 'No'),
+                        'can_cancel': oc.get('can_cancel', 'No'),
+                        'max_cancellable_qty': oc.get('max_cancellable_qty', 0)
                     }
                     st.rerun()
             else:
@@ -1013,27 +1017,65 @@ def show_allocation_history_modal():
                 if alloc.get('cancellation_info'):
                     st.warning(f"❌ {alloc['cancellation_info']}")
                 
-                # Action buttons based on permissions and status
+                # UPDATED: Action buttons based on permissions and pending quantity
                 if alloc['status'] == 'ALLOCATED':
                     action_cols = st.columns([1, 1, 2])
                     
-                    # Update ETD button (only for SOFT allocations)
-                    with action_cols[0]:
-                        if alloc['allocation_mode'] == 'SOFT' and alloc['delivered_qty'] == 0:
-                            if validator.check_permission(st.session_state.user_role, 'update'):
-                                if st.button("📅 Update ETD", key=f"update_etd_{alloc['allocation_detail_id']}"):
-                                    st.session_state.show_update_etd_modal = True
-                                    st.session_state.selected_allocation_for_update = alloc.to_dict()
-                                    st.rerun()
+                    # Calculate pending quantity for this allocation
+                    pending_qty = alloc['allocated_qty'] - alloc.get('cancelled_qty', 0) - alloc.get('delivered_qty', 0)
                     
-                    # Cancel button
+                    # Update ETD button - NEW LOGIC
+                    with action_cols[0]:
+                        # Check if can update ETD based on pending quantity and mode
+                        can_update = (
+                            pending_qty > 0 and  # Has pending quantity
+                            alloc['allocation_mode'] == 'SOFT' and  # Is SOFT allocation
+                            validator.check_permission(st.session_state.user_role, 'update')
+                        )
+                        
+                        if can_update:
+                            if st.button("📅 Update ETD", key=f"update_etd_{alloc['allocation_detail_id']}"):
+                                # Add pending quantity to allocation data
+                                alloc_data = alloc.to_dict()
+                                alloc_data['pending_allocated_qty'] = pending_qty
+                                st.session_state.show_update_etd_modal = True
+                                st.session_state.selected_allocation_for_update = alloc_data
+                                st.rerun()
+                        else:
+                            # Show disabled button with tooltip
+                            if alloc['allocation_mode'] == 'HARD':
+                                help_text = "Cannot update ETD for HARD allocation"
+                            elif pending_qty <= 0:
+                                help_text = "Cannot update ETD - all quantity has been delivered"
+                            else:
+                                help_text = "No permission to update"
+                            st.button("📅 Update ETD", key=f"update_etd_{alloc['allocation_detail_id']}_disabled", 
+                                     disabled=True, help=help_text)
+                    
+                    # Cancel button - NEW LOGIC
                     with action_cols[1]:
-                        if alloc['effective_qty'] > 0:
-                            if validator.check_permission(st.session_state.user_role, 'cancel'):
-                                if st.button("❌ Cancel", key=f"cancel_{alloc['allocation_detail_id']}"):
-                                    st.session_state.show_cancel_modal = True
-                                    st.session_state.selected_allocation_for_cancel = alloc.to_dict()
-                                    st.rerun()
+                        # Check if can cancel based on pending quantity
+                        can_cancel = (
+                            pending_qty > 0 and  # Has pending quantity
+                            validator.check_permission(st.session_state.user_role, 'cancel')
+                        )
+                        
+                        if can_cancel:
+                            if st.button("❌ Cancel", key=f"cancel_{alloc['allocation_detail_id']}"):
+                                # Add pending quantity to allocation data
+                                alloc_data = alloc.to_dict()
+                                alloc_data['pending_allocated_qty'] = pending_qty
+                                st.session_state.show_cancel_modal = True
+                                st.session_state.selected_allocation_for_cancel = alloc_data
+                                st.rerun()
+                        else:
+                            # Show disabled button with tooltip
+                            if pending_qty <= 0:
+                                help_text = "Cannot cancel - all quantity has been delivered"
+                            else:
+                                help_text = "No permission to cancel"
+                            st.button("❌ Cancel", key=f"cancel_{alloc['allocation_detail_id']}_disabled", 
+                                     disabled=True, help=help_text)
                 
                 # Show cancellation history if exists
                 if alloc.get('has_cancellations'):
@@ -1066,6 +1108,14 @@ def show_allocation_history_modal():
         st.info(f"ℹ️ Note: Allocation quantities are stored in {oc_info.get('standard_uom', 'standard UOM')}. " +
                 f"Conversion: {oc_info.get('uom_conversion', 'N/A')}")
     
+    # NEW: Show action availability from view flags
+    if oc_info.get('can_update_etd') == 'Yes' or oc_info.get('can_cancel') == 'Yes':
+        st.caption("**Available Actions:**")
+        if oc_info.get('can_update_etd') == 'Yes':
+            st.caption("• ETD can be updated for SOFT allocations with pending quantity")
+        if oc_info.get('can_cancel') == 'Yes':
+            st.caption(f"• Can cancel up to {format_number(oc_info.get('max_cancellable_qty', 0))} {oc_info.get('standard_uom', '')} (pending quantity)")
+    
     # Close button
     if st.button("Close", use_container_width=True):
         st.session_state.show_allocation_history = False
@@ -1088,30 +1138,38 @@ def show_cancel_allocation_modal():
     oc_info = st.session_state.get('selected_oc_info', {})
     display_uom = oc_info.get('standard_uom', '')  # Allocations are in standard UOM
     
-    # Show allocation info
-    st.info(f"Current effective quantity: {format_number(allocation['effective_qty'])} {display_uom}")
+    # NEW: Show pending quantity instead of effective quantity
+    pending_qty = allocation.get('pending_allocated_qty', 0)
+    st.info(f"Pending quantity (not yet delivered): {format_number(pending_qty)} {display_uom}")
+    
+    # Show delivered quantity if any
+    delivered_qty = allocation.get('delivered_qty', 0)
+    if delivered_qty > 0:
+        st.warning(f"⚠️ {format_number(delivered_qty)} {display_uom} already delivered and cannot be cancelled")
     
     # Validate if can cancel
-    if allocation['allocation_mode'] == 'HARD':
+    if allocation['allocation_mode'] == 'HARD' and st.session_state.user_role not in ['GM', 'MD', 'admin', 'sales_manager']:
         st.error("❌ Cannot cancel HARD allocation. Please contact manager for approval.")
         if st.button("Close"):
             st.session_state.show_cancel_modal = False
             st.rerun()
         return
     
-    if allocation.get('delivered_qty', 0) > 0:
-        st.warning(f"⚠️ {format_number(allocation['delivered_qty'])} {display_uom} already delivered. You can only cancel undelivered quantity.")
+    if pending_qty <= 0:
+        st.error("❌ Cannot cancel - all quantity has been delivered")
+        if st.button("Close"):
+            st.session_state.show_cancel_modal = False
+            st.rerun()
+        return
     
-    # Cancel quantity input
-    max_cancel = allocation['effective_qty'] - allocation.get('delivered_qty', 0)
-    
+    # Cancel quantity input - NEW: Max is pending quantity
     cancel_qty = st.number_input(
         f"Quantity to Cancel ({display_uom})",
         min_value=0.0,
-        max_value=float(max_cancel),
-        value=float(max_cancel),
+        max_value=float(pending_qty),
+        value=float(pending_qty),
         step=1.0,
-        help=f"Maximum cancellable: {format_number(max_cancel)} {display_uom}"
+        help=f"Maximum cancellable: {format_number(pending_qty)} {display_uom} (pending quantity)"
     )
     
     # Reason category
@@ -1155,6 +1213,8 @@ def show_cancel_allocation_modal():
             
             if result['success']:
                 st.success(f"✅ Successfully cancelled {format_number(cancel_qty)} {display_uom}")
+                if result.get('remaining_pending_qty', 0) > 0:
+                    st.info(f"Remaining pending: {format_number(result['remaining_pending_qty'])} {display_uom}")
                 time.sleep(1)
                 st.session_state.show_cancel_modal = False
                 st.cache_data.clear()
@@ -1180,6 +1240,18 @@ def show_update_etd_modal():
     
     # Show current ETD
     st.info(f"Current Allocated ETD: {format_date(allocation['allocated_etd'])}")
+    
+    # NEW: Show pending quantity that will be affected
+    pending_qty = allocation.get('pending_allocated_qty', 0)
+    oc_info = st.session_state.get('selected_oc_info', {})
+    display_uom = oc_info.get('standard_uom', '')
+    
+    st.caption(f"**Pending quantity affected:** {format_number(pending_qty)} {display_uom}")
+    
+    # Show delivered quantity if any
+    delivered_qty = allocation.get('delivered_qty', 0)
+    if delivered_qty > 0:
+        st.warning(f"ℹ️ {format_number(delivered_qty)} {display_uom} already delivered. ETD update will only affect pending quantity.")
     
     # Validate if can update
     valid, error = validator.validate_update_etd(
@@ -1224,6 +1296,8 @@ def show_update_etd_modal():
             
             if result['success']:
                 st.success("✅ ETD updated successfully")
+                if result.get('update_count'):
+                    st.caption(f"This is update #{result['update_count']} for this allocation")
                 time.sleep(1)
                 st.session_state.show_update_etd_modal = False
                 st.cache_data.clear()
