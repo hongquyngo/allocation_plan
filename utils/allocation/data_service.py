@@ -1,5 +1,5 @@
 """
-Data Service for Allocation Module - Cleaned Version
+Data Service for Allocation Module - Cleaned Version with Improved UOM Handling
 Removed duplicates and unused methods
 """
 import pandas as pd
@@ -593,7 +593,7 @@ class AllocationDataService:
     
     @st.cache_data(ttl=300)
     def get_ocs_by_product(_self, product_id: int) -> pd.DataFrame:
-        """Get all pending OCs for a specific product"""
+        """Get all pending OCs for a specific product with full UOM information"""
         try:
             query = """
                 SELECT 
@@ -605,10 +605,15 @@ class AllocationDataService:
                     product_id,
                     product_name,
                     etd,
+                    -- IMPROVED: Include both selling and standard quantities/UOMs
                     selling_quantity as order_quantity,
                     pending_selling_delivery_quantity as pending_quantity,
                     selling_uom,
                     standard_uom,
+                    standard_quantity as order_quantity_standard,
+                    pending_standard_delivery_quantity,
+                    uom_conversion,
+                    -- Allocation quantities
                     effective_allocated_qty as allocated_quantity,
                     total_allocated_qty_standard as allocated_quantity_standard,
                     outstanding_amount_usd,
@@ -884,7 +889,7 @@ class AllocationDataService:
     
     @st.cache_data(ttl=300)
     def get_all_supply_for_product(_self, product_id: int) -> pd.DataFrame:
-        """Get all available supply sources for a product"""
+        """Get all available supply sources for a product with full UOM information"""
         try:
             query = """
                 SELECT 
@@ -893,6 +898,8 @@ class AllocationDataService:
                     CONCAT('Batch ', batch_number) as reference,
                     remaining_quantity as available_quantity,
                     standard_uom as uom,
+                    NULL as buying_uom,
+                    NULL as uom_conversion,
                     expiry_date,
                     NULL as arrival_date,
                     NULL as etd,
@@ -916,6 +923,8 @@ class AllocationDataService:
                     arrival_note_number as reference,
                     pending_quantity as available_quantity,
                     standard_uom as uom,
+                    buying_uom,
+                    uom_conversion,
                     NULL as expiry_date,
                     arrival_date,
                     NULL as etd,
@@ -939,6 +948,8 @@ class AllocationDataService:
                     po_number as reference,
                     pending_standard_arrival_quantity as available_quantity,
                     standard_uom as uom,
+                    buying_uom,
+                    uom_conversion,
                     NULL as expiry_date,
                     NULL as arrival_date,
                     etd,
@@ -962,6 +973,8 @@ class AllocationDataService:
                     CONCAT(from_warehouse, ' → ', to_warehouse) as reference,
                     transfer_quantity as available_quantity,
                     standard_uom as uom,
+                    NULL as buying_uom,
+                    NULL as uom_conversion,
                     expiry_date,
                     NULL as arrival_date,
                     transfer_date as etd,
@@ -1088,7 +1101,7 @@ class AllocationDataService:
     
     @st.cache_data(ttl=300)
     def get_can_summary(_self, product_id: Optional[int] = None) -> pd.DataFrame:
-        """Get CAN summary for product view"""
+        """Get CAN summary with buying UOM information"""
         try:
             params = {}
             where_clause = "WHERE pending_quantity > 0"
@@ -1103,8 +1116,12 @@ class AllocationDataService:
                     product_id,
                     product_name,
                     arrival_note_number,
+                    -- IMPROVED: Include both buying and standard quantities/UOMs
                     pending_quantity,
                     standard_uom,
+                    buying_quantity,
+                    buying_uom,
+                    uom_conversion,
                     arrival_date,
                     vendor,
                     po_number
@@ -1125,7 +1142,7 @@ class AllocationDataService:
     
     @st.cache_data(ttl=300)
     def get_po_summary(_self, product_id: Optional[int] = None) -> pd.DataFrame:
-        """Get PO summary for product view"""
+        """Get PO summary with buying UOM information"""
         try:
             params = {}
             where_clause = "WHERE pending_standard_arrival_quantity > 0"
@@ -1140,8 +1157,12 @@ class AllocationDataService:
                     product_id,
                     product_name,
                     po_number,
+                    -- IMPROVED: Include both buying and standard quantities/UOMs
                     pending_standard_arrival_quantity as pending_quantity,
                     standard_uom,
+                    pending_buying_invoiced_quantity as buying_quantity,
+                    buying_uom,
+                    uom_conversion,
                     etd,
                     vendor_name
                 FROM purchase_order_full_view

@@ -1,5 +1,5 @@
 """
-Allocation Service for Business Logic - Cleaned Version
+Allocation Service for Business Logic - Cleaned Version with Improved UOM Handling
 Core business logic for allocation operations
 """
 import logging
@@ -83,20 +83,28 @@ class AllocationService:
                 # Generate allocation number
                 allocation_number = self._generate_allocation_number(conn)
                 
-                # Create allocation context for audit
+                # IMPROVED: Create allocation context with full UOM information
                 allocation_context = {
                     'oc_detail': {
                         'id': oc_info['ocd_id'],
                         'oc_number': oc_info['oc_number'],
                         'customer': oc_info['customer_name'],
                         'product': oc_info['product_name'],
-                        'pending_qty': float(oc_info['pending_quantity'])
+                        'pending_qty': float(oc_info['pending_quantity']),
+                        'pending_qty_selling': float(oc_info.get('pending_selling_quantity', oc_info['pending_quantity'])),
+                        'standard_uom': oc_info['standard_uom'],
+                        'selling_uom': oc_info.get('selling_uom', oc_info['standard_uom']),
+                        'uom_conversion': oc_info.get('uom_conversion', '1')
                     },
                     'allocations': [
                         {
                             'source_type': alloc.get('source_type'),
                             'source_id': alloc.get('source_id'),
-                            'quantity': float(alloc['quantity'])
+                            'quantity': float(alloc['quantity']),  # Always in standard UOM
+                            'source_info': {
+                                k: v for k, v in alloc.get('supply_info', {}).items() 
+                                if k in ['buying_uom', 'standard_uom', 'uom_conversion', 'reference']
+                            }
                         } for alloc in allocations
                     ],
                     'mode': mode,
@@ -137,7 +145,7 @@ class AllocationService:
                         supply_source_id = alloc['source_id']
                         source_description = self._get_source_description(alloc)
                     
-                    # Insert allocation detail
+                    # Insert allocation detail (quantities are in standard UOM)
                     detail_query = text("""
                         INSERT INTO allocation_details (
                             allocation_plan_id, allocation_mode, demand_type, 
@@ -166,8 +174,8 @@ class AllocationService:
                         'customer_code': oc_info['customer_code'],
                         'customer_name': oc_info['customer_name'],
                         'legal_entity_name': oc_info['legal_entity'],
-                        'requested_qty': oc_info['pending_quantity'],
-                        'allocated_qty': alloc['quantity'],
+                        'requested_qty': oc_info['pending_quantity'],  # Standard UOM
+                        'allocated_qty': alloc['quantity'],  # Standard UOM
                         'etd': oc_info['etd'],
                         'allocated_etd': etd,
                         'notes': f"Source: {source_description}",
@@ -443,7 +451,7 @@ class AllocationService:
                 'error': 'No allocation items provided'
             }
         
-        # Calculate total to be allocated
+        # Calculate total to be allocated (in standard UOM)
         total_to_allocate = sum(alloc['quantity'] for alloc in allocations)
         
         # Basic quantity validation
@@ -453,7 +461,7 @@ class AllocationService:
                 'error': 'Total allocation quantity must be positive'
             }
         
-        # Check over-allocation
+        # Check over-allocation (using standard UOM for accurate comparison)
         pending_qty = float(oc_info['pending_quantity'])
         max_allowed = pending_qty * (self.MAX_OVER_ALLOCATION_PERCENT / 100)
         
@@ -553,8 +561,9 @@ class AllocationService:
             return f"ALL-{datetime.now().strftime('%Y%m%d%H%M%S')}"
     
     def _get_oc_detail_info(self, conn, oc_detail_id: int) -> Optional[Dict]:
-        """Get OC detail information for allocation"""
+        """Get OC detail information for allocation with full UOM info"""
         try:
+            # IMPROVED: Get both selling and standard quantities/UOMs
             query = text("""
                 SELECT 
                     ocd_id,
@@ -567,8 +576,10 @@ class AllocationService:
                     pt_code,
                     etd,
                     pending_standard_delivery_quantity as pending_quantity,
+                    pending_selling_delivery_quantity as pending_selling_quantity,
                     selling_uom,
-                    standard_uom
+                    standard_uom,
+                    uom_conversion
                 FROM outbound_oc_pending_delivery_view
                 WHERE ocd_id = :oc_detail_id
             """)
@@ -592,9 +603,15 @@ class AllocationService:
         if source_type == 'INVENTORY':
             return f"Inventory Batch {supply_info.get('batch_number', 'N/A')}"
         elif source_type == 'PENDING_CAN':
-            return f"CAN {supply_info.get('arrival_note_number', 'N/A')}"
+            desc = f"CAN {supply_info.get('arrival_note_number', 'N/A')}"
+            if supply_info.get('buying_uom') and supply_info.get('buying_uom') != supply_info.get('standard_uom'):
+                desc += f" (Buying: {supply_info['buying_uom']})"
+            return desc
         elif source_type == 'PENDING_PO':
-            return f"PO {supply_info.get('po_number', 'N/A')}"
+            desc = f"PO {supply_info.get('po_number', 'N/A')}"
+            if supply_info.get('buying_uom') and supply_info.get('buying_uom') != supply_info.get('standard_uom'):
+                desc += f" (Buying: {supply_info['buying_uom']})"
+            return desc
         elif source_type == 'PENDING_WHT':
             return f"Transfer {supply_info.get('from_warehouse', 'N/A')} → {supply_info.get('to_warehouse', 'N/A')}"
         else:
