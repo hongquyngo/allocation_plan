@@ -100,35 +100,35 @@ def show_metrics_row():
             st.metric(
                 "Total Products",
                 format_number(metrics.get('total_products', 0)),
-                help="Products with pending demand"
+                help="Number of unique products with pending customer orders"
             )
         
         with col2:
             st.metric(
                 "Total Demand",
                 format_number(metrics.get('total_demand_qty', 0)),
-                help="Total quantity required"
+                help="Total quantity required across all pending orders (standard UOM)"
             )
         
         with col3:
             st.metric(
                 "Total Supply",
                 format_number(metrics.get('total_supply_qty', 0)),
-                help="Total available from all sources"
+                help="Total available quantity from all sources: Inventory + CAN + PO + Transfer"
             )
         
         with col4:
             st.metric(
                 "🔴 Critical Items",
                 format_number(metrics.get('critical_products', 0)),
-                help="Products with <20% supply coverage"
+                help="Products where available supply is less than 20% of demand"
             )
         
         with col5:
             st.metric(
                 "⚠️ Urgent ETD",
                 format_number(metrics.get('urgent_etd_count', 0)),
-                help="OCs with ETD in next 7 days"
+                help="Products with at least one order due within the next 7 days"
             )
     except Exception as e:
         logger.error(f"Error loading metrics: {e}")
@@ -394,7 +394,7 @@ def show_product_list():
         return
     
     # Create header
-    header_cols = st.columns([3, 1.5, 1.5, 0.5, 0.5])
+    header_cols = st.columns([3.5, 1.5, 1.5, 0.5])
     with header_cols[0]:
         st.markdown("**PRODUCT INFO**")
     with header_cols[1]:
@@ -403,8 +403,6 @@ def show_product_list():
         st.markdown("**TOTAL SUPPLY**")
     with header_cols[3]:
         st.markdown("**STATUS**")
-    with header_cols[4]:
-        st.markdown("**ACTION**")
     
     st.divider()
     
@@ -414,7 +412,7 @@ def show_product_list():
         is_expanded = product_id in st.session_state.expanded_products
         
         # Main product row
-        cols = st.columns([3, 1.5, 1.5, 0.5, 0.5])
+        cols = st.columns([3.5, 1.5, 1.5, 0.5])
         
         with cols[0]:
             # Product info with expand/collapse button
@@ -429,9 +427,9 @@ def show_product_list():
                 else:
                     st.session_state.expanded_products.add(product_id)
                 st.rerun()
-            
-            st.caption(f"{row['pt_code']} | {row['package_size']} {row['standard_uom']}/box | {row['standard_uom']}")
-        
+
+            st.caption(f"{row['pt_code']} | {row['package_size']} | {row['standard_uom']}")
+
         with cols[1]:
             # Demand info
             st.markdown(f"**{format_number(row['total_demand'])} {row['standard_uom']}**")
@@ -452,16 +450,9 @@ def show_product_list():
             st.caption(" | ".join(supply_breakdown) if supply_breakdown else "No supply")
         
         with cols[3]:
-            # Status indicator
+            # Status indicator with tooltip
             indicator, status = get_supply_status_indicator(row['total_demand'], row['total_supply'])
-            st.markdown(f"{indicator}")
-        
-        with cols[4]:
-            # Action button
-            if st.button("View", key=f"view_{product_id}", use_container_width=True):
-                st.session_state.selected_product = row.to_dict()
-                st.session_state.expanded_products.add(product_id)
-                st.rerun()
+            st.markdown(f"{indicator}", help=f"Supply Status: {status}")
         
         # Expanded details
         if is_expanded:
@@ -492,7 +483,25 @@ def show_product_demand_details(product_id):
         st.info("No pending OCs for this product")
         return
     
-    # Create OC table
+    # Add headers for the OC table
+    header_cols = st.columns([2, 2, 1, 1, 1, 1.5])
+    with header_cols[0]:
+        st.markdown("**OC Number**")
+    with header_cols[1]:
+        st.markdown("**Customer**")
+    with header_cols[2]:
+        st.markdown("**ETD**")
+    with header_cols[3]:
+        st.markdown("**Pending Qty**")
+    with header_cols[4]:
+        st.markdown("**Allocated %**")
+    with header_cols[5]:
+        st.markdown("**Action**")
+    
+    # Divider after header
+    # st.markdown("---")
+    
+    # Create OC table rows
     for idx, oc in ocs_df.iterrows():
         cols = st.columns([2, 2, 1, 1, 1, 1.5])
         
@@ -504,7 +513,14 @@ def show_product_demand_details(product_id):
         
         with cols[2]:
             etd_days = (pd.to_datetime(oc['etd']).date() - datetime.now().date()).days
-            etd_color = "🔴" if etd_days <= 7 else "🟡" if etd_days <= 14 else ""
+            etd_color = ""
+            if etd_days <= 0:
+                etd_color = "⚫"  # Overdue
+            elif etd_days <= 7:
+                etd_color = "🔴"  # Urgent
+            elif etd_days <= 14:
+                etd_color = "🟡"  # Soon
+            
             st.text(f"{etd_color} {format_date(oc['etd'])}")
         
         with cols[3]:
