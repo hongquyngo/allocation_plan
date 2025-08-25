@@ -1,6 +1,7 @@
 """
-Validation utilities for Allocation module - Updated Version
-Core validation logic for allocation operations with partial delivery support
+Validation utilities for Allocation module - Fixed Version
+Core validation logic for allocation operations
+Fixed: Removed min/max date restrictions for ETD update
 """
 from datetime import datetime, date, timedelta
 from typing import Dict, List, Optional, Any, Tuple
@@ -17,7 +18,6 @@ class AllocationValidator:
         # Configuration constants
         self.MAX_OVER_ALLOCATION_PERCENT = 110  # Allow max 10% over-allocation
         self.MIN_ALLOCATION_QTY = 0.01
-        self.MAX_ETD_DAYS_FUTURE = 365
         self.MIN_REASON_LENGTH = 10
         self.MAX_STRING_LENGTH = 500
         
@@ -129,7 +129,8 @@ class AllocationValidator:
                           new_etd: Any,
                           user_role: str = 'viewer') -> Tuple[bool, str]:
         """
-        Validate ETD update request with partial delivery support
+        Validate ETD update request
+        FIXED: Removed min/max date restrictions
         
         Returns:
             Tuple of (is_valid, error_message)
@@ -148,12 +149,12 @@ class AllocationValidator:
         if allocation_detail.get('status') != 'ALLOCATED':
             return False, "Can only update ETD for ALLOCATED status"
         
-        # NEW: Check if there's pending quantity (not yet delivered)
+        # Check if there's pending quantity (not yet delivered)
         pending_qty = allocation_detail.get('pending_allocated_qty', 0)
         if pending_qty <= 0:
             return False, "Cannot update ETD - all quantity has been delivered"
         
-        # Validate ETD date
+        # Validate ETD date format
         if not new_etd:
             return False, "ETD is required"
         
@@ -170,15 +171,8 @@ class AllocationValidator:
         except ValueError:
             return False, "Invalid ETD format. Use YYYY-MM-DD"
         
-        # Check not too far in the past (30 days)
-        min_date = date.today() - timedelta(days=30)
-        if new_etd_date < min_date:
-            return False, "ETD cannot be more than 30 days in the past"
-        
-        # Check not too far in the future
-        max_date = date.today() + timedelta(days=self.MAX_ETD_DAYS_FUTURE)
-        if new_etd_date > max_date:
-            return False, f"ETD cannot be more than {self.MAX_ETD_DAYS_FUTURE} days in the future"
+        # REMOVED: Date range restrictions
+        # Users can now set any date as allocated ETD
         
         # Check if new ETD is different from current
         current_etd = allocation_detail.get('allocated_etd')
@@ -191,7 +185,7 @@ class AllocationValidator:
             if current_etd == new_etd_date:
                 return False, "New ETD is the same as current ETD"
         
-        # NEW: Add info message about partial delivery
+        # Add info message about partial delivery
         delivered_qty = allocation_detail.get('delivered_qty', 0)
         if delivered_qty > 0:
             logger.info(
@@ -227,7 +221,7 @@ class AllocationValidator:
         if cancel_qty <= 0:
             errors.append("Cancel quantity must be positive")
         
-        # NEW: Use pending_allocated_qty instead of effective_qty
+        # Use pending_allocated_qty instead of effective_qty
         pending_qty = allocation_detail.get('pending_allocated_qty', 0)
         if cancel_qty > pending_qty:
             errors.append(
@@ -255,7 +249,7 @@ class AllocationValidator:
                 f"Invalid reason category. Must be one of: {', '.join(self.VALID_REASON_CATEGORIES)}"
             )
         
-        # NEW: Add info about partial delivery
+        # Add info about partial delivery
         delivered_qty = allocation_detail.get('delivered_qty', 0)
         if delivered_qty > 0 and not errors:
             logger.info(
@@ -307,7 +301,7 @@ class AllocationValidator:
                                          oc_data: Dict,
                                          action: str) -> Dict[str, Any]:
         """
-        Validate allocation action based on view data (with new flags)
+        Validate allocation action based on view data
         
         Args:
             oc_data: Data from outbound_oc_pending_delivery_view
