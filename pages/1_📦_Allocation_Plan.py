@@ -93,6 +93,16 @@ def init_session_state():
                 st.session_state[key] = value.copy() if isinstance(value, (dict, set)) else value
         st.session_state.state_initialized = True
     
+    # Ensure modal states are properly initialized on each page load
+    if 'modals' not in st.session_state:
+        st.session_state.modals = {
+            'allocation': False,
+            'cancel': False,
+            'update_etd': False,
+            'reverse': False,
+            'history': False
+        }
+    
     # Set user info if not already set
     if st.session_state.user['id'] is None:
         st.session_state.user['id'] = st.session_state.get('authenticated_user_id', 1)
@@ -101,6 +111,11 @@ def init_session_state():
 
 # Initialize session state
 init_session_state()
+
+# Debug modal states (remove in production)
+if config.get_app_setting('DEBUG_MODE', False):
+    with st.sidebar:
+        st.write("Modal States:", st.session_state.modals)
 
 # Constants
 ITEMS_PER_PAGE = config.get_app_setting('ITEMS_PER_PAGE', 50)
@@ -114,6 +129,8 @@ def show_header():
         st.caption("Product-centric view with complete allocation management")
     with col2:
         if st.button("🚪 Logout", use_container_width=True):
+            # Reset all modals before logout
+            reset_all_modals()
             auth.logout()
             st.switch_page("app.py")
 
@@ -223,6 +240,9 @@ def show_search_bar():
     with col2:
         if st.button("⚙️ Advanced Filters", use_container_width=True):
             st.session_state.ui['show_advanced_filters'] = not st.session_state.ui['show_advanced_filters']
+            # Reset modals when toggling advanced filters
+            reset_all_modals()
+            st.rerun()
 
 def show_search_suggestions(search_query):
     """Display search suggestions"""
@@ -243,6 +263,8 @@ def show_search_suggestions(search_query):
                     ):
                         product_name = product.split(" | ")[0]
                         st.session_state.search_input = product_name
+                        # Reset modals when selecting search suggestion
+                        reset_all_modals()
                         st.rerun()
             
             if suggestions['brands']:
@@ -254,6 +276,7 @@ def show_search_suggestions(search_query):
                         use_container_width=True
                     ):
                         st.session_state.search_input = brand
+                        reset_all_modals()
                         st.rerun()
             
             if suggestions['customers']:
@@ -265,6 +288,7 @@ def show_search_suggestions(search_query):
                         use_container_width=True
                     ):
                         st.session_state.search_input = customer
+                        reset_all_modals()
                         st.rerun()
             
             if suggestions['oc_numbers']:
@@ -276,6 +300,7 @@ def show_search_suggestions(search_query):
                         use_container_width=True
                     ):
                         st.session_state.search_input = oc
+                        reset_all_modals()
                         st.rerun()
 
 def show_advanced_filters():
@@ -518,6 +543,10 @@ def apply_advanced_filters():
     
     st.session_state.filters = new_filters
     st.session_state.ui['page_number'] = 1
+    
+    # Reset modals when applying filters
+    reset_all_modals()
+    
     st.rerun()
 
 def clear_all_filters():
@@ -535,6 +564,10 @@ def clear_all_filters():
         st.session_state.filters['search'] = search_filter
     
     st.session_state.ui['page_number'] = 1
+    
+    # Reset modals when clearing filters
+    reset_all_modals()
+    
     st.rerun()
 
 def show_quick_filters():
@@ -566,6 +599,10 @@ def show_quick_filters():
                     st.session_state.filters.update(filter_value)
                 
                 st.session_state.ui['page_number'] = 1
+                
+                # Reset modals when changing quick filters
+                reset_all_modals()
+                
                 st.rerun()
 
 def is_filter_active(filter_type):
@@ -666,6 +703,8 @@ def show_empty_state():
             if st.button("🔄 Clear All Filters and Retry", use_container_width=True):
                 st.session_state.filters = {}
                 st.session_state.ui['page_number'] = 1
+                # Reset modals when clearing all filters
+                reset_all_modals()
                 st.rerun()
         else:
             st.write("**No products with pending demand found**")
@@ -706,6 +745,10 @@ def show_product_row(row):
     
     # Expanded details
     if is_expanded:
+        # Safety check: ensure no stale modal states when showing details
+        if st.session_state.modals.get('history') and not st.session_state.selections.get('oc_for_history'):
+            st.session_state.modals['history'] = False
+        
         show_product_details(row)
     
     st.divider()
@@ -721,8 +764,12 @@ def show_product_info(row, product_id, is_expanded):
     ):
         if is_expanded:
             st.session_state.ui['expanded_products'].remove(product_id)
+            # Clear modals when collapsing product
+            reset_all_modals()
         else:
             st.session_state.ui['expanded_products'].add(product_id)
+            # Clear any open modals when expanding a new product
+            reset_all_modals()
         st.rerun()
 
     # Show additional info
@@ -845,6 +892,13 @@ def show_oc_row(oc):
     
     with cols[5]:
         if st.button("Allocate", key=f"alloc_oc_{oc['ocd_id']}", use_container_width=True, type="primary"):
+            # Clear any other open modals
+            st.session_state.modals['history'] = False
+            st.session_state.modals['cancel'] = False
+            st.session_state.modals['update_etd'] = False
+            st.session_state.modals['reverse'] = False
+            
+            # Open allocation modal
             st.session_state.selections['oc_for_allocation'] = oc.to_dict()
             st.session_state.modals['allocation'] = True
             st.rerun()
@@ -898,6 +952,13 @@ def show_allocated_quantity(oc, is_over_allocated):
             use_container_width=True,
             type=button_type
         ):
+            # Clear any other open modals
+            st.session_state.modals['allocation'] = False
+            st.session_state.modals['cancel'] = False
+            st.session_state.modals['update_etd'] = False
+            st.session_state.modals['reverse'] = False
+            
+            # Open history modal
             st.session_state.modals['history'] = True
             st.session_state.selections['oc_for_history'] = oc['ocd_id']
             st.session_state.selections['oc_info'] = {
@@ -1020,6 +1081,8 @@ def show_pagination(df):
             if st.session_state.ui['page_number'] > 1:
                 if st.button("← Previous", use_container_width=True):
                     st.session_state.ui['page_number'] -= 1
+                    # Reset modals when changing page
+                    reset_all_modals()
                     st.rerun()
         
         with col2:
@@ -1028,18 +1091,48 @@ def show_pagination(df):
         with col3:
             if st.button("Next →", use_container_width=True):
                 st.session_state.ui['page_number'] += 1
+                # Reset modals when changing page
+                reset_all_modals()
                 st.rerun()
+
+def reset_all_modals():
+    """Reset all modal states and selections"""
+    st.session_state.modals = {
+        'allocation': False,
+        'cancel': False,
+        'update_etd': False,
+        'reverse': False,
+        'history': False
+    }
+    st.session_state.selections['oc_for_allocation'] = None
+    st.session_state.selections['oc_for_history'] = None
+    st.session_state.selections['oc_info'] = None
+    st.session_state.selections['allocation_for_cancel'] = None
+    st.session_state.selections['allocation_for_update'] = None
+    st.session_state.selections['cancellation_for_reverse'] = None
+    st.session_state.context['return_to_history'] = None
 
 # ==================== ALLOCATION HISTORY MODAL ====================
 @st.dialog("Allocation History", width="large")
 def show_allocation_history_modal():
     """Show allocation history for selected OC with management actions"""
-    if 'oc_for_history' not in st.session_state.selections:
+    if 'oc_for_history' not in st.session_state.selections or not st.session_state.selections['oc_for_history']:
         st.error("No OC selected")
+        if st.button("Close"):
+            st.session_state.modals['history'] = False
+            st.rerun()
         return
     
     oc_detail_id = st.session_state.selections['oc_for_history']
-    oc_info = st.session_state.selections['oc_info']
+    oc_info = st.session_state.selections.get('oc_info')
+    
+    if not oc_info:
+        st.error("OC information not found")
+        if st.button("Close"):
+            st.session_state.modals['history'] = False
+            st.session_state.selections['oc_for_history'] = None
+            st.rerun()
+        return
     
     # Header
     st.markdown(f"### Allocation History for {oc_info['oc_number']}")
@@ -1082,6 +1175,7 @@ def show_allocation_history_modal():
         st.session_state.modals['history'] = False
         st.session_state.selections['oc_for_history'] = None
         st.session_state.selections['oc_info'] = None
+        st.session_state.context['return_to_history'] = None
         st.rerun()
 
 def show_allocation_summary_metrics(oc_info):
@@ -1345,6 +1439,10 @@ def show_update_etd_modal():
     
     if not allocation:
         st.error("No allocation selected")
+        if st.button("Close"):
+            st.session_state.modals['update_etd'] = False
+            st.session_state.selections['allocation_for_update'] = None
+            st.rerun()
         return
     
     st.markdown(f"### Update ETD for {allocation['allocation_number']}")
@@ -1445,6 +1543,10 @@ def show_cancel_allocation_modal():
     
     if not allocation:
         st.error("No allocation selected")
+        if st.button("Close"):
+            st.session_state.modals['cancel'] = False
+            st.session_state.selections['allocation_for_cancel'] = None
+            st.rerun()
         return
     
     st.markdown(f"### Cancel Allocation {allocation['allocation_number']}")
@@ -1568,6 +1670,10 @@ def show_reverse_cancellation_modal():
     
     if not cancellation:
         st.error("No cancellation selected")
+        if st.button("Close"):
+            st.session_state.modals['reverse'] = False
+            st.session_state.selections['cancellation_for_reverse'] = None
+            st.rerun()
         return
     
     st.markdown("### Reverse Cancellation")
@@ -1644,6 +1750,10 @@ def show_allocation_modal():
     
     if not oc:
         st.error("No OC selected")
+        if st.button("Close"):
+            st.session_state.modals['allocation'] = False
+            st.session_state.selections['oc_for_allocation'] = None
+            st.rerun()
         return
     
     # Header info
@@ -1676,6 +1786,7 @@ def show_allocation_modal():
         st.error("⏳ No available supply for this product")
         if st.button("Close"):
             st.session_state.modals['allocation'] = False
+            st.session_state.selections['oc_for_allocation'] = None
             st.rerun()
         return
     
@@ -1859,9 +1970,10 @@ def show_allocation_summary(oc, total_selected, selected_supplies, use_soft):
                     st.success(f"✅ Allocation Successful\nAllocated: {format_number(total_selected)} {oc.get('standard_uom', 'pcs')} to {oc['oc_number']}\nAllocation Number: {result['allocation_number']}")
                     st.balloons()
                     
-                    # Close modal after short delay
+                    # Close modal and clear selection after short delay
                     time.sleep(2)
                     st.session_state.modals['allocation'] = False
+                    st.session_state.selections['oc_for_allocation'] = None
                     st.cache_data.clear()
                     st.rerun()
                 else:
@@ -1870,11 +1982,24 @@ def show_allocation_summary(oc, total_selected, selected_supplies, use_soft):
     with col2:
         if st.button("Cancel", use_container_width=True):
             st.session_state.modals['allocation'] = False
+            st.session_state.selections['oc_for_allocation'] = None
             st.rerun()
 
 # ==================== MAIN EXECUTION ====================
 def main():
     """Main function to run the allocation planning page"""
+    # Safety check: Reset modals if no corresponding selection
+    if st.session_state.modals['history'] and not st.session_state.selections.get('oc_for_history'):
+        st.session_state.modals['history'] = False
+    if st.session_state.modals['allocation'] and not st.session_state.selections.get('oc_for_allocation'):
+        st.session_state.modals['allocation'] = False
+    if st.session_state.modals['cancel'] and not st.session_state.selections.get('allocation_for_cancel'):
+        st.session_state.modals['cancel'] = False
+    if st.session_state.modals['update_etd'] and not st.session_state.selections.get('allocation_for_update'):
+        st.session_state.modals['update_etd'] = False
+    if st.session_state.modals['reverse'] and not st.session_state.selections.get('cancellation_for_reverse'):
+        st.session_state.modals['reverse'] = False
+    
     show_header()
     show_metrics_row()
     st.divider()
@@ -1891,19 +2016,19 @@ def main():
     show_product_list()
     
     # Show modals based on state
-    if st.session_state.modals['allocation']:
+    if st.session_state.modals['allocation'] and st.session_state.selections.get('oc_for_allocation'):
         show_allocation_modal()
     
-    if st.session_state.modals['history']:
+    if st.session_state.modals['history'] and st.session_state.selections.get('oc_for_history'):
         show_allocation_history_modal()
     
-    if st.session_state.modals['cancel']:
+    if st.session_state.modals['cancel'] and st.session_state.selections.get('allocation_for_cancel'):
         show_cancel_allocation_modal()
     
-    if st.session_state.modals['update_etd']:
+    if st.session_state.modals['update_etd'] and st.session_state.selections.get('allocation_for_update'):
         show_update_etd_modal()
     
-    if st.session_state.modals['reverse']:
+    if st.session_state.modals['reverse'] and st.session_state.selections.get('cancellation_for_reverse'):
         show_reverse_cancellation_modal()
 
 # Run the main function
