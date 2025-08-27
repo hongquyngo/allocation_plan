@@ -1001,11 +1001,20 @@ def show_inventory_summary(product_id):
     inventory_df = data_service.get_inventory_summary(product_id)
     if not inventory_df.empty:
         for _, inv in inventory_df.iterrows():
+            # Include warehouse in the label
+            label = f"Batch {inv['batch_number']}"
+            if inv.get('warehouse_name'):
+                label += f" | {inv['warehouse_name']}"
+            
             st.metric(
-                f"Batch {inv['batch_number']}",
+                label,
                 f"{format_number(inv['available_quantity'])} {inv.get('standard_uom', '')}",
                 delta=f"Exp: {format_date(inv['expiry_date'])}"
             )
+            
+            # Optionally show location as caption if available
+            if inv.get('location'):
+                st.caption(f"📍 Location: {inv['location']}")
     else:
         st.caption("No inventory")
 
