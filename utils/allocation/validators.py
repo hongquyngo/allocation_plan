@@ -3,8 +3,8 @@ Validation utilities for Allocation module - Fixed Version
 Core validation logic for allocation operations
 Fixed: Removed min/max date restrictions for ETD update
 """
-from datetime import datetime, date, timedelta
-from typing import Dict, List, Optional, Any, Tuple
+from datetime import datetime, date
+from typing import Dict, List, Any, Tuple
 import pandas as pd
 import logging
 
@@ -296,51 +296,4 @@ class AllocationValidator:
         """Check if user role has permission for action"""
         allowed_actions = self.PERMISSIONS.get(user_role.lower(), [])
         return action in allowed_actions
-    
-    def validate_allocation_from_view_data(self, 
-                                         oc_data: Dict,
-                                         action: str) -> Dict[str, Any]:
-        """
-        Validate allocation action based on view data
-        
-        Args:
-            oc_data: Data from outbound_oc_pending_delivery_view
-            action: 'update_etd' or 'cancel'
-            
-        Returns:
-            Dict with 'valid' boolean and 'message' if invalid
-        """
-        # Use the new flags from view
-        if action == 'update_etd':
-            if oc_data.get('can_update_etd') == 'Yes':
-                return {'valid': True}
-            else:
-                if oc_data.get('pending_allocated_qty_standard', 0) <= 0:
-                    return {
-                        'valid': False,
-                        'message': 'Cannot update ETD - all quantity has been delivered'
-                    }
-                elif not oc_data.get('has_soft_allocation'):
-                    return {
-                        'valid': False,
-                        'message': 'Cannot update ETD - no SOFT allocation found'
-                    }
-                else:
-                    return {
-                        'valid': False,
-                        'message': 'Cannot update ETD for this allocation'
-                    }
-        
-        elif action == 'cancel':
-            if oc_data.get('can_cancel') == 'Yes':
-                return {
-                    'valid': True,
-                    'max_qty': oc_data.get('max_cancellable_qty', 0)
-                }
-            else:
-                return {
-                    'valid': False,
-                    'message': 'Cannot cancel - all quantity has been delivered'
-                }
-        
-        return {'valid': False, 'message': 'Unknown action'}
+   

@@ -4,8 +4,7 @@ UOM Converter Service for Allocation Module - Cleaned Version
 Only keeps functions actually used in the UI
 """
 import logging
-from typing import Union, Optional
-from decimal import Decimal
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 

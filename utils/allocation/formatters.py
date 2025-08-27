@@ -34,43 +34,6 @@ def format_number(value: Union[int, float, None], decimals: int = 0) -> str:
         return "-"
 
 
-def format_currency(value: Union[int, float, None], currency: str = "USD", 
-                   decimals: int = 2) -> str:
-    """
-    Format currency value
-    
-    Args:
-        value: Amount to format
-        currency: Currency code (USD, VND, etc.)
-        decimals: Number of decimal places
-        
-    Returns:
-        Formatted currency string
-    """
-    try:
-        if value is None or pd.isna(value):
-            return "-"
-        
-        # Currency symbols
-        symbols = {
-            "USD": "$",
-            "VND": "₫",
-            "EUR": "€",
-            "GBP": "£"
-        }
-        
-        symbol = symbols.get(currency, currency + " ")
-        
-        if currency == "VND":
-            # VND typically doesn't use decimals
-            return f"{symbol}{int(value):,}"
-        else:
-            return f"{symbol}{float(value):,.{decimals}f}"
-            
-    except (ValueError, TypeError):
-        return "-"
-
-
 def format_date(value: Union[str, datetime, date, None], 
                 format_str: str = "%d/%m/%Y") -> str:
     """
@@ -120,29 +83,6 @@ def format_date(value: Union[str, datetime, date, None],
     except Exception as e:
         logger.debug(f"Error formatting date {value}: {e}")
         return "-"
-
-
-def format_status(status: str) -> str:
-    """
-    Format allocation status with emoji
-    
-    Args:
-        status: Status string
-        
-    Returns:
-        Status with emoji prefix
-    """
-    status_map = {
-        'Not Allocated': '⚪ Not Allocated',
-        'Partially Allocated': '🟡 Partially Allocated',
-        'Fully Allocated': '🟢 Fully Allocated',
-        'Over Allocated': '🔴 Over Allocated',
-        'ALLOCATED': '✅ Allocated',
-        'DRAFT': '📝 Draft',
-        'CANCELLED': '❌ Cancelled'
-    }
-    
-    return status_map.get(status, f"❓ {status}")
 
 
 def format_percentage(value: Union[int, float, None], decimals: int = 1) -> str:

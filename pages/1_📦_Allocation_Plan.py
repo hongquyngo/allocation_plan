@@ -8,7 +8,6 @@ import pandas as pd
 from datetime import datetime, timedelta
 import logging
 import time
-from sqlalchemy import text
 
 # Import utilities
 from utils.auth import AuthManager
@@ -16,8 +15,8 @@ from utils.config import config
 from utils.allocation.data_service import AllocationDataService
 from utils.allocation.allocation_service import AllocationService
 from utils.allocation.formatters import (
-    format_number, format_date, format_status, 
-    format_percentage, format_currency, format_allocation_mode,
+    format_number, format_date, 
+    format_percentage, format_allocation_mode,
     format_reason_category
 )
 from utils.allocation.validators import AllocationValidator

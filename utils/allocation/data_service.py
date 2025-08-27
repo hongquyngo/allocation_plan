@@ -3,12 +3,10 @@ Data Service for Allocation Module - Fixed Version
 Fixed SQL injection risks, improved query performance
 """
 import pandas as pd
-from datetime import datetime, timedelta
 import logging
 from typing import Dict, List, Optional, Any, Tuple
 import streamlit as st
-from sqlalchemy import text, and_, or_, select, func
-from sqlalchemy.sql import bindparam
+from sqlalchemy import text
 
 from ..db import get_db_engine
 from ..config import config
@@ -528,121 +526,6 @@ class AllocationDataService:
         except Exception as e:
             logger.error(f"Error loading products with demand/supply: {e}", exc_info=True)
             return pd.DataFrame()
-    
-    # ==================== Batch Loading to Avoid N+1 ====================
-    
-    def get_products_with_details_batch(self, product_ids: List[int]) -> Dict[int, Dict]:
-        """
-        Get product details for multiple products in one query
-        Avoids N+1 query pattern
-        """
-        if not product_ids:
-            return {}
-        
-        try:
-            # Build safe IN clause
-            params = {}
-            in_clause, params = self._build_safe_in_clause(
-                'p.product_id',
-                product_ids,
-                'prod_id',
-                params
-            )
-            
-            # Get OCs for all products
-            oc_query = f"""
-                SELECT 
-                    product_id,
-                    ocd_id,
-                    oc_number,
-                    customer,
-                    etd,
-                    pending_selling_delivery_quantity,
-                    pending_standard_delivery_quantity,
-                    selling_uom,
-                    standard_uom,
-                    uom_conversion,
-                    effective_allocated_qty,
-                    is_over_allocated,
-                    allocation_warning
-                FROM outbound_oc_pending_delivery_view
-                WHERE {in_clause}
-                AND pending_standard_delivery_quantity > 0
-                ORDER BY product_id, etd
-            """
-            
-            # Get supply for all products
-            supply_query = f"""
-                SELECT 
-                    product_id,
-                    source_type,
-                    source_id,
-                    reference,
-                    available_quantity,
-                    uom,
-                    buying_uom,
-                    uom_conversion,
-                    expiry_date,
-                    arrival_date,
-                    etd
-                FROM (
-                    SELECT 
-                        product_id,
-                        'INVENTORY' as source_type,
-                        inventory_history_id as source_id,
-                        CONCAT('Batch ', batch_number) as reference,
-                        remaining_quantity as available_quantity,
-                        standard_uom as uom,
-                        NULL as buying_uom,
-                        NULL as uom_conversion,
-                        expiry_date,
-                        NULL as arrival_date,
-                        NULL as etd
-                    FROM inventory_detailed_view
-                    WHERE product_id IN (SELECT product_id FROM (VALUES {','.join([f'({id})' for id in product_ids])}) AS t(product_id))
-                    AND remaining_quantity > 0
-                    
-                    UNION ALL
-                    
-                    SELECT 
-                        product_id,
-                        'PENDING_CAN' as source_type,
-                        can_line_id as source_id,
-                        arrival_note_number as reference,
-                        pending_quantity as available_quantity,
-                        standard_uom as uom,
-                        buying_uom,
-                        uom_conversion,
-                        NULL as expiry_date,
-                        arrival_date,
-                        NULL as etd
-                    FROM can_pending_stockin_view
-                    WHERE product_id IN (SELECT product_id FROM (VALUES {','.join([f'({id})' for id in product_ids])}) AS t(product_id))
-                    AND pending_quantity > 0
-                    
-                    -- Similar for PO and WHT
-                ) AS supply_union
-                ORDER BY product_id, source_type
-            """
-            
-            with self.engine.connect() as conn:
-                # Execute queries
-                oc_df = pd.read_sql(text(oc_query), conn, params=params)
-                supply_df = pd.read_sql(text(supply_query), conn, params=params)
-                
-                # Group by product_id
-                result = {}
-                for product_id in product_ids:
-                    result[product_id] = {
-                        'ocs': oc_df[oc_df['product_id'] == product_id].to_dict('records'),
-                        'supply': supply_df[supply_df['product_id'] == product_id].to_dict('records')
-                    }
-                
-                return result
-                
-        except Exception as e:
-            logger.error(f"Error batch loading product details: {e}")
-            return {}
     
     # ==================== Search Suggestions with Security ====================
     
