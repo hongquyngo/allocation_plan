@@ -1,6 +1,6 @@
 """
-Allocation Service for Business Logic - Fixed Version
-Core business logic for allocation operations with improved transaction management
+Allocation Service for Business Logic - Complete Fixed Version
+Core business logic for allocation operations with proper UOM handling
 """
 import logging
 from datetime import datetime
@@ -539,8 +539,8 @@ class AllocationService:
                 'oc_number': oc_info['oc_number'],
                 'customer': oc_info['customer_name'],
                 'product': oc_info['product_name'],
-                'pending_qty_standard': float(oc_info['pending_quantity']),
-                'pending_qty_selling': float(oc_info.get('pending_selling_quantity', 
+                'pending_qty_standard': float(oc_info.get('pending_standard_delivery_quantity', oc_info['pending_quantity'])),
+                'pending_qty_selling': float(oc_info.get('pending_quantity', 
                                                         oc_info['pending_quantity'])),
                 'standard_uom': oc_info['standard_uom'],
                 'selling_uom': oc_info.get('selling_uom', oc_info['standard_uom']),
@@ -597,6 +597,9 @@ class AllocationService:
             )
         """)
         
+        # Use standard UOM for storage
+        requested_qty_standard = oc_info.get('pending_standard_delivery_quantity', oc_info['pending_quantity'])
+        
         result = conn.execute(detail_query, {
             'allocation_plan_id': allocation_plan_id,
             'allocation_mode': mode,
@@ -607,7 +610,7 @@ class AllocationService:
             'customer_code': oc_info['customer_code'],
             'customer_name': oc_info['customer_name'],
             'legal_entity_name': oc_info['legal_entity'],
-            'requested_qty': oc_info['pending_quantity'],  # Standard UOM
+            'requested_qty': requested_qty_standard,  # Standard UOM
             'allocated_qty': alloc['quantity'],  # Standard UOM
             'etd': oc_info['etd'],
             'allocated_etd': etd,
@@ -643,22 +646,51 @@ class AllocationService:
                 'error': 'Total allocation quantity must be greater than zero'
             }
         
-        # Check over-allocation
+        # Check over-allocation - FIX: Use pending_standard_delivery_quantity
         pending_qty_standard = float(oc_info.get('pending_standard_delivery_quantity', oc_info['pending_quantity']))
         max_allowed = pending_qty_standard * (self.MAX_OVER_ALLOCATION_PERCENT / 100)
         standard_uom = oc_info.get('standard_uom', '')
         
         if total_to_allocate > max_allowed:
             over_percent = ((total_to_allocate - pending_qty_standard) / pending_qty_standard * 100)
+            
+            # Build error message with UOM context
+            error_msg = (
+                f"Over-allocation limit exceeded. "
+                f"Requested: {total_to_allocate:.0f} {standard_uom} "
+                f"({over_percent:.1f}% over). "
+                f"Maximum allowed: {max_allowed:.0f} {standard_uom} "
+                f"({self.MAX_OVER_ALLOCATION_PERCENT - 100}% over)"
+            )
+            
+            # Add selling UOM reference if different
+            if oc_info.get('selling_uom') and oc_info.get('selling_uom') != standard_uom:
+                if self.uom_converter.needs_conversion(oc_info.get('uom_conversion', '1')):
+                    # Convert to selling UOM for user reference
+                    total_selling = self.uom_converter.convert_quantity(
+                        total_to_allocate,
+                        'standard',
+                        'selling',
+                        oc_info.get('uom_conversion', '1')
+                    )
+                    max_selling = self.uom_converter.convert_quantity(
+                        max_allowed,
+                        'standard',
+                        'selling',
+                        oc_info.get('uom_conversion', '1')
+                    )
+                    pending_selling = oc_info.get('pending_quantity', pending_qty_standard)
+                    
+                    error_msg += (
+                        f"\n\nFor reference in selling UOM: "
+                        f"{total_selling:.0f} {oc_info['selling_uom']} exceeds "
+                        f"{max_selling:.0f} {oc_info['selling_uom']} "
+                        f"(110% of {pending_selling:.0f} {oc_info['selling_uom']})"
+                    )
+            
             return {
                 'valid': False,
-                'error': (
-                    f"Over-allocation limit exceeded. "
-                    f"Requested: {total_to_allocate:.0f} {standard_uom} "
-                    f"({over_percent:.1f}% over). "
-                    f"Maximum allowed: {max_allowed:.0f} {standard_uom} "
-                    f"({self.MAX_OVER_ALLOCATION_PERCENT - 100}% over)"
-                )
+                'error': error_msg
             }
         
         # For SOFT allocation, check total supply availability
@@ -774,8 +806,8 @@ class AllocationService:
                     product_name,
                     pt_code,
                     etd,
-                    pending_standard_delivery_quantity as pending_quantity,
-                    pending_selling_delivery_quantity as pending_selling_quantity,
+                    pending_standard_delivery_quantity,
+                    pending_selling_delivery_quantity as pending_quantity,
                     selling_uom,
                     standard_uom,
                     uom_conversion
@@ -880,5 +912,3 @@ class AllocationService:
             return f"Transfer {supply_info.get('from_warehouse', 'N/A')} → {supply_info.get('to_warehouse', 'N/A')}"
         else:
             return source_type
-    
-    
