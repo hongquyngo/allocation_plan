@@ -644,7 +644,7 @@ class AllocationService:
             }
         
         # Check over-allocation
-        pending_qty_standard = float(oc_info['pending_quantity'])
+        pending_qty_standard = float(oc_info.get('pending_standard_delivery_quantity', oc_info['pending_quantity']))
         max_allowed = pending_qty_standard * (self.MAX_OVER_ALLOCATION_PERCENT / 100)
         standard_uom = oc_info.get('standard_uom', '')
         
