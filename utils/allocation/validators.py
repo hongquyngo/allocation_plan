@@ -15,7 +15,7 @@ class AllocationValidator:
     
     def __init__(self):
         # Configuration constants
-        self.MAX_OVER_ALLOCATION_PERCENT = 110  # Allow max 10% over-allocation
+        self.MAX_OVER_ALLOCATION_PERCENT = 100
         self.MIN_ALLOCATION_QTY = 0.01
         self.MIN_REASON_LENGTH = 10
         self.MAX_STRING_LENGTH = 500
@@ -154,11 +154,11 @@ class AllocationValidator:
         return errors
     
     # ==================== Update Allocation Validation ====================
-    
+        
     def validate_update_etd(self,
-                          allocation_detail: Dict,
-                          new_etd: Any,
-                          user_role: str = 'viewer') -> Tuple[bool, str]:
+                        allocation_detail: Dict,
+                        new_etd: Any,
+                        user_role: str = 'viewer') -> Tuple[bool, str]:
         """
         Validate ETD update request
         
@@ -169,11 +169,7 @@ class AllocationValidator:
         if not self.check_permission(user_role, 'update'):
             return False, "You don't have permission to update allocations"
         
-        # Check allocation mode
-        if allocation_detail.get('allocation_mode') == 'HARD':
-            # For HARD allocation, need manager approval
-            if user_role not in ['GM', 'MD', 'admin', 'sales_manager']:
-                return False, "HARD allocation ETD update requires manager approval"
+        # REMOVED: Check for HARD allocation mode - now both HARD and SOFT can be updated
         
         # Check status
         if allocation_detail.get('status') != 'ALLOCATED':
@@ -222,15 +218,15 @@ class AllocationValidator:
             )
         
         return True, ""
-    
+
     # ==================== Cancel Allocation Validation ====================
-    
+        
     def validate_cancel_allocation(self,
-                                 allocation_detail: Dict,
-                                 cancel_qty: float,
-                                 reason: str,
-                                 reason_category: str,
-                                 user_role: str = 'viewer') -> List[str]:
+                                allocation_detail: Dict,
+                                cancel_qty: float,
+                                reason: str,
+                                reason_category: str,
+                                user_role: str = 'viewer') -> List[str]:
         """
         Validate cancellation request with UOM context
         
@@ -264,11 +260,7 @@ class AllocationValidator:
         if pending_qty <= 0:
             errors.append("Cannot cancel - all quantity has been delivered")
         
-        # Check allocation mode
-        if allocation_detail.get('allocation_mode') == 'HARD':
-            # For HARD allocation, need manager approval
-            if user_role not in ['GM', 'MD', 'admin', 'sales_manager']:
-                errors.append("HARD allocation cancellation requires manager approval")
+        # REMOVED: Check for HARD allocation mode - now both can be cancelled with same rules
         
         # Validate reason
         if not reason or len(reason.strip()) < self.MIN_REASON_LENGTH:
@@ -294,7 +286,7 @@ class AllocationValidator:
             )
         
         return errors
-    
+
     # ==================== Reverse Cancellation Validation ====================
     
     def validate_reverse_cancellation(self,
@@ -332,21 +324,3 @@ class AllocationValidator:
         allowed_actions = self.PERMISSIONS.get(user_role.lower(), [])
         return action in allowed_actions
     
-    def validate_quantity_with_uom(self, quantity: float, uom: str, 
-                                  min_qty: float = None, max_qty: float = None) -> Tuple[bool, str]:
-        """
-        Validate quantity with UOM context
-        
-        Returns:
-            Tuple of (is_valid, error_message)
-        """
-        if quantity <= 0:
-            return False, f"Quantity must be positive (entered: {quantity} {uom})"
-        
-        if min_qty is not None and quantity < min_qty:
-            return False, f"Quantity {quantity} {uom} is below minimum {min_qty} {uom}"
-        
-        if max_qty is not None and quantity > max_qty:
-            return False, f"Quantity {quantity} {uom} exceeds maximum {max_qty} {uom}"
-        
-        return True, ""

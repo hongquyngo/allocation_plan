@@ -49,7 +49,7 @@ class AllocationDataService:
         
         clause = f"{column} IN ({','.join(param_names)})"
         return clause, params
-    
+        
     def _build_safe_where_conditions(self, filters: Dict) -> Tuple[List[str], Dict]:
         """
         Build WHERE conditions safely with proper parameterization
@@ -189,6 +189,35 @@ class AllocationDataService:
             params['date_from'] = filters['date_from']
             params['date_to'] = filters['date_to']
         
+        # ETD range filter (from UI)
+        if filters.get('etd_range'):
+            etd_range = filters['etd_range']
+            
+            if etd_range == 'Next 7 days':
+                where_conditions.append("""
+                    EXISTS (
+                        SELECT 1 FROM outbound_oc_pending_delivery_view ocpd
+                        WHERE ocpd.product_id = p.id 
+                        AND ocpd.etd <= DATE_ADD(CURRENT_DATE, INTERVAL 7 DAY)
+                    )
+                """)
+            elif etd_range == 'Next 14 days':
+                where_conditions.append("""
+                    EXISTS (
+                        SELECT 1 FROM outbound_oc_pending_delivery_view ocpd
+                        WHERE ocpd.product_id = p.id 
+                        AND ocpd.etd <= DATE_ADD(CURRENT_DATE, INTERVAL 14 DAY)
+                    )
+                """)
+            elif etd_range == 'Next 30 days':
+                where_conditions.append("""
+                    EXISTS (
+                        SELECT 1 FROM outbound_oc_pending_delivery_view ocpd
+                        WHERE ocpd.product_id = p.id 
+                        AND ocpd.etd <= DATE_ADD(CURRENT_DATE, INTERVAL 30 DAY)
+                    )
+                """)
+        
         # Quick filters
         if filters.get('supply_status') == 'low':
             # This will be handled in HAVING clause
@@ -212,21 +241,84 @@ class AllocationDataService:
                 )
             """)
         
+        # Allocation status filter (detailed)
+        if filters.get('allocation_status_detail'):
+            status = filters['allocation_status_detail']
+            
+            if status == 'Not Allocated':
+                where_conditions.append("""
+                    EXISTS (
+                        SELECT 1 FROM outbound_oc_pending_delivery_view ocpd
+                        WHERE ocpd.product_id = p.id 
+                        AND ocpd.is_allocated = 'No'
+                    )
+                """)
+            elif status == 'Partially Allocated':
+                where_conditions.append("""
+                    EXISTS (
+                        SELECT 1 FROM outbound_oc_pending_delivery_view ocpd
+                        WHERE ocpd.product_id = p.id 
+                        AND ocpd.is_allocated = 'Yes'
+                        AND ocpd.allocation_coverage_percent < 100
+                    )
+                """)
+            elif status == 'Fully Allocated':
+                where_conditions.append("""
+                    EXISTS (
+                        SELECT 1 FROM outbound_oc_pending_delivery_view ocpd
+                        WHERE ocpd.product_id = p.id 
+                        AND ocpd.is_allocated = 'Yes'
+                        AND ocpd.allocation_coverage_percent >= 100
+                        AND ocpd.over_allocation_type = 'Normal'
+                    )
+                """)
+            elif status == 'Over Allocated':
+                where_conditions.append("""
+                    EXISTS (
+                        SELECT 1 FROM outbound_oc_pending_delivery_view ocpd
+                        WHERE ocpd.product_id = p.id 
+                        AND ocpd.over_allocation_type IN ('Over-Committed', 'Pending-Over-Allocated')
+                    )
+                """)
+        
         if filters.get('has_inventory'):
             # This will be handled in HAVING clause
             pass
         
+        # Updated over-allocated filter to use new column names
         if filters.get('over_allocated'):
             where_conditions.append("""
                 EXISTS (
                     SELECT 1 FROM outbound_oc_pending_delivery_view ocpd
                     WHERE ocpd.product_id = p.id 
-                    AND ocpd.is_over_allocated = 'Yes'
+                    AND (ocpd.is_over_committed = 'Yes' OR ocpd.is_pending_over_allocated = 'Yes')
                 )
             """)
         
+        # Coverage filter (percentage based)
+        if filters.get('coverage_percent_min') is not None:
+            where_conditions.append("""
+                EXISTS (
+                    SELECT 1 FROM outbound_oc_pending_delivery_view ocpd
+                    WHERE ocpd.product_id = p.id 
+                    AND ocpd.allocation_coverage_percent >= :coverage_percent_min
+                )
+            """)
+            params['coverage_percent_min'] = filters['coverage_percent_min']
+        
+        if filters.get('coverage_percent_max') is not None:
+            where_conditions.append("""
+                EXISTS (
+                    SELECT 1 FROM outbound_oc_pending_delivery_view ocpd
+                    WHERE ocpd.product_id = p.id 
+                    AND ocpd.allocation_coverage_percent <= :coverage_percent_max
+                )
+            """)
+            params['coverage_percent_max'] = filters['coverage_percent_max']
+        
         return where_conditions, params
-    
+
+
     def _build_safe_having_conditions(self, filters: Dict) -> List[str]:
         """Build HAVING conditions for aggregate filters"""
         having_conditions = []
@@ -380,10 +472,10 @@ class AllocationDataService:
             return pd.DataFrame()
     
     # ==================== Main Product List with Improved Query ====================
-    
+        
     @st.cache_data(ttl=300)
     def get_products_with_demand_supply(_self, filters: Dict = None, 
-                                       page: int = 1, page_size: int = 50) -> pd.DataFrame:
+                                    page: int = 1, page_size: int = 50) -> pd.DataFrame:
         """Get products with aggregated demand and supply information - Improved version"""
         try:
             # Build WHERE and HAVING conditions safely
@@ -409,8 +501,15 @@ class AllocationDataService:
                         COUNT(CASE WHEN etd <= DATE_ADD(CURRENT_DATE, INTERVAL 7 DAY) THEN 1 END) as urgent_ocs,
                         GROUP_CONCAT(DISTINCT oc_number ORDER BY oc_number SEPARATOR ', ') as oc_numbers,
                         GROUP_CONCAT(DISTINCT customer ORDER BY customer SEPARATOR ', ') as customers,
-                        SUM(CASE WHEN is_over_allocated = 'Yes' THEN 1 ELSE 0 END) as over_allocated_count,
-                        MAX(CASE WHEN is_over_allocated = 'Yes' THEN 1 ELSE 0 END) as has_over_allocation
+                        -- Updated to use new column names
+                        SUM(CASE 
+                            WHEN is_over_committed = 'Yes' OR is_pending_over_allocated = 'Yes' 
+                            THEN 1 ELSE 0 
+                        END) as over_allocated_count,
+                        MAX(CASE 
+                            WHEN is_over_committed = 'Yes' OR is_pending_over_allocated = 'Yes' 
+                            THEN 1 ELSE 0 
+                        END) as has_over_allocation
                     FROM outbound_oc_pending_delivery_view
                     WHERE pending_standard_delivery_quantity > 0
                     GROUP BY product_id
@@ -658,25 +757,28 @@ class AllocationDataService:
                     standard_quantity as order_quantity_standard,
                     pending_standard_delivery_quantity,
                     uom_conversion,
-                    effective_allocated_qty as allocated_quantity,
-                    total_allocated_qty_standard as allocated_quantity_standard,
+                    total_allocated_qty_standard,
+                    undelivered_allocated_qty_standard,
+                    allocation_count,
+                    allocation_numbers,
                     outstanding_amount_usd,
                     allocation_coverage_percent,
                     is_allocated,
-                    allocation_numbers,
-                    allocation_count,
-                    is_over_allocated,
-                    over_allocated_qty,
-                    over_allocation_percent,
-                    allocation_warning,
-                    can_update_etd,
-                    can_cancel,
-                    max_cancellable_qty
+                    -- New over-allocation fields
+                    is_over_committed,
+                    over_committed_qty_standard,
+                    is_pending_over_allocated,
+                    pending_over_allocated_qty_standard,
+                    over_allocation_type
                 FROM outbound_oc_pending_delivery_view
                 WHERE product_id = :product_id
                 AND pending_selling_delivery_quantity > 0
                 ORDER BY 
-                    is_over_allocated DESC,
+                    CASE over_allocation_type 
+                        WHEN 'Over-Committed' THEN 1 
+                        WHEN 'Pending-Over-Allocated' THEN 2 
+                        ELSE 3 
+                    END,
                     etd ASC, 
                     outstanding_amount_usd DESC
             """
@@ -694,6 +796,7 @@ class AllocationDataService:
             logger.error(f"Error loading OCs for product {product_id}: {e}")
             return pd.DataFrame()
     
+
     # ==================== Allocation History ====================
     
     def get_allocation_history_with_details(_self, oc_detail_id: int) -> pd.DataFrame:
@@ -796,7 +899,11 @@ class AllocationDataService:
                         COALESCE(po.po_qty, 0) + 
                         COALESCE(wht.wht_qty, 0) as supply_qty,
                         MIN(ocpd.etd) as earliest_etd,
-                        MAX(CASE WHEN ocpd.is_over_allocated = 'Yes' THEN 1 ELSE 0 END) as has_over_allocation
+                        -- Updated to use new column names
+                        MAX(CASE 
+                            WHEN ocpd.is_over_committed = 'Yes' OR ocpd.is_pending_over_allocated = 'Yes' 
+                            THEN 1 ELSE 0 
+                        END) as has_over_allocation
                     FROM products p
                     INNER JOIN outbound_oc_pending_delivery_view ocpd ON p.id = ocpd.product_id
                     LEFT JOIN (
@@ -847,7 +954,7 @@ class AllocationDataService:
         except Exception as e:
             logger.error(f"Error loading dashboard metrics: {e}")
             return _self._get_empty_dashboard_metrics()
-    
+
     def _get_empty_dashboard_metrics(self) -> Dict[str, Any]:
         """Return empty dashboard metrics structure"""
         return {

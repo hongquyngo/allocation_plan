@@ -5,8 +5,10 @@ Product-centric view with dual UOM display and standard UOM allocation
 import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta
+from typing import List, Dict, Any, Optional
 import logging
 import time
+
 
 # Import utilities
 from utils.auth import AuthManager
@@ -109,11 +111,6 @@ def init_session_state():
 
 # Initialize session state
 init_session_state()
-
-# Debug modal states (remove in production)
-if config.get_app_setting('DEBUG_MODE', False):
-    with st.sidebar:
-        st.write("Modal States:", st.session_state.modals)
 
 # Constants
 ITEMS_PER_PAGE = config.get_app_setting('ITEMS_PER_PAGE', 50)
@@ -862,15 +859,35 @@ def show_product_demand_details(product_id):
     for idx, oc in ocs_df.iterrows():
         show_oc_row_dual_uom(oc)
 
+
 def show_oc_row_dual_uom(oc):
     """Display a single OC row with proper dual UOM handling"""
     # Check for over-allocation
-    is_over_allocated = oc.get('is_over_allocated') == 'Yes'
+    over_allocation_type = oc.get('over_allocation_type', 'Normal')
     
-    # Show warning if over-allocated
-    if is_over_allocated:
-        st.error(f"⚡ {oc.get('allocation_warning', 'Over-allocated')}")
+    # Show warning based on type
+    if over_allocation_type == 'Over-Committed':
+        over_qty = oc.get('over_committed_qty_standard', 0)
+        # Convert to selling UOM for display
+        if uom_converter.needs_conversion(oc.get('uom_conversion', '1')):
+            over_qty_selling = uom_converter.convert_quantity(
+                over_qty, 'standard', 'selling', oc.get('uom_conversion', '1')
+            )
+            st.error(f"⚡ Over-committed by {format_number(over_qty_selling)} {oc.get('selling_uom')} - Total allocation exceeds order quantity")
+        else:
+            st.error(f"⚡ Over-committed by {format_number(over_qty)} {oc.get('standard_uom')} - Total allocation exceeds order quantity")
     
+    elif over_allocation_type == 'Pending-Over-Allocated':
+        over_qty = oc.get('pending_over_allocated_qty_standard', 0)
+        if uom_converter.needs_conversion(oc.get('uom_conversion', '1')):
+            over_qty_selling = uom_converter.convert_quantity(
+                over_qty, 'standard', 'selling', oc.get('uom_conversion', '1')
+            )
+            st.warning(f"⚠️ Pending over-allocated by {format_number(over_qty_selling)} {oc.get('selling_uom')} - Undelivered allocation exceeds pending delivery")
+        else:
+            st.warning(f"⚠️ Pending over-allocated by {format_number(over_qty)} {oc.get('standard_uom')} - Undelivered allocation exceeds pending delivery")
+    
+    # Rest of the row display...
     cols = st.columns([2, 2, 1, 1.5, 1.5, 1])
     
     with cols[0]:
@@ -883,22 +900,62 @@ def show_oc_row_dual_uom(oc):
         show_etd_with_urgency(oc['etd'])
     
     with cols[3]:
-        # Show pending quantity with dual UOM
         show_pending_quantity_dual_uom(oc)
     
     with cols[4]:
-        # Show allocated quantity with dual UOM
-        show_allocated_quantity_dual_uom(oc, is_over_allocated)
+        show_allocated_quantity_dual_uom(oc, over_allocation_type != 'Normal')
     
     with cols[5]:
-        if st.button("Allocate", key=f"alloc_oc_{oc['ocd_id']}", use_container_width=True, type="primary"):
-            # Clear any other open modals
+        # Calculate if can allocate more
+        pending_qty_standard = oc.get('pending_standard_delivery_quantity', 0)
+        total_allocated_standard = oc.get('total_allocated_qty_standard', 0)
+        max_allowed_standard = pending_qty_standard * 1.1  # 110% limit
+        
+        # Check if already at or over 110% limit
+        can_allocate_more = total_allocated_standard < max_allowed_standard
+        
+        # Prepare help text
+        if not can_allocate_more:
+            remaining_allowed = max_allowed_standard - total_allocated_standard
+            help_text = f"Maximum allocation limit reached ({format_number(total_allocated_standard)} of {format_number(max_allowed_standard)} {oc.get('standard_uom')})"
+        else:
+            remaining_allowed = max_allowed_standard - total_allocated_standard
+            help_text = f"Can allocate up to {format_number(remaining_allowed)} {oc.get('standard_uom')} more"
+        
+        if st.button(
+            "Allocate", 
+            key=f"alloc_oc_{oc['ocd_id']}", 
+            use_container_width=True, 
+            type="primary" if can_allocate_more else "secondary",
+            disabled=not can_allocate_more,
+            help=help_text
+        ):
             reset_all_modals()
-            
-            # Open allocation modal
             st.session_state.selections['oc_for_allocation'] = oc.to_dict()
             st.session_state.modals['allocation'] = True
             st.rerun()
+
+def get_allocation_actions_availability(allocation_detail: Dict) -> Dict[str, bool]:
+    """Determine available actions for an allocation detail"""
+    # Calculate pending quantity
+    allocated_qty = allocation_detail.get('allocated_qty', 0)
+    cancelled_qty = allocation_detail.get('cancelled_qty', 0)
+    delivered_qty = allocation_detail.get('delivered_qty', 0)
+    
+    pending_qty = allocated_qty - cancelled_qty - delivered_qty
+    
+    return {
+        'can_update_etd': (
+            pending_qty > 0 and
+            allocation_detail.get('status') == 'ALLOCATED'
+        ),
+        'can_cancel': (
+            pending_qty > 0 and
+            allocation_detail.get('status') == 'ALLOCATED'
+        ),
+        'pending_qty': pending_qty,
+        'max_cancellable_qty': pending_qty
+    }
 
 def show_etd_with_urgency(etd):
     """Show ETD with urgency indicator"""
@@ -934,31 +991,45 @@ def show_pending_quantity_dual_uom(oc):
 
 def show_allocated_quantity_dual_uom(oc, is_over_allocated):
     """Show allocated quantity with dual UOM display"""
-    # Standard UOM (stored in DB)
-    allocated_qty_standard = oc.get('allocated_quantity_standard', oc.get('allocated_quantity', 0))
+    # Standard UOM (stored in DB) - Use net quantity after cancellations
+    allocated_qty_standard = oc.get('total_allocated_qty_standard', 0)
+    cancelled_qty_standard = oc.get('total_allocation_cancelled_qty', 0)
+    
+    # Calculate effective allocated (allocated - cancelled)
+    effective_allocated_standard = allocated_qty_standard - cancelled_qty_standard
+    
     standard_uom = oc.get('standard_uom', '')
-    
-    # Selling UOM (for display)
-    allocated_qty_selling = oc.get('allocated_quantity', 0)
     selling_uom = oc.get('selling_uom', '')
-    
     allocation_count = oc.get('allocation_count', 0)
     
-    if allocated_qty_standard > 0:
-        # Build button label with dual UOM
+    if effective_allocated_standard > 0:
+        # Build button label with dual UOM using EFFECTIVE quantity
         if uom_converter.needs_conversion(oc.get('uom_conversion', '1')):
-            button_label = f"{format_number(allocated_qty_standard)} {standard_uom}"
+            effective_allocated_selling = uom_converter.convert_quantity(
+                effective_allocated_standard,
+                'standard',
+                'selling',
+                oc.get('uom_conversion', '1')
+            )
+            button_label = f"{format_number(effective_allocated_standard)} {standard_uom}"
             if allocation_count > 1:
                 button_label += f" ({allocation_count})"
-            help_text = f"= {format_number(allocated_qty_selling)} {selling_uom}. Click to view allocation history"
+            help_text = f"= {format_number(effective_allocated_selling)} {selling_uom}. Click to view allocation history"
         else:
-            button_label = f"{format_number(allocated_qty_standard)} {standard_uom}"
+            button_label = f"{format_number(effective_allocated_standard)} {standard_uom}"
             if allocation_count > 1:
                 button_label += f" ({allocation_count})"
             help_text = f"Click to view {allocation_count} allocation(s)"
         
-        # Color coding for allocation status
-        button_type = "secondary"
+        # Add cancelled info to help text if any
+        if cancelled_qty_standard > 0:
+            help_text += f". Cancelled: {format_number(cancelled_qty_standard)} {standard_uom}"
+        
+        # Color coding based on over-allocation type
+        if oc.get('over_allocation_type') == 'Over-Committed':
+            button_type = "secondary"
+        else:
+            button_type = "secondary"
         
         if st.button(
             button_label, 
@@ -979,12 +1050,12 @@ def show_allocated_quantity_dual_uom(oc, is_over_allocated):
                 'standard_uom': oc.get('standard_uom', ''),
                 'pending_quantity': oc['pending_quantity'],
                 'pending_standard_delivery_quantity': oc.get('pending_standard_delivery_quantity', 0),
-                'is_over_allocated': is_over_allocated,
                 'allocation_warning': oc.get('allocation_warning', ''),
                 'uom_conversion': oc.get('uom_conversion', '1'),
-                'can_update_etd': oc.get('can_update_etd', 'No'),
-                'can_cancel': oc.get('can_cancel', 'No'),
-                'max_cancellable_qty': oc.get('max_cancellable_qty', 0)
+                'over_allocation_type': oc.get('over_allocation_type', 'Normal'),
+                # Add these for correct calculation in history modal
+                'total_allocated_qty_standard': allocated_qty_standard,
+                'total_allocation_cancelled_qty': cancelled_qty_standard
             }
             st.rerun()
     else:
@@ -1549,9 +1620,11 @@ def show_allocation_summary_metrics(oc_info):
             st.caption(f"= {format_number(selling_qty)} {selling_uom}")
     
     with metrics_cols[1]:
-        # Get total allocated from history
+        # QUAN TRỌNG: Tính total allocated từ history data thực tế
         history_df = data_service.get_allocation_history_with_details(st.session_state.selections['oc_for_history'])
+        
         if not history_df.empty:
+            # Tính tổng effective_qty (đã trừ cancelled)
             total_effective_standard = history_df['effective_qty'].sum()
             
             if uom_converter.needs_conversion(oc_info.get('uom_conversion', '1')):
@@ -1565,14 +1638,24 @@ def show_allocation_summary_metrics(oc_info):
                 st.caption(f"= {format_number(total_effective_selling)} {selling_uom}")
             else:
                 st.metric("Total Allocated", f"{format_number(total_effective_standard)} {standard_uom}")
+            
+            # Hiển thị tổng cancelled nếu có
+            total_cancelled = history_df['cancelled_qty'].sum()
+            if total_cancelled > 0:
+                st.caption(f"(Total cancelled: {format_number(total_cancelled)} {standard_uom})")
         else:
             st.metric("Total Allocated", f"0 {standard_uom}")
     
     with metrics_cols[2]:
         if not history_df.empty:
             pending_standard = oc_info.get('pending_standard_delivery_quantity', oc_info['pending_quantity'])
+            total_effective_standard = history_df['effective_qty'].sum()
             coverage = (total_effective_standard / pending_standard * 100) if pending_standard > 0 else 0
             st.metric("Coverage", format_percentage(coverage))
+            
+            # Show warning if over-allocated
+            if coverage > 100:
+                st.caption("⚡ Over-allocated")
         else:
             st.metric("Coverage", "0%")
 
@@ -1694,27 +1777,27 @@ def show_allocation_actions(alloc, oc_info):
     if alloc['status'] != 'ALLOCATED':
         return
     
-    action_cols = st.columns([1, 1, 2])
+    # Get availability for this specific allocation
+    actions_availability = get_allocation_actions_availability(alloc)
     
-    # Calculate pending quantity for this allocation
-    pending_qty = alloc['allocated_qty'] - alloc.get('cancelled_qty', 0) - alloc.get('delivered_qty', 0)
+    action_cols = st.columns([1, 1, 2])
     
     # Update ETD button
     with action_cols[0]:
-        show_update_etd_button(alloc, pending_qty)
+        show_update_etd_button(alloc, actions_availability)
     
     # Cancel button
     with action_cols[1]:
-        show_cancel_button(alloc, pending_qty)
+        show_cancel_button(alloc, actions_availability)
 
-def show_update_etd_button(alloc, pending_qty):
-    """Show update ETD button with validation"""
-    # Check if can update ETD based on pending quantity and mode
-    can_update = (
-        pending_qty > 0 and
-        alloc['allocation_mode'] == 'SOFT' and
-        validator.check_permission(st.session_state.user['role'], 'update')
-    )
+
+def show_update_etd_button(alloc, actions_availability):
+    """Show update ETD button with validation using centralized availability check"""
+    # Check permission
+    can_update_permission = validator.check_permission(st.session_state.user['role'], 'update')
+    
+    # Combined check: availability AND permission
+    can_update = actions_availability['can_update_etd'] and can_update_permission
     
     if can_update:
         if st.button("📅 Update ETD", key=f"update_etd_{alloc['allocation_detail_id']}"):
@@ -1728,29 +1811,37 @@ def show_update_etd_button(alloc, pending_qty):
             st.session_state.modals['history'] = False
             
             # Open update ETD modal
-            alloc_data = alloc.to_dict()
-            alloc_data['pending_allocated_qty'] = pending_qty
+            alloc_data = alloc.to_dict() if hasattr(alloc, 'to_dict') else dict(alloc)
+            alloc_data['pending_allocated_qty'] = actions_availability['pending_qty']
+            
             st.session_state.modals['update_etd'] = True
             st.session_state.selections['allocation_for_update'] = alloc_data
             st.rerun()
     else:
-        # Show disabled button with tooltip
-        if alloc['allocation_mode'] == 'HARD':
-            help_text = "Cannot update ETD for HARD allocation"
-        elif pending_qty <= 0:
+        # Show disabled button with appropriate tooltip
+        if not can_update_permission:
+            help_text = "No permission to update ETD"
+        elif actions_availability['pending_qty'] <= 0:
             help_text = "Cannot update ETD - all quantity has been delivered"
+        elif alloc.get('status') != 'ALLOCATED':
+            help_text = "Cannot update ETD - allocation status is not ALLOCATED"
         else:
-            help_text = "No permission to update"
-        st.button("📅 Update ETD", key=f"update_etd_{alloc['allocation_detail_id']}_disabled", 
-                 disabled=True, help=help_text)
+            help_text = "Cannot update ETD"
+            
+        st.button(
+            "📅 Update ETD", 
+            key=f"update_etd_{alloc['allocation_detail_id']}_disabled", 
+            disabled=True, 
+            help=help_text
+        )
 
-def show_cancel_button(alloc, pending_qty):
-    """Show cancel button with validation"""
-    # Check if can cancel based on pending quantity
-    can_cancel = (
-        pending_qty > 0 and
-        validator.check_permission(st.session_state.user['role'], 'cancel')
-    )
+def show_cancel_button(alloc, actions_availability):
+    """Show cancel button with validation using centralized availability check"""
+    # Check permission
+    can_cancel_permission = validator.check_permission(st.session_state.user['role'], 'cancel')
+    
+    # Combined check: availability AND permission
+    can_cancel = actions_availability['can_cancel'] and can_cancel_permission
     
     if can_cancel:
         if st.button("❌ Cancel", key=f"cancel_{alloc['allocation_detail_id']}"):
@@ -1764,19 +1855,30 @@ def show_cancel_button(alloc, pending_qty):
             st.session_state.modals['history'] = False
             
             # Open cancel modal
-            alloc_data = alloc.to_dict()
-            alloc_data['pending_allocated_qty'] = pending_qty
+            alloc_data = alloc.to_dict() if hasattr(alloc, 'to_dict') else dict(alloc)
+            alloc_data['pending_allocated_qty'] = actions_availability['pending_qty']
+            alloc_data['max_cancellable_qty'] = actions_availability['max_cancellable_qty']
+            
             st.session_state.modals['cancel'] = True
             st.session_state.selections['allocation_for_cancel'] = alloc_data
             st.rerun()
     else:
-        # Show disabled button with tooltip
-        if pending_qty <= 0:
+        # Show disabled button with appropriate tooltip
+        if not can_cancel_permission:
+            help_text = "No permission to cancel allocation"
+        elif actions_availability['pending_qty'] <= 0:
             help_text = "Cannot cancel - all quantity has been delivered"
+        elif alloc.get('status') != 'ALLOCATED':
+            help_text = "Cannot cancel - allocation status is not ALLOCATED"
         else:
-            help_text = "No permission to cancel"
-        st.button("❌ Cancel", key=f"cancel_{alloc['allocation_detail_id']}_disabled", 
-                 disabled=True, help=help_text)
+            help_text = "Cannot cancel allocation"
+            
+        st.button(
+            "❌ Cancel", 
+            key=f"cancel_{alloc['allocation_detail_id']}_disabled", 
+            disabled=True, 
+            help=help_text
+        )
 
 def show_cancellation_history_dual_uom(alloc, oc_info):
     """Show cancellation history with dual UOM"""
