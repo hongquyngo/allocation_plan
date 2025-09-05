@@ -603,7 +603,7 @@ class AllocationService:
         product_id = oc_info['product_id']
         
         # Existing OC-level validations...
-        effective_qty_standard = float(oc_info.get('standard_quantity', 0))
+        effective_qty_standard = float(oc_info.get('effective_standard_quantity', 0))
         pending_qty_standard = float(oc_info.get('pending_standard_delivery_quantity', 0))
         
         # Get existing allocations

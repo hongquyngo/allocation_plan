@@ -161,7 +161,7 @@ class AllocationValidator:
         
         # 6. Warning for over-allocation (not an error, just a warning)
         if total_quantity > 0 and len(errors) == 0:
-            effective_qty = float(oc_info.get('standard_quantity', 0))
+            effective_qty = float(oc_info.get('effective_standard_quantity', 0))
             current_effective_allocated = float(oc_info.get('total_effective_allocated_qty_standard', 0))
             new_total_effective = current_effective_allocated + total_quantity
             
