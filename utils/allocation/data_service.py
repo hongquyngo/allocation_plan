@@ -766,7 +766,7 @@ class AllocationDataService:
                     AND pending_quantity > 0
                 """,
                 "PENDING_PO": """
-                    SELECT pending_standard_arrival_quantity as available_qty, po_number, etd
+                    SELECT pending_standard_arrival_quantity as available_qty, po_number, etd, eta
                     FROM purchase_order_full_view
                     WHERE po_line_id = :source_id AND product_id = :product_id
                     AND pending_standard_arrival_quantity > 0
@@ -798,7 +798,8 @@ class AllocationDataService:
         except Exception as e:
             logger.error(f"Error checking supply availability: {e}")
             return {'available': False, 'available_qty': 0}
-    
+
+
     @st.cache_data(ttl=300)
     def get_all_supply_for_product(_self, product_id: int) -> pd.DataFrame:
         """Get all available supply sources for a product"""
@@ -815,6 +816,7 @@ class AllocationDataService:
                     expiry_date,
                     NULL as arrival_date,
                     NULL as etd,
+                    NULL as eta,
                     batch_number,
                     location,
                     warehouse_name,
@@ -839,6 +841,7 @@ class AllocationDataService:
                     NULL as expiry_date,
                     arrival_date,
                     NULL as etd,
+                    NULL as eta,
                     NULL as batch_number,
                     NULL as location,
                     NULL as warehouse_name,
@@ -863,6 +866,7 @@ class AllocationDataService:
                     NULL as expiry_date,
                     NULL as arrival_date,
                     etd,
+                    eta,
                     NULL as batch_number,
                     NULL as location,
                     NULL as warehouse_name,
@@ -887,6 +891,7 @@ class AllocationDataService:
                     expiry_date,
                     NULL as arrival_date,
                     transfer_date as etd,
+                    NULL as eta,
                     batch_number,
                     NULL as location,
                     NULL as warehouse_name,
@@ -916,7 +921,7 @@ class AllocationDataService:
         except Exception as e:
             logger.error(f"Error loading supply for product {product_id}: {e}")
             return pd.DataFrame()
-    
+
     # ==================== Supply Summary Methods ====================
     
     @st.cache_data(ttl=300)
@@ -982,6 +987,7 @@ class AllocationDataService:
             logger.error(f"Error loading CAN summary: {e}")
             return pd.DataFrame()
     
+
     @st.cache_data(ttl=300)
     def get_po_summary(_self, product_id: int) -> pd.DataFrame:
         """Get PO summary with buying UOM information"""
@@ -998,6 +1004,7 @@ class AllocationDataService:
                     buying_uom,
                     uom_conversion,
                     etd,
+                    eta,
                     vendor_name
                 FROM purchase_order_full_view
                 WHERE product_id = :product_id AND pending_standard_arrival_quantity > 0
@@ -1013,7 +1020,8 @@ class AllocationDataService:
         except Exception as e:
             logger.error(f"Error loading PO summary: {e}")
             return pd.DataFrame()
-    
+
+
     @st.cache_data(ttl=300)
     def get_wht_summary(_self, product_id: int) -> pd.DataFrame:
         """Get warehouse transfer summary for product view"""
@@ -1136,9 +1144,7 @@ class AllocationDataService:
                 'available': 0,
                 'coverage_ratio': 0
             }
-        
-
-    # Thêm method mới để get supply với committed info
+            
     @st.cache_data(ttl=300)
     def get_supply_with_availability(_self, product_id: int) -> pd.DataFrame:
         """Get all supply sources with availability info after considering commitments"""
@@ -1156,6 +1162,7 @@ class AllocationDataService:
                     expiry_date,
                     NULL as arrival_date,
                     NULL as etd,
+                    NULL as eta,
                     batch_number,
                     location,
                     warehouse_name,
@@ -1180,6 +1187,7 @@ class AllocationDataService:
                     NULL as expiry_date,
                     arrival_date,
                     NULL as etd,
+                    NULL as eta,
                     NULL as batch_number,
                     NULL as location,
                     NULL as warehouse_name,
@@ -1204,6 +1212,7 @@ class AllocationDataService:
                     NULL as expiry_date,
                     NULL as arrival_date,
                     etd,
+                    eta,
                     NULL as batch_number,
                     NULL as location,
                     NULL as warehouse_name,
@@ -1228,6 +1237,7 @@ class AllocationDataService:
                     expiry_date,
                     NULL as arrival_date,
                     transfer_date as etd,
+                    NULL as eta,
                     batch_number,
                     NULL as location,
                     NULL as warehouse_name,

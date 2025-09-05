@@ -1096,6 +1096,7 @@ def show_product_supply_details(product_id):
     with col4:
         show_supply_summary(product_id, 'wht', data_service.get_wht_summary)
 
+
 def show_supply_summary(product_id, supply_type, data_fetcher):
     """Generic supply summary display"""
     titles = {
@@ -1132,10 +1133,12 @@ def show_supply_summary(product_id, supply_type, data_fetcher):
                 
             elif supply_type == 'po':
                 qty_str = f"{format_number(item['pending_quantity'])} {item.get('standard_uom', '')}"
+                etd_str = format_date(item['etd'])
+                eta_str = format_date(item.get('eta')) if item.get('eta') else 'N/A'
                 st.metric(
                     item['po_number'],
                     qty_str,
-                    delta=f"ETD: {format_date(item['etd'])}"
+                    delta=f"ETD: {etd_str} | ETA: {eta_str}"
                 )
                 
             elif supply_type == 'wht':
@@ -1200,7 +1203,9 @@ def format_supply_info_with_real_time_availability(supply, source_type, oc, curr
     elif source_type == 'PENDING_CAN':
         info = f"{supply['arrival_note_number']} - Arr: {format_date(supply['arrival_date'])}"
     elif source_type == 'PENDING_PO':
-        info = f"{supply['po_number']} - ETD: {format_date(supply['etd'])}"
+        etd_str = format_date(supply['etd'])
+        eta_str = format_date(supply.get('eta')) if supply.get('eta') else 'N/A'
+        info = f"{supply['po_number']} - ETD: {etd_str} | ETA: {eta_str}"
     else:
         info = f"{supply['from_warehouse']} → {supply['to_warehouse']}"
     
@@ -1230,7 +1235,6 @@ def format_supply_info_with_real_time_availability(supply, source_type, oc, curr
         qty_str += f" (= {format_number(qty_selling)} {selling_uom})"
     
     return f"{info} - {qty_str}"
-
 
 @st.dialog("Create Allocation", width="large")
 def show_allocation_modal():
@@ -1555,6 +1559,30 @@ def show_allocation_modal():
     
     # Additional fields
     allocated_etd = st.date_input("Allocated ETD", value=oc['etd'])
+
+    # Validate allocated ETD against PO ETAs
+    if not use_soft and selected_supplies:
+        max_eta = None
+        po_with_max_eta = None
+        
+        for supply_item in selected_supplies:
+            if supply_item['source_type'] == 'PENDING_PO':
+                supply_info = supply_item['supply_info']
+                if supply_info.get('eta'):
+                    try:
+                        eta_date = pd.to_datetime(supply_info['eta']).date()
+                        if max_eta is None or eta_date > max_eta:
+                            max_eta = eta_date
+                            po_with_max_eta = supply_info.get('po_number', 'PO')
+                    except:
+                        pass
+        
+        if max_eta and allocated_etd < max_eta:
+            st.warning(
+                f"⚠️ Allocated ETD ({format_date(allocated_etd)}) is earlier than the ETA of {po_with_max_eta} ({format_date(max_eta)}). "
+                "The goods won't arrive until the ETA date. Consider adjusting the allocated ETD to be on or after the ETA."
+            )
+
     notes = st.text_area("Notes (optional)")
     
     # Action buttons
