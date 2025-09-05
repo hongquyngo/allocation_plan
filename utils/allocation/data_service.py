@@ -1110,8 +1110,8 @@ class AllocationDataService:
                 result = conn.execute(query, {'product_id': product_id}).fetchone()
                 
                 if result:
-                    total_supply = float(result['total_supply'] or 0)
-                    total_committed = float(result['total_committed'] or 0)
+                    total_supply = float(result[0] or 0)  # Index 0
+                    total_committed = float(result[1] or 0)  # Index 1
                     available = total_supply - total_committed
                     
                     return {
