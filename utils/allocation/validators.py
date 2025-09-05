@@ -156,7 +156,7 @@ class AllocationValidator:
                         errors.append(
                             f"For reference: {total_selling:.0f} {oc_info['selling_uom']} exceeds "
                             f"{max_selling:.0f} {oc_info['selling_uom']} "
-                            f"(110% of {effective_selling:.0f} {oc_info['selling_uom']})"
+                            f"(100% of {effective_selling:.0f} {oc_info['selling_uom']})"
                         )
         
         # 6. Warning for over-allocation (not an error, just a warning)

@@ -887,21 +887,38 @@ def show_allocation_action_button(oc):
     is_over_committed = oc.get('is_over_committed', 'No') == 'Yes'
     is_pending_over_allocated = oc.get('is_pending_over_allocated', 'No') == 'Yes'
     
-    can_allocate_more = not (is_over_committed or is_pending_over_allocated)
+    # Check supply availability for this product
+    product_id = oc.get('product_id')
+    supply_summary = data_service.get_product_supply_summary(product_id)
+    has_available_supply = supply_summary.get('available', 0) > 0
     
+    # Determine if can allocate more
+    can_allocate_more = (
+        not is_over_committed and 
+        not is_pending_over_allocated and 
+        has_available_supply and
+        pending_qty_standard > undelivered_allocated_qty
+    )
+    
+    # Set help text based on conditions
     if is_over_committed:
-        help_text = f"Cannot allocate more - Over-committed"
+        help_text = "Cannot allocate more - Over-committed"
+        button_type = "secondary"
     elif is_pending_over_allocated:
-        help_text = f"Cannot allocate more - Pending over-allocated"
+        help_text = "Cannot allocate more - Pending over-allocated"
+        button_type = "secondary"
+    elif not has_available_supply:
+        help_text = "No supply available for allocation"
+        button_type = "secondary"
     else:
         remaining_allowed = pending_qty_standard - undelivered_allocated_qty
         if remaining_allowed > 0:
             help_text = f"Can allocate up to {format_number(remaining_allowed)} {oc.get('standard_uom')} more"
+            button_type = "primary"
         else:
             help_text = "Fully allocated"
             can_allocate_more = False
-    
-    button_type = "primary" if can_allocate_more else "secondary"
+            button_type = "secondary"
     
     if st.button(
         "Allocate", 
@@ -1004,8 +1021,67 @@ def show_allocated_quantity_dual_uom(oc, is_over_allocated):
     else:
         st.text(f"0 {standard_uom}")
 
+
 def show_product_supply_details(product_id):
-    """Show supply sources for a product"""
+    """Show supply sources for a product with overview"""
+    # Get supply summary first
+    supply_summary = data_service.get_product_supply_summary(product_id)
+    
+    # Get product info to get correct UOM
+    products_df = data_service.get_products_with_demand_supply(
+        filters={'product_id': product_id},
+        page=1,
+        page_size=1
+    )
+    if not products_df.empty:
+        standard_uom = products_df.iloc[0]['standard_uom']
+    else:
+        standard_uom = 'pcs'
+    
+    # Show overview section
+    st.markdown("### 📊 Supply Overview")
+    overview_cols = st.columns(4)
+    
+    with overview_cols[0]:
+        st.metric(
+            "Total Supply",
+            f"{format_number(supply_summary['total_supply'])} {standard_uom}",
+            help="Total quantity available from all sources"
+        )
+    
+    with overview_cols[1]:
+        st.metric(
+            "Committed",
+            f"{format_number(supply_summary['total_committed'])} {standard_uom}",
+            help="Already allocated but not yet delivered"
+        )
+    
+    with overview_cols[2]:
+        availability_color = "🟢" if supply_summary['coverage_ratio'] > 50 else "🟡" if supply_summary['coverage_ratio'] > 20 else "🔴"
+        st.metric(
+            f"{availability_color} Available",
+            f"{format_number(supply_summary['available'])} {standard_uom}",
+            delta=f"{supply_summary['coverage_ratio']:.0f}% of total",
+            help="Quantity available for new allocations"
+        )
+    
+    with overview_cols[3]:
+        st.metric(
+            "Max SOFT Allocation",
+            f"{format_number(supply_summary['available'])} {standard_uom}",
+            help="Maximum quantity that can be allocated without specifying source"
+        )
+    
+    # Show warnings if needed
+    if supply_summary['available'] <= 0:
+        st.error("❌ No supply available for allocation. All supply has been committed to other orders.")
+    elif supply_summary['coverage_ratio'] < 20:
+        st.warning(f"⚠️ Low supply availability! Only {supply_summary['coverage_ratio']:.0f}% of total supply is uncommitted.")
+    
+    st.divider()
+    
+    # Show supply details by type
+    st.markdown("### 📦 Supply Details by Source")
     col1, col2, col3, col4 = st.columns(4)
     
     with col1:
@@ -1116,9 +1192,49 @@ def reset_all_modals():
     st.session_state.context['return_to_history'] = None
 
 # ==================== ALLOCATION MODAL ====================
+
+def format_supply_info_with_real_time_availability(supply, source_type, oc, current_total_selected):
+    """Format supply information with real-time availability considering current selections"""
+    if source_type == 'INVENTORY':
+        info = f"Batch {supply['batch_number']} - Exp: {format_date(supply['expiry_date'])}"
+    elif source_type == 'PENDING_CAN':
+        info = f"{supply['arrival_note_number']} - Arr: {format_date(supply['arrival_date'])}"
+    elif source_type == 'PENDING_PO':
+        info = f"{supply['po_number']} - ETD: {format_date(supply['etd'])}"
+    else:
+        info = f"{supply['from_warehouse']} → {supply['to_warehouse']}"
+    
+    # Get quantities
+    total_qty = supply.get('total_quantity', 0)
+    committed_qty = supply.get('committed_quantity', 0)
+    available_qty = supply.get('available_quantity', 0)
+    standard_uom = supply.get('uom', 'pcs')
+    
+    # Format quantity string with real-time context
+    if available_qty <= 0:
+        qty_str = f"Total: {format_number(total_qty)} | ❌ Fully committed"
+    elif committed_qty > 0:
+        qty_str = f"Total: {format_number(total_qty)} | Committed: {format_number(committed_qty)} | ✅ Available: {format_number(available_qty)} {standard_uom}"
+    else:
+        qty_str = f"✅ Available: {format_number(available_qty)} {standard_uom}"
+    
+    # Add selling UOM if different
+    if available_qty > 0 and uom_converter.needs_conversion(oc.get('uom_conversion', '1')):
+        qty_selling = uom_converter.convert_quantity(
+            available_qty,
+            'standard',
+            'selling',
+            oc.get('uom_conversion', '1')
+        )
+        selling_uom = oc.get('selling_uom', 'pcs')
+        qty_str += f" (= {format_number(qty_selling)} {selling_uom})"
+    
+    return f"{info} - {qty_str}"
+
+
 @st.dialog("Create Allocation", width="large")
 def show_allocation_modal():
-    """Allocation modal with dual UOM display"""
+    """Allocation modal with dual UOM display and supply validation"""
     oc = st.session_state.selections['oc_for_allocation']
     
     if not oc:
@@ -1153,12 +1269,59 @@ def show_allocation_modal():
     
     st.divider()
     
-    # Get available supply
-    supply_details = data_service.get_all_supply_for_product(oc['product_id'])
+    # Get supply summary first
+    standard_uom = oc.get('standard_uom', 'pcs')
+    supply_summary = data_service.get_product_supply_summary(oc['product_id'])
     
-    if supply_details.empty:
-        st.error("⏳ No available supply for this product")
-        if st.button("Close"):
+    # Show supply availability overview
+    st.markdown("**📊 Supply Overview:**")
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        st.metric(
+            "Total Supply",
+            f"{format_number(supply_summary['total_supply'])} {standard_uom}",
+            help="Total quantity available from all sources"
+        )
+    
+    with col2:
+        st.metric(
+            "Committed",
+            f"{format_number(supply_summary['total_committed'])} {standard_uom}",
+            help="Already allocated but not yet delivered"
+        )
+    
+    with col3:
+        availability_color = "🟢" if supply_summary['coverage_ratio'] > 50 else "🟡" if supply_summary['coverage_ratio'] > 20 else "🔴"
+        st.metric(
+            f"{availability_color} Available",
+            f"{format_number(supply_summary['available'])} {standard_uom}",
+            delta=f"{supply_summary['coverage_ratio']:.0f}% of total",
+            help="Quantity available for new allocations"
+        )
+    
+    with col4:
+        st.metric(
+            "Max SOFT Allocation",
+            f"{format_number(supply_summary['available'])} {standard_uom}",
+            help="Maximum quantity for SOFT allocation"
+        )
+    
+    # Show warnings if needed
+    if supply_summary['available'] <= 0:
+        st.error("❌ No supply available for allocation. All supply has been committed to other orders.")
+    elif supply_summary['coverage_ratio'] < 20:
+        st.warning(f"⚠️ Low supply availability! Only {supply_summary['coverage_ratio']:.0f}% of total supply is available.")
+    
+    st.divider()
+    
+    # Get supply details with availability
+    supply_details = data_service.get_supply_with_availability(oc['product_id'])
+    
+    if supply_details.empty and supply_summary['available'] <= 0:
+        st.error("⛔ No supply available for this product")
+        st.info("All existing supply has been committed. Please check with procurement team.")
+        if st.button("Close", use_container_width=True):
             st.session_state.modals['allocation'] = False
             st.session_state.selections['oc_for_allocation'] = None
             st.rerun()
@@ -1167,7 +1330,7 @@ def show_allocation_modal():
     st.info("ℹ️ **Allocation Rule**: All allocations are made in standard UOM to ensure whole container quantities")
     
     # Supply selection
-    st.markdown("**Available Supply:**")
+    st.markdown("**Supply Sources:**")
     
     selected_supplies = []
     total_selected_standard = 0
@@ -1190,20 +1353,49 @@ def show_allocation_modal():
                 col1, col2 = st.columns([3, 1])
                 
                 with col1:
-                    info = format_supply_info_dual_uom(supply, source_type, oc)
+                    # Format supply info with real-time availability
+                    info = format_supply_info_with_real_time_availability(
+                        supply, source_type, oc, total_selected_standard
+                    )
+                    
+                    # Check availability
+                    is_available = supply.get('available_quantity', 0) > 0
+                    
+                    # Check if selecting this would exceed total available
+                    would_exceed_supply = False
+                    if is_available:
+                        max_selectable = min(
+                            supply.get('available_quantity', 0),
+                            supply_summary['available'] - total_selected_standard
+                        )
+                        would_exceed_supply = max_selectable <= 0
+                    
+                    # Set appropriate help text
+                    if not is_available:
+                        help_text = "No quantity available - fully committed"
+                    elif would_exceed_supply:
+                        help_text = "⚠️ Cannot select - would exceed total available supply"
+                    else:
+                        help_text = None
                     
                     selected = st.checkbox(
                         info,
-                        key=f"supply_{supply['source_id']}_{source_type}"
+                        key=f"supply_{supply['source_id']}_{source_type}",
+                        disabled=(not is_available or would_exceed_supply),
+                        help=help_text
                     )
                 
                 with col2:
-                    if selected:
+                    if selected and is_available and not would_exceed_supply:
                         # Calculate remaining requirement
                         pending_standard = oc.get('pending_standard_delivery_quantity', oc['pending_quantity'])
-                        max_qty_standard = min(supply['available_quantity'], pending_standard - total_selected_standard)
-                        
-                        standard_uom = oc.get('standard_uom', 'pcs')
+                        available_qty = supply.get('available_quantity', 0)
+                        remaining_supply_cap = supply_summary['available'] - total_selected_standard
+                        max_qty_standard = min(
+                            available_qty, 
+                            pending_standard - total_selected_standard,
+                            remaining_supply_cap
+                        )
                         
                         # Show equivalent selling quantity
                         if uom_converter.needs_conversion(oc.get('uom_conversion', '1')):
@@ -1244,38 +1436,205 @@ def show_allocation_modal():
     
     if use_soft:
         pending_standard = oc.get('pending_standard_delivery_quantity', oc['pending_quantity'])
-        standard_uom = oc.get('standard_uom', 'pcs')
         
-        if uom_converter.needs_conversion(oc.get('uom_conversion', '1')):
-            pending_selling = oc.get('pending_quantity', pending_standard)
-            selling_uom = oc.get('selling_uom', 'pcs')
-            help_text = f"Max: {format_number(pending_standard)} {standard_uom} (= {format_number(pending_selling)} {selling_uom})"
-        else:
-            help_text = f"Max: {format_number(pending_standard)} {standard_uom}"
-        
-        st.caption(f"Allocate quantity in {standard_uom} (standard UOM)")
-        soft_qty_standard = st.number_input(
-            "Quantity",
-            min_value=0.0,
-            max_value=float(pending_standard),
-            value=0.0,
-            step=1.0,
-            help=help_text
+        # Check available supply for SOFT allocation
+        max_soft_qty = min(
+            pending_standard,
+            supply_summary.get('available', 0)
         )
         
-        if soft_qty_standard > 0:
-            selected_supplies = [{
-                'source_type': None,
-                'source_id': None,
-                'quantity': soft_qty_standard,
-                'supply_info': {'type': 'SOFT', 'description': 'No specific source'}
-            }]
-            total_selected_standard = soft_qty_standard
+        if max_soft_qty <= 0:
+            st.error("❌ Cannot create SOFT allocation - no supply available")
+        else:
+            if uom_converter.needs_conversion(oc.get('uom_conversion', '1')):
+                pending_selling = oc.get('pending_quantity', pending_standard)
+                selling_uom = oc.get('selling_uom', 'pcs')
+                max_soft_qty_selling = uom_converter.convert_quantity(
+                    max_soft_qty,
+                    'standard',
+                    'selling',
+                    oc.get('uom_conversion', '1')
+                )
+                help_text = f"Max: {format_number(max_soft_qty)} {standard_uom} (= {format_number(max_soft_qty_selling)} {selling_uom})"
+            else:
+                help_text = f"Max: {format_number(max_soft_qty)} {standard_uom}"
+            
+            # Show warning if supply is limited
+            if max_soft_qty < pending_standard:
+                st.warning(
+                    f"⚠️ Available supply ({format_number(supply_summary['available'])} {standard_uom}) "
+                    f"is less than pending quantity ({format_number(pending_standard)} {standard_uom})"
+                )
+            
+            st.caption(f"Allocate quantity in {standard_uom} (standard UOM)")
+            soft_qty_standard = st.number_input(
+                "Quantity",
+                min_value=0.0,
+                max_value=float(max_soft_qty),
+                value=0.0,
+                step=1.0,
+                help=help_text,
+                disabled=max_soft_qty <= 0
+            )
+            
+            if soft_qty_standard > 0:
+                selected_supplies = [{
+                    'source_type': None,
+                    'source_id': None,
+                    'quantity': soft_qty_standard,
+                    'supply_info': {'type': 'SOFT', 'description': 'No specific source'}
+                }]
+                total_selected_standard = soft_qty_standard
     
     st.divider()
     
-    # Summary
-    show_allocation_summary_dual_uom(oc, total_selected_standard, selected_supplies, use_soft)
+    # Summary section
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        if uom_converter.needs_conversion(oc.get('uom_conversion', '1')):
+            total_selected_selling = uom_converter.convert_quantity(
+                total_selected_standard,
+                'standard',
+                'selling',
+                oc.get('uom_conversion', '1')
+            )
+            selling_uom = oc.get('selling_uom', 'pcs')
+            
+            st.metric(
+                "Total Selected", 
+                f"{format_number(total_selected_standard)} {standard_uom}"
+            )
+            st.caption(f"= {format_number(total_selected_selling)} {selling_uom}")
+        else:
+            st.metric(
+                "Total Selected", 
+                f"{format_number(total_selected_standard)} {standard_uom}"
+            )
+    
+    with col2:
+        pending_standard = oc.get('pending_standard_delivery_quantity', oc['pending_quantity'])
+        coverage = (total_selected_standard / pending_standard * 100) if pending_standard > 0 else 0
+        st.metric("Coverage", format_percentage(coverage))
+    
+    # Supply availability check
+    if total_selected_standard > 0 and total_selected_standard > supply_summary.get('available', 0):
+        st.error(
+            f"❌ Total allocation ({format_number(total_selected_standard)} {standard_uom}) "
+            f"exceeds available supply ({format_number(supply_summary['available'])} {standard_uom})"
+        )
+    
+    # Over-allocation warning (OC level)
+    effective_qty_standard = oc.get('standard_quantity', pending_standard)
+    current_effective_allocated = oc.get('total_effective_allocated_qty_standard', 0)
+    new_total_effective = current_effective_allocated + total_selected_standard
+    
+    if new_total_effective > effective_qty_standard:
+        over_qty_standard = new_total_effective - effective_qty_standard
+        over_pct = (over_qty_standard / effective_qty_standard * 100) if effective_qty_standard > 0 else 0
+        max_allowed = effective_qty_standard  # 100% limit
+        
+        if new_total_effective > max_allowed:
+            if uom_converter.needs_conversion(oc.get('uom_conversion', '1')):
+                over_qty_selling = uom_converter.convert_quantity(
+                    over_qty_standard,
+                    'standard',
+                    'selling',
+                    oc.get('uom_conversion', '1')
+                )
+                st.error(
+                    f"⚡ Would exceed OC limit by {format_number(over_qty_standard)} {standard_uom} "
+                    f"(= {format_number(over_qty_selling)} {oc.get('selling_uom')}) - "
+                    f"{format_percentage(over_pct)} over! Maximum allowed is 100% of OC quantity."
+                )
+            else:
+                st.error(
+                    f"⚡ Would exceed OC limit by {format_number(over_qty_standard)} {standard_uom} "
+                    f"({format_percentage(over_pct)} over)! Maximum allowed is 100% of OC quantity."
+                )
+    
+    # Additional fields
+    allocated_etd = st.date_input("Allocated ETD", value=oc['etd'])
+    notes = st.text_area("Notes (optional)")
+    
+    # Action buttons
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        # Determine if save button should be enabled
+        can_save = (
+            total_selected_standard > 0 and 
+            total_selected_standard <= supply_summary.get('available', float('inf'))
+        )
+        
+        # Create helpful button text
+        if not can_save and total_selected_standard == 0:
+            button_help = "Please select at least one supply source or enter SOFT allocation quantity"
+        elif not can_save and total_selected_standard > supply_summary.get('available', 0):
+            button_help = f"Total selection exceeds available supply by {format_number(total_selected_standard - supply_summary['available'])} {standard_uom}"
+        else:
+            button_help = "Click to save allocation"
+        
+        if st.button(
+            "💾 Save Allocation", 
+            type="primary", 
+            use_container_width=True, 
+            disabled=not can_save,
+            help=button_help
+        ):
+            # Validate allocation
+            errors = validator.validate_create_allocation(
+                selected_supplies,
+                oc,
+                'SOFT' if use_soft else 'HARD',
+                st.session_state.user['role']
+            )
+            
+            if errors:
+                for error in errors:
+                    st.error(f"❌ {error}")
+            else:
+                # Save allocation
+                result = allocation_service.create_allocation(
+                    oc_detail_id=oc['ocd_id'],
+                    allocations=selected_supplies,
+                    mode='SOFT' if use_soft else 'HARD',
+                    etd=allocated_etd,
+                    notes=notes,
+                    user_id=st.session_state.user['id']
+                )
+                
+                if result['success']:
+                    success_msg = f"✅ Allocation Successful\nAllocated: {format_number(total_selected_standard)} {standard_uom}"
+                    
+                    if uom_converter.needs_conversion(oc.get('uom_conversion', '1')):
+                        total_selected_selling = uom_converter.convert_quantity(
+                            total_selected_standard,
+                            'standard',
+                            'selling',
+                            oc.get('uom_conversion', '1')
+                        )
+                        selling_uom = oc.get('selling_uom', 'pcs')
+                        success_msg += f" (= {format_number(total_selected_selling)} {selling_uom})"
+                    
+                    success_msg += f" to {oc['oc_number']}\nAllocation Number: {result['allocation_number']}"
+                    
+                    st.success(success_msg)
+                    st.balloons()
+                    
+                    time.sleep(2)
+                    st.session_state.modals['allocation'] = False
+                    st.session_state.selections['oc_for_allocation'] = None
+                    st.cache_data.clear()
+                    st.rerun()
+                else:
+                    st.error(f"❌ {result['error']}")
+    
+    with col2:
+        if st.button("Cancel", use_container_width=True):
+            st.session_state.modals['allocation'] = False
+            st.session_state.selections['oc_for_allocation'] = None
+            st.rerun()
 
 def show_dual_uom_metric(label: str, 
                          standard_qty: float, standard_uom: str,
@@ -1289,7 +1648,7 @@ def show_dual_uom_metric(label: str,
         st.metric(label, f"{format_number(standard_qty)} {standard_uom}")
 
 def format_supply_info_dual_uom(supply, source_type, oc):
-    """Format supply information with dual UOM display"""
+    """Format supply information with actual availability display"""
     if source_type == 'INVENTORY':
         info = f"Batch {supply['batch_number']} - Exp: {format_date(supply['expiry_date'])}"
     elif source_type == 'PENDING_CAN':
@@ -1299,16 +1658,22 @@ def format_supply_info_dual_uom(supply, source_type, oc):
     else:
         info = f"{supply['from_warehouse']} → {supply['to_warehouse']}"
     
-    # Format quantity
-    qty_standard = supply['available_quantity']
+    # Get quantities
+    total_qty = supply.get('total_quantity', supply.get('available_quantity', 0))
+    committed_qty = supply.get('committed_quantity', 0)
+    available_qty = supply.get('available_quantity', total_qty - committed_qty)
     standard_uom = supply.get('uom', 'pcs')
     
-    qty_str = f"{format_number(qty_standard)} {standard_uom}"
+    # Format quantity with committed info
+    if committed_qty > 0:
+        qty_str = f"Total: {format_number(total_qty)} | Committed: {format_number(committed_qty)} | Available: {format_number(available_qty)} {standard_uom}"
+    else:
+        qty_str = f"Available: {format_number(available_qty)} {standard_uom}"
     
     # Add selling UOM if different
-    if uom_converter.needs_conversion(oc.get('uom_conversion', '1')):
+    if available_qty > 0 and uom_converter.needs_conversion(oc.get('uom_conversion', '1')):
         qty_selling = uom_converter.convert_quantity(
-            qty_standard,
+            available_qty,
             'standard',
             'selling',
             oc.get('uom_conversion', '1')
@@ -1316,7 +1681,7 @@ def format_supply_info_dual_uom(supply, source_type, oc):
         selling_uom = oc.get('selling_uom', 'pcs')
         qty_str += f" (= {format_number(qty_selling)} {selling_uom})"
     
-    return f"{info} - Available: {qty_str}"
+    return f"{info} - {qty_str}"
 
 def show_allocation_summary_dual_uom(oc, total_selected_standard, selected_supplies, use_soft):
     """Show allocation summary with dual UOM display"""
@@ -1367,12 +1732,12 @@ def show_allocation_summary_dual_uom(oc, total_selected_standard, selected_suppl
                 st.error(
                     f"⚡ Over-allocating by {format_number(over_qty_standard)} {oc.get('standard_uom')} "
                     f"(= {format_number(over_qty_selling)} {oc.get('selling_uom')}) - "
-                    f"{format_percentage(over_pct)}! Maximum allowed is 110%."
+                    f"{format_percentage(over_pct)}! Maximum allowed is 100%."
                 )
             else:
                 st.error(
                     f"⚡ Over-allocating by {format_number(over_qty_standard)} {oc.get('standard_uom')} "
-                    f"({format_percentage(over_pct)})! Maximum allowed is 110%."
+                    f"({format_percentage(over_pct)})! Maximum allowed is 100%."
                 )
     
     # Additional fields

@@ -31,7 +31,7 @@ class OverAllocationError(AllocationError):
         self.uom = uom
         super().__init__(
             f"Cannot allocate {requested:.0f} {uom}. "
-            f"Maximum allowed is {maximum:.0f} {uom} (110% of pending quantity). "
+            f"Maximum allowed is {maximum:.0f} {uom} (100% of pending quantity). "
             f"Please reduce the allocation amount or contact a manager for approval."
         )
 
@@ -63,7 +63,7 @@ class AllocationService:
         self.uom_converter = UOMConverter()
         
         # Configuration
-        self.MAX_OVER_ALLOCATION_PERCENT = config.get_app_setting('MAX_OVER_ALLOCATION_PERCENT', 110)
+        self.MAX_OVER_ALLOCATION_PERCENT = config.get_app_setting('MAX_OVER_ALLOCATION_PERCENT', 100)
         self.MIN_ALLOCATION_QTY = config.get_app_setting('MIN_ALLOCATION_QTY', 0.01)
         
         # Thread local storage for nested transactions
@@ -586,10 +586,10 @@ class AllocationService:
         })
         
         return result.lastrowid, alloc['quantity']
-    
+        
     def _validate_allocation_request(self, conn, oc_info: Dict, 
                                     allocations: List[Dict], mode: str) -> Dict[str, Any]:
-        """Validate allocation request with correct over-allocation checks"""
+        """Validate allocation request with supply checks for both SOFT and HARD"""
         if not allocations:
             return {'valid': False, 'error': 'Please select at least one supply source'}
         
@@ -598,21 +598,21 @@ class AllocationService:
         if total_to_allocate <= 0:
             return {'valid': False, 'error': 'Total allocation quantity must be greater than zero'}
         
-        # Lấy EFFECTIVE quantity (sau OC cancellation) để check over-commitment
-        effective_qty_standard = float(oc_info.get('standard_quantity', 0))  # Đã là effective trong view
-        # Lấy PENDING quantity để check pending over-allocation
-        pending_qty_standard = float(oc_info.get('pending_standard_delivery_quantity', 0))
+        # Get UOM info
         standard_uom = oc_info.get('standard_uom', '')
+        product_id = oc_info['product_id']
+        
+        # Existing OC-level validations...
+        effective_qty_standard = float(oc_info.get('standard_quantity', 0))
+        pending_qty_standard = float(oc_info.get('pending_standard_delivery_quantity', 0))
         
         # Get existing allocations
         allocation_summary = self._get_enhanced_allocation_summary(conn, oc_info['ocd_id'])
         
         # Check 1: Total commitment vs effective OC quantity
-        # SỬ DỤNG total_effective_allocated thay vì total_allocated
         new_total_effective_allocated = allocation_summary['total_effective_allocated'] + total_to_allocate
         
         if new_total_effective_allocated > effective_qty_standard:
-            # Check if within 110% limit of EFFECTIVE quantity
             max_allowed = effective_qty_standard * (self.MAX_OVER_ALLOCATION_PERCENT / 100)
             
             if new_total_effective_allocated > max_allowed:
@@ -624,11 +624,11 @@ class AllocationService:
                         f"Current effective allocation: {allocation_summary['total_effective_allocated']:.0f} {standard_uom}, "
                         f"Attempting to add: {total_to_allocate:.0f} {standard_uom}, "
                         f"Total would be: {new_total_effective_allocated:.0f} {standard_uom} "
-                        f"(limit is {max_allowed:.0f} {standard_uom} = 110%)"
+                        f"(limit is {max_allowed:.0f} {standard_uom} = 100%)"
                     )
                 }
         
-        # Check 2: Pending over-allocation (logic này giữ nguyên)
+        # Check 2: Pending over-allocation
         new_undelivered = allocation_summary['undelivered_allocated'] + total_to_allocate
         
         if new_undelivered > pending_qty_standard:
@@ -643,9 +643,25 @@ class AllocationService:
                     f"Adding: {total_to_allocate:.0f} {standard_uom} would exceed pending requirement"
                 )
             }
-        
-        # For HARD allocation, check supply availability
-        if mode == 'HARD':
+
+        # NEW: Check 3 - Supply capability check for BOTH SOFT and HARD
+        if mode == 'SOFT':
+            # For SOFT allocation, use consistent supply summary
+            supply_summary = self._get_product_supply_summary(conn, product_id)
+            
+            if total_to_allocate > supply_summary['available']:
+                return {
+                    'valid': False,
+                    'error': (
+                        f"Insufficient supply for SOFT allocation. "
+                        f"Available: {supply_summary['available']:.0f} {standard_uom}, "
+                        f"Requested: {total_to_allocate:.0f} {standard_uom}\n"
+                        f"(Total supply: {supply_summary['total_supply']:.0f}, "
+                        f"Already committed: {supply_summary['total_committed']:.0f})"
+                    )
+                }
+        else:  # HARD allocation
+            # Existing HARD allocation checks
             for idx, alloc in enumerate(allocations):
                 if not alloc.get('source_type') or not alloc.get('source_id'):
                     return {
@@ -657,7 +673,7 @@ class AllocationService:
                 available = self.data_service.check_supply_availability(
                     alloc['source_type'],
                     alloc['source_id'],
-                    oc_info['product_id']
+                    product_id
                 )
                 
                 if not available['available']:
@@ -666,7 +682,7 @@ class AllocationService:
                         'error': f"Item {idx + 1}: Supply source no longer available"
                     }
                 
-                # Get current commitments for this supply
+                # Get current commitments for this specific supply
                 committed = self._get_supply_commitment(conn, alloc['source_type'], alloc['source_id'])
                 remaining = available['available_qty'] - committed
                 
@@ -934,6 +950,88 @@ class AllocationService:
         
         return float(result['committed_qty'] or 0)
     
+    # Thêm sau method _get_supply_commitment (khoảng dòng 775)
+    def _get_source_specific_availability(self, conn, source_type: str, source_id: int, product_id: int) -> Dict[str, float]:
+        """Get availability info for a specific supply source"""
+        # Get total available from source
+        available_check = self.data_service.check_supply_availability(source_type, source_id, product_id)
+        total_qty = available_check.get('available_qty', 0)
+        
+        # Get committed from this specific source
+        committed_qty = self._get_supply_commitment(conn, source_type, source_id)
+        
+        # Calculate actual available
+        actual_available = total_qty - committed_qty
+        
+        return {
+            'total': total_qty,
+            'committed': committed_qty,
+            'available': actual_available
+        }
+
+    def _get_total_product_supply(self, conn, product_id: int) -> float:
+        """Get total available supply for a product across all sources"""
+        query = text("""
+            SELECT 
+                COALESCE(SUM(total_supply), 0) as total_supply
+            FROM (
+                -- Inventory
+                SELECT SUM(remaining_quantity) as total_supply
+                FROM inventory_detailed_view
+                WHERE product_id = :product_id AND remaining_quantity > 0
+                
+                UNION ALL
+                
+                -- Pending CAN
+                SELECT SUM(pending_quantity) as total_supply
+                FROM can_pending_stockin_view
+                WHERE product_id = :product_id AND pending_quantity > 0
+                
+                UNION ALL
+                
+                -- Pending PO
+                SELECT SUM(pending_standard_arrival_quantity) as total_supply
+                FROM purchase_order_full_view
+                WHERE product_id = :product_id AND pending_standard_arrival_quantity > 0
+                
+                UNION ALL
+                
+                -- Pending WHT
+                SELECT SUM(transfer_quantity) as total_supply
+                FROM warehouse_transfer_details_view
+                WHERE product_id = :product_id AND is_completed = 0 AND transfer_quantity > 0
+            ) supply_union
+        """)
+        
+        result = conn.execute(query, {'product_id': product_id}).fetchone()
+        return float(result['total_supply'] or 0)
+
+    def _get_total_product_commitment(self, conn, product_id: int) -> float:
+        """Get total undelivered allocated quantity for a product across all sources"""
+        query = text("""
+            SELECT COALESCE(SUM(
+                ad.allocated_qty - COALESCE(ac.cancelled_qty, 0) - COALESCE(adl.delivered_qty, 0)
+            ), 0) as total_committed
+            FROM allocation_details ad
+            LEFT JOIN (
+                SELECT allocation_detail_id, 
+                    SUM(CASE WHEN status = 'ACTIVE' THEN cancelled_qty ELSE 0 END) as cancelled_qty
+                FROM allocation_cancellations
+                GROUP BY allocation_detail_id
+            ) ac ON ad.id = ac.allocation_detail_id
+            LEFT JOIN (
+                SELECT allocation_detail_id, SUM(delivered_qty) as delivered_qty
+                FROM allocation_delivery_links  
+                GROUP BY allocation_detail_id
+            ) adl ON ad.id = adl.allocation_detail_id
+            WHERE ad.product_id = :product_id
+            AND ad.status = 'ALLOCATED'
+            AND (ad.allocated_qty - COALESCE(ac.cancelled_qty, 0) - COALESCE(adl.delivered_qty, 0)) > 0
+        """)
+        
+        result = conn.execute(query, {'product_id': product_id}).fetchone()
+        return float(result['total_committed'] or 0)
+
     # ==================== ADDITIONAL HELPER METHODS ====================
     
     def get_allocation_delivery_summary(self, allocation_detail_id: int) -> Dict[str, Any]:
@@ -978,4 +1076,17 @@ class AllocationService:
                 'has_deliveries': False,
                 'delivery_count': 0,
                 'total_delivered': 0.0
+            }
+        
+    def _get_product_supply_summary(self, conn, product_id: int) -> Dict[str, float]:
+            """Get supply summary - single source of truth for availability calculations"""
+            total_supply = self._get_total_product_supply(conn, product_id)
+            total_committed = self._get_total_product_commitment(conn, product_id)
+            available = total_supply - total_committed
+            
+            return {
+                'total_supply': total_supply,
+                'total_committed': total_committed,
+                'available': available,
+                'coverage_ratio': (available / total_supply * 100) if total_supply > 0 else 0
             }
