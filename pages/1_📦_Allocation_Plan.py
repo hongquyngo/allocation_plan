@@ -369,6 +369,180 @@ def get_filter_label(key, value):
     }
     return filter_labels.get(key, f"{key}: {value}")
 
+# ==================== TOOLTIP HELPERS ====================
+def create_oc_tooltip(oc) -> str:
+    """Create unified tooltip for OC details - handles both dict and Series"""
+    tooltip_lines = []
+    
+    # Helper function to safely get value from dict or Series
+    def get_value(key, default=0):
+        try:
+            if isinstance(oc, pd.Series):
+                if key in oc.index:
+                    value = oc[key]
+                    # Handle numpy types and ensure scalar
+                    if hasattr(value, 'item'):
+                        return value.item()
+                    elif isinstance(value, pd.Series):
+                        return value.iloc[0] if len(value) > 0 else default
+                    return value
+                else:
+                    return default
+            else:
+                return oc.get(key, default)
+        except Exception:
+            return default
+    
+    # Get values with proper defaults
+    original_qty = float(get_value('original_standard_quantity', 0))
+    oc_cancelled = float(get_value('total_oc_cancelled_qty', 0))
+    effective_oc = float(get_value('standard_quantity', 0))
+    delivered = float(get_value('total_delivered_standard_quantity', 0))
+    pending = float(get_value('pending_standard_delivery_quantity', 0))
+    standard_uom = str(get_value('standard_uom', ''))
+    
+    # OC Details section
+    tooltip_lines.append("📄 OC Details")
+    tooltip_lines.append("")
+    tooltip_lines.append(f"• Original Quantity: {format_number(original_qty)} {standard_uom}")
+    if oc_cancelled > 0:
+        tooltip_lines.append(f"• OC Cancelled: {format_number(oc_cancelled)} {standard_uom}")
+    tooltip_lines.append(f"• Effective OC: {format_number(effective_oc)} {standard_uom}")
+    if delivered > 0:
+        tooltip_lines.append(f"• Delivered: {format_number(delivered)} {standard_uom}")
+    tooltip_lines.append(f"• Pending Delivery: {format_number(pending)} {standard_uom}")
+    
+    # Allocation Summary section
+    if get_value('allocation_count', 0) > 0:
+        tooltip_lines.append("")
+        tooltip_lines.append("📦 Allocation Summary")
+        tooltip_lines.append("")
+        
+        total_allocated = float(get_value('total_allocated_qty_standard', 0))
+        alloc_cancelled = float(get_value('total_allocation_cancelled_qty_standard', 0))
+        effective_allocated = float(get_value('total_effective_allocated_qty_standard', 0))
+        alloc_delivered = float(get_value('total_allocation_delivered_qty_standard', 0))
+        undelivered = float(get_value('undelivered_allocated_qty_standard', 0))
+        
+        tooltip_lines.append(f"• Total Allocated: {format_number(total_allocated)} {standard_uom}")
+        if alloc_cancelled > 0:
+            tooltip_lines.append(f"• Allocation Cancelled: {format_number(alloc_cancelled)} {standard_uom}")
+        tooltip_lines.append(f"• Effective Allocated: {format_number(effective_allocated)} {standard_uom}")
+        if alloc_delivered > 0:
+            tooltip_lines.append(f"• Delivered from Allocation: {format_number(alloc_delivered)} {standard_uom}")
+        tooltip_lines.append(f"• Undelivered: {format_number(undelivered)} {standard_uom}")
+    
+    # Status
+    status = get_oc_allocation_status(oc)
+    tooltip_lines.append("")
+    tooltip_lines.append(f"Status: {status}")
+    
+    # Join with explicit line breaks
+    return "\n".join(tooltip_lines)
+
+def create_allocation_tooltip(alloc, oc_info) -> str:
+    """Create unified tooltip for allocation details - handles both dict and Series"""
+    tooltip_lines = []
+    
+    # Helper function to safely get value
+    def get_value(obj, key, default=0):
+        try:
+            if isinstance(obj, pd.Series):
+                if key in obj.index:
+                    value = obj[key]
+                    # Handle numpy types and ensure scalar
+                    if hasattr(value, 'item'):
+                        return value.item()
+                    elif isinstance(value, pd.Series):
+                        return value.iloc[0] if len(value) > 0 else default
+                    return value
+                else:
+                    return default
+            else:
+                return obj.get(key, default)
+        except Exception:
+            return default
+    
+    # Get values
+    allocated_qty = float(get_value(alloc, 'allocated_qty', 0))
+    cancelled_qty = float(get_value(alloc, 'cancelled_qty', 0))
+    effective_qty = float(get_value(alloc, 'effective_qty', 0))
+    delivered_qty = float(get_value(alloc, 'delivered_qty', 0))
+    pending_qty = float(get_value(alloc, 'pending_qty', 0))
+    standard_uom = str(get_value(oc_info, 'standard_uom', ''))
+    
+    # Header
+    tooltip_lines.append(f"📦 Allocation {get_value(alloc, 'allocation_number', '')}")
+    tooltip_lines.append("")
+    
+    # Quantities with bullet points
+    tooltip_lines.append(f"• Allocated Quantity: {format_number(allocated_qty)} {standard_uom}")
+    if cancelled_qty > 0:
+        tooltip_lines.append(f"• Cancelled: {format_number(cancelled_qty)} {standard_uom}")
+    tooltip_lines.append(f"• Effective: {format_number(effective_qty)} {standard_uom}")
+    if delivered_qty > 0:
+        tooltip_lines.append(f"• Delivered: {format_number(delivered_qty)} {standard_uom}")
+    tooltip_lines.append(f"• Pending: {format_number(pending_qty)} {standard_uom}")
+    
+    # Metadata
+    tooltip_lines.append("")
+    tooltip_lines.append(f"• Created: {format_date(get_value(alloc, 'allocation_date'))}")
+    tooltip_lines.append(f"• By: {str(get_value(alloc, 'created_by', ''))}")
+    tooltip_lines.append(f"• Mode: {format_allocation_mode(get_value(alloc, 'allocation_mode', ''))}")
+    
+    if get_value(alloc, 'supply_source_type'):
+        tooltip_lines.append(f"• Source: {str(get_value(alloc, 'supply_source_type', ''))}")
+    
+    return "\n".join(tooltip_lines)
+
+def get_oc_allocation_status(oc) -> str:
+    """Get allocation status for OC - handles both dict and Series"""
+    # Helper function
+    def get_value(key, default=0):
+        try:
+            if isinstance(oc, pd.Series):
+                if key in oc.index:
+                    value = oc[key]
+                    # Handle numpy types and ensure scalar
+                    if hasattr(value, 'item'):
+                        return value.item()
+                    elif isinstance(value, pd.Series):
+                        return value.iloc[0] if len(value) > 0 else default
+                    return value
+                else:
+                    return default
+            else:
+                return oc.get(key, default)
+        except Exception:
+            return default
+    
+    pending = float(get_value('pending_standard_delivery_quantity', 0))
+    undelivered = float(get_value('undelivered_allocated_qty_standard', 0))
+    over_type = get_value('over_allocation_type', 'Normal')
+    
+    if over_type == 'Over-Committed':
+        return "❌ Over-Committed"
+    elif over_type == 'Pending-Over-Allocated':
+        return "⚠️ Pending Over-Allocated"
+    elif undelivered == 0:
+        return "⏳ Not Allocated"
+    elif undelivered >= pending:
+        return "✅ Fully Allocated"
+    else:
+        coverage = (undelivered / pending * 100) if pending > 0 else 0
+        return f"🟡 Partially Allocated ({coverage:.0f}%)"
+
+def get_allocation_status_color(pending: float, undelivered: float) -> str:
+    """Get color indicator based on allocation status"""
+    if undelivered > pending:
+        return "🔴"  # Over-allocated
+    elif undelivered == pending:
+        return "🟢"  # Fully allocated
+    elif undelivered > 0:
+        return "🟡"  # Partially allocated
+    else:
+        return "⚪"  # Not allocated
+
 # ==================== PRODUCT LIST ====================
 def show_product_list():
     """Display product list with demand/supply summary"""
@@ -542,14 +716,14 @@ def show_product_details(product_row):
             show_product_supply_details(product_row['product_id'])
 
 def show_product_demand_details(product_id):
-    """Show OCs for a product"""
+    """Show OCs for a product with improved headers"""
     ocs_df = data_service.get_ocs_by_product(product_id)
     
     if ocs_df.empty:
         st.info("No pending OCs for this product")
         return
     
-    # Add headers
+    # Updated headers
     header_cols = st.columns([2, 2, 1, 1.5, 1.5, 1])
     with header_cols[0]:
         st.markdown("**OC Number**")
@@ -558,9 +732,9 @@ def show_product_demand_details(product_id):
     with header_cols[2]:
         st.markdown("**ETD**")
     with header_cols[3]:
-        st.markdown("**Pending Qty**")
+        st.markdown("**Pending Delivery**")
     with header_cols[4]:
-        st.markdown("**Total Allocated**")
+        st.markdown("**Undelivered Alloc**")
     with header_cols[5]:
         st.markdown("**Action**")
     
@@ -569,15 +743,13 @@ def show_product_demand_details(product_id):
         show_oc_row_dual_uom(oc)
 
 def show_oc_row_dual_uom(oc):
-    """Display a single OC row with dual UOM handling"""
-    # Check for over-allocation
+    """Display a single OC row with improved Pending/Undelivered display"""
+    # Check for over-allocation warnings first
     over_allocation_type = oc.get('over_allocation_type', 'Normal')
     
-    # Show warning với context rõ ràng hơn
     if over_allocation_type == 'Over-Committed':
         over_qty = oc.get('over_committed_qty_standard', 0)
-        effective_qty = oc.get('standard_quantity', 0)  # Effective quantity after OC cancellation
-        # Lấy phân bổ hiệu lực
+        effective_qty = oc.get('standard_quantity', 0)
         total_allocated = oc.get('total_allocated_qty_standard', 0)
         cancelled_allocated = oc.get('total_allocation_cancelled_qty_standard', 0)
         effective_allocated = total_allocated - cancelled_allocated
@@ -593,13 +765,13 @@ def show_oc_row_dual_uom(oc):
                 effective_allocated, 'standard', 'selling', oc.get('uom_conversion', '1')
             )
             st.error(
-                f"⚡ Over-committed by {format_number(over_qty_selling)} {oc.get('selling_uom')} - "
+                f"❌ Over-committed by {format_number(over_qty_selling)} {oc.get('selling_uom')} - "
                 f"Effective allocation ({format_number(effective_allocated_selling)} {oc.get('selling_uom')}) "
                 f"exceeds OC effective quantity ({format_number(effective_qty_selling)} {oc.get('selling_uom')})"
             )
         else:
             st.error(
-                f"⚡ Over-committed by {format_number(over_qty)} {oc.get('standard_uom')} - "
+                f"❌ Over-committed by {format_number(over_qty)} {oc.get('standard_uom')} - "
                 f"Effective allocation ({format_number(effective_allocated)} {oc.get('standard_uom')}) "
                 f"exceeds OC effective quantity ({format_number(effective_qty)} {oc.get('standard_uom')})"
             )
@@ -626,53 +798,123 @@ def show_oc_row_dual_uom(oc):
     with cols[2]:
         show_etd_with_urgency(oc['etd'])
     
-    with cols[3]:
-        show_pending_quantity_dual_uom(oc)
+    with cols[3]:  # Pending Delivery
+        show_pending_delivery_with_tooltip(oc)
     
-    with cols[4]:
-        show_allocated_quantity_dual_uom(oc, over_allocation_type != 'Normal')
+    with cols[4]:  # Undelivered Allocated
+        show_undelivered_allocated_with_tooltip(oc)
     
-    with cols[5]:
-        # Updated logic based on validation với effective allocation
-        pending_qty_standard = oc.get('pending_standard_delivery_quantity', 0)
-        total_effective_allocated = oc.get('total_effective_allocated_qty_standard', 0)
-        undelivered_allocated_qty = oc.get('undelivered_allocated_qty_standard', 0)
-        
-        # Check both over-allocation scenarios from the view
-        is_over_committed = oc.get('is_over_committed', 'No') == 'Yes'
-        is_pending_over_allocated = oc.get('is_pending_over_allocated', 'No') == 'Yes'
-        
-        # Determine if can allocate more
-        can_allocate_more = not (is_over_committed or is_pending_over_allocated)
-        
-        # Generate appropriate help text
-        if is_over_committed:
-            help_text = f"Cannot allocate more - Effective allocation ({format_number(total_effective_allocated)} {oc.get('standard_uom')}) exceeds order quantity"
-        elif is_pending_over_allocated:
-            help_text = f"Cannot allocate more - Undelivered allocation ({format_number(undelivered_allocated_qty)} {oc.get('standard_uom')}) exceeds pending delivery quantity ({format_number(pending_qty_standard)} {oc.get('standard_uom')})"
-        else:
-            # Can still allocate
-            remaining_allowed = pending_qty_standard - undelivered_allocated_qty
-            if remaining_allowed > 0:
-                help_text = f"Can allocate up to {format_number(remaining_allowed)} {oc.get('standard_uom')} more"
-            else:
-                help_text = "Fully allocated"
-                can_allocate_more = False
-        
-        button_type = "primary" if can_allocate_more else "secondary"
-        
+    with cols[5]:  # Action button
+        show_allocation_action_button(oc)
+
+def show_pending_delivery_with_tooltip(oc):
+    """Show pending delivery quantity with tooltip"""
+    pending_std = float(oc.get('pending_standard_delivery_quantity', 0))
+    standard_uom = oc.get('standard_uom', '')
+    
+    # Create tooltip
+    tooltip = create_oc_tooltip(oc)
+    
+    # Main display
+    st.markdown(
+        f"**{format_number(pending_std)} {standard_uom}**",
+        help=tooltip
+    )
+    
+    # Show selling UOM if different
+    if uom_converter.needs_conversion(oc.get('uom_conversion', '1')):
+        pending_selling = float(oc.get('pending_quantity', pending_std))
+        selling_uom = oc.get('selling_uom', '')
+        st.caption(f"= {format_number(pending_selling)} {selling_uom}")
+
+def show_undelivered_allocated_with_tooltip(oc):
+    """Show undelivered allocated quantity with color coding"""
+    undelivered_std = float(oc.get('undelivered_allocated_qty_standard', 0))
+    pending_std = float(oc.get('pending_standard_delivery_quantity', 0))
+    standard_uom = oc.get('standard_uom', '')
+    
+    # Get color indicator
+    color = get_allocation_status_color(pending_std, undelivered_std)
+    
+    # Create clickable metric if there are allocations
+    if oc.get('allocation_count', 0) > 0:
         if st.button(
-            "Allocate", 
-            key=f"alloc_oc_{oc['ocd_id']}", 
-            use_container_width=True, 
-            type=button_type,
-            disabled=not can_allocate_more,
-            help=help_text
+            f"{color} {format_number(undelivered_std)} {standard_uom}",
+            key=f"view_alloc_{oc['ocd_id']}",
+            help="Click to view allocation history",
+            use_container_width=True,
+            type="secondary"
         ):
             reset_all_modals()
-            st.session_state.selections['oc_for_allocation'] = oc.to_dict()
-            st.session_state.modals['allocation'] = True
+            st.session_state.modals['history'] = True
+            st.session_state.selections['oc_for_history'] = oc['ocd_id']
+            st.session_state.selections['oc_info'] = {
+                'oc_number': oc['oc_number'],
+                'customer': oc['customer'],
+                'product_name': oc['product_name'],
+                'selling_uom': oc.get('selling_uom', ''),
+                'standard_uom': oc.get('standard_uom', ''),
+                'pending_quantity': oc['pending_quantity'],
+                'pending_standard_delivery_quantity': oc.get('pending_standard_delivery_quantity', 0),
+                'allocation_warning': oc.get('allocation_warning', ''),
+                'uom_conversion': oc.get('uom_conversion', '1'),
+                'over_allocation_type': oc.get('over_allocation_type', 'Normal'),
+                'total_allocated_qty_standard': oc.get('total_allocated_qty_standard', 0),
+                'total_allocation_cancelled_qty': oc.get('total_allocation_cancelled_qty_standard', 0)
+            }
             st.rerun()
+        
+        # Show allocation count if multiple
+        if oc.get('allocation_count', 0) > 1:
+            st.caption(f"({oc['allocation_count']} allocations)")
+    else:
+        # Not allocated
+        st.markdown(f"{color} {format_number(undelivered_std)} {standard_uom}")
+    
+    # Show selling UOM if different
+    if uom_converter.needs_conversion(oc.get('uom_conversion', '1')):
+        undelivered_selling = uom_converter.convert_quantity(
+            undelivered_std, 'standard', 'selling', oc.get('uom_conversion', '1')
+        )
+        selling_uom = oc.get('selling_uom', '')
+        st.caption(f"= {format_number(undelivered_selling)} {selling_uom}")
+
+def show_allocation_action_button(oc):
+    """Show allocation action button with proper validation"""
+    pending_qty_standard = oc.get('pending_standard_delivery_quantity', 0)
+    undelivered_allocated_qty = oc.get('undelivered_allocated_qty_standard', 0)
+    
+    is_over_committed = oc.get('is_over_committed', 'No') == 'Yes'
+    is_pending_over_allocated = oc.get('is_pending_over_allocated', 'No') == 'Yes'
+    
+    can_allocate_more = not (is_over_committed or is_pending_over_allocated)
+    
+    if is_over_committed:
+        help_text = f"Cannot allocate more - Over-committed"
+    elif is_pending_over_allocated:
+        help_text = f"Cannot allocate more - Pending over-allocated"
+    else:
+        remaining_allowed = pending_qty_standard - undelivered_allocated_qty
+        if remaining_allowed > 0:
+            help_text = f"Can allocate up to {format_number(remaining_allowed)} {oc.get('standard_uom')} more"
+        else:
+            help_text = "Fully allocated"
+            can_allocate_more = False
+    
+    button_type = "primary" if can_allocate_more else "secondary"
+    
+    if st.button(
+        "Allocate", 
+        key=f"alloc_oc_{oc['ocd_id']}", 
+        use_container_width=True, 
+        type=button_type,
+        disabled=not can_allocate_more,
+        help=help_text
+    ):
+        reset_all_modals()
+        st.session_state.selections['oc_for_allocation'] = oc.to_dict()
+        st.session_state.modals['allocation'] = True
+        st.rerun()
 
 def show_etd_with_urgency(etd):
     """Show ETD with urgency indicator"""
@@ -1326,10 +1568,10 @@ def show_allocation_summary_metrics(oc_info):
             st.metric("Coverage", "0%")
 
 def show_allocation_history_item_dual_uom(alloc, oc_info):
-    """Show single allocation history item with delivery data"""
+    """Show single allocation history item with tooltip"""
     with st.container():
-        # Allocation header
-        show_allocation_header(alloc)
+        # Allocation header with tooltip
+        show_allocation_header_with_tooltip(alloc, oc_info)
         
         # Allocation quantities
         show_allocation_quantities_dual_uom(alloc, oc_info)
@@ -1345,12 +1587,33 @@ def show_allocation_history_item_dual_uom(alloc, oc_info):
             show_cancellation_history_dual_uom(alloc, oc_info)
         
         # Show delivery details if any
-        # Fix: Handle None values properly
         delivery_count = alloc.get('delivery_count')
         if delivery_count is not None and delivery_count > 0:
             show_delivery_details(alloc)
         
         st.divider()
+
+def show_allocation_header_with_tooltip(alloc, oc_info):
+    """Show allocation header with tooltip"""
+    status_color = {
+        'ALLOCATED': '🟢',
+        'DRAFT': '🟡',
+        'CANCELLED': '🔴'
+    }.get(alloc['status'], '⚪')
+    
+    # Create tooltip
+    tooltip = create_allocation_tooltip(alloc, oc_info)
+    
+    col1, col2, col3 = st.columns([2, 1, 1])
+    with col1:
+        st.markdown(
+            f"{status_color} **{alloc['allocation_number']}**",
+            help=tooltip
+        )
+    with col2:
+        st.caption(f"Mode: {format_allocation_mode(alloc['allocation_mode'])}")
+    with col3:
+        st.caption(f"Status: {alloc['status']}")
 
 def show_allocation_header(alloc):
     """Show allocation header"""

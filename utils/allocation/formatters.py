@@ -144,3 +144,22 @@ def format_reason_category(category: str) -> str:
     
     return category_map.get(category, category)
 
+def format_allocation_status(status: str) -> str:
+    """
+    Format allocation status with icon
+    
+    Args:
+        status: Status string
+        
+    Returns:
+        Formatted status string
+    """
+    status_map = {
+        'Not Allocated': '⏳ Not Allocated',
+        'Partially Allocated': '🟡 Partially Allocated', 
+        'Fully Allocated': '✅ Fully Allocated',
+        'Over-Committed': '❌ Over-Committed',
+        'Pending Over-Allocated': '⚠️ Pending Over-Allocated'
+    }
+    
+    return status_map.get(status, status)

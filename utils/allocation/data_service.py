@@ -490,7 +490,12 @@ class AllocationDataService:
                     COALESCE(alloc_delivery.total_delivered_qty_standard, 0) as actual_delivered_qty_standard,
                     -- Add effective quantities for proper validation
                     ocpd.standard_quantity as effective_standard_quantity,
-                    ocpd.selling_quantity as effective_selling_quantity
+                    ocpd.selling_quantity as effective_selling_quantity,
+                    -- ADD ORIGINAL QUANTITY
+                    ocpd.original_standard_quantity,
+                    ocpd.original_selling_quantity,
+                    -- Add OC-level cancellation info
+                    COALESCE(oc_cancel.total_cancelled_quantity, 0) as total_oc_cancelled_qty
                 FROM outbound_oc_pending_delivery_view ocpd
                 LEFT JOIN (
                     SELECT 
@@ -501,6 +506,16 @@ class AllocationDataService:
                     WHERE ad.demand_type = 'OC' AND ad.status = 'ALLOCATED'
                     GROUP BY ad.demand_reference_id
                 ) alloc_delivery ON ocpd.ocd_id = alloc_delivery.ocd_id
+                -- ADD OC CANCELLATION JOIN
+                LEFT JOIN (
+                    SELECT 
+                        occd.order_confirmation_detail_id,
+                        SUM(occd.cancelled_quantity) as total_cancelled_quantity
+                    FROM order_confirmation_cancellation_detail occd
+                    JOIN order_confirmation_cancellation occ ON occd.order_confirmation_cancellation_id = occ.id
+                    WHERE occd.delete_flag = 0 AND occ.delete_flag = 0 AND occ.status = 'APPROVED'
+                    GROUP BY occd.order_confirmation_detail_id
+                ) oc_cancel ON ocpd.ocd_id = oc_cancel.order_confirmation_detail_id
                 WHERE ocpd.product_id = :product_id
                 AND ocpd.pending_selling_delivery_quantity > 0
                 ORDER BY 
@@ -520,7 +535,6 @@ class AllocationDataService:
         except Exception as e:
             logger.error(f"Error loading OCs for product {product_id}: {e}")
             return pd.DataFrame()
-
 
     # ==================== Allocation History ====================
     
