@@ -948,7 +948,7 @@ class AllocationService:
             'source_id': source_id
         }).fetchone()
         
-        return float(result['committed_qty'] or 0)
+        return float(result[0] or 0) if result else 0.0
     
     # Thêm sau method _get_supply_commitment (khoảng dòng 775)
     def _get_source_specific_availability(self, conn, source_type: str, source_id: int, product_id: int) -> Dict[str, float]:
@@ -1004,7 +1004,7 @@ class AllocationService:
         """)
         
         result = conn.execute(query, {'product_id': product_id}).fetchone()
-        return float(result['total_supply'] or 0)
+        return float(result[0] or 0) if result else 0.0
 
     def _get_total_product_commitment(self, conn, product_id: int) -> float:
         """Get total undelivered allocated quantity for a product across all sources"""
@@ -1030,7 +1030,7 @@ class AllocationService:
         """)
         
         result = conn.execute(query, {'product_id': product_id}).fetchone()
-        return float(result['total_committed'] or 0)
+        return float(result[0] or 0) if result else 0.0
 
     # ==================== ADDITIONAL HELPER METHODS ====================
     
