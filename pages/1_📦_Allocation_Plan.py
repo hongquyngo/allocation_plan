@@ -568,22 +568,41 @@ def show_product_demand_details(product_id):
     for idx, oc in ocs_df.iterrows():
         show_oc_row_dual_uom(oc)
 
-
 def show_oc_row_dual_uom(oc):
     """Display a single OC row with dual UOM handling"""
     # Check for over-allocation
     over_allocation_type = oc.get('over_allocation_type', 'Normal')
     
-    # Show warning
+    # Show warning với context rõ ràng hơn
     if over_allocation_type == 'Over-Committed':
         over_qty = oc.get('over_committed_qty_standard', 0)
+        effective_qty = oc.get('standard_quantity', 0)  # Effective quantity after OC cancellation
+        # Lấy phân bổ hiệu lực
+        total_allocated = oc.get('total_allocated_qty_standard', 0)
+        cancelled_allocated = oc.get('total_allocation_cancelled_qty_standard', 0)
+        effective_allocated = total_allocated - cancelled_allocated
+        
         if uom_converter.needs_conversion(oc.get('uom_conversion', '1')):
             over_qty_selling = uom_converter.convert_quantity(
                 over_qty, 'standard', 'selling', oc.get('uom_conversion', '1')
             )
-            st.error(f"⚡ Over-committed by {format_number(over_qty_selling)} {oc.get('selling_uom')} - Total allocation exceeds order quantity")
+            effective_qty_selling = uom_converter.convert_quantity(
+                effective_qty, 'standard', 'selling', oc.get('uom_conversion', '1')
+            )
+            effective_allocated_selling = uom_converter.convert_quantity(
+                effective_allocated, 'standard', 'selling', oc.get('uom_conversion', '1')
+            )
+            st.error(
+                f"⚡ Over-committed by {format_number(over_qty_selling)} {oc.get('selling_uom')} - "
+                f"Effective allocation ({format_number(effective_allocated_selling)} {oc.get('selling_uom')}) "
+                f"exceeds OC effective quantity ({format_number(effective_qty_selling)} {oc.get('selling_uom')})"
+            )
         else:
-            st.error(f"⚡ Over-committed by {format_number(over_qty)} {oc.get('standard_uom')} - Total allocation exceeds order quantity")
+            st.error(
+                f"⚡ Over-committed by {format_number(over_qty)} {oc.get('standard_uom')} - "
+                f"Effective allocation ({format_number(effective_allocated)} {oc.get('standard_uom')}) "
+                f"exceeds OC effective quantity ({format_number(effective_qty)} {oc.get('standard_uom')})"
+            )
     
     elif over_allocation_type == 'Pending-Over-Allocated':
         over_qty = oc.get('pending_over_allocated_qty_standard', 0)
@@ -614,9 +633,9 @@ def show_oc_row_dual_uom(oc):
         show_allocated_quantity_dual_uom(oc, over_allocation_type != 'Normal')
     
     with cols[5]:
-        # Updated logic based on validation
+        # Updated logic based on validation với effective allocation
         pending_qty_standard = oc.get('pending_standard_delivery_quantity', 0)
-        total_allocated_standard = oc.get('total_allocated_qty_standard', 0)
+        total_effective_allocated = oc.get('total_effective_allocated_qty_standard', 0)
         undelivered_allocated_qty = oc.get('undelivered_allocated_qty_standard', 0)
         
         # Check both over-allocation scenarios from the view
@@ -628,7 +647,7 @@ def show_oc_row_dual_uom(oc):
         
         # Generate appropriate help text
         if is_over_committed:
-            help_text = f"Cannot allocate more - Total commitment ({format_number(total_allocated_standard)} {oc.get('standard_uom')}) exceeds order quantity ({format_number(pending_qty_standard)} {oc.get('standard_uom')})"
+            help_text = f"Cannot allocate more - Effective allocation ({format_number(total_effective_allocated)} {oc.get('standard_uom')}) exceeds order quantity"
         elif is_pending_over_allocated:
             help_text = f"Cannot allocate more - Undelivered allocation ({format_number(undelivered_allocated_qty)} {oc.get('standard_uom')}) exceeds pending delivery quantity ({format_number(pending_qty_standard)} {oc.get('standard_uom')})"
         else:
@@ -1266,6 +1285,10 @@ def show_allocation_summary_metrics(oc_info):
             # Calculate total effective (allocated - cancelled)
             total_effective_standard = history_df['effective_qty'].sum()
             
+            # Hiển thị cả tổng allocated và effective
+            total_allocated_standard = history_df['allocated_qty'].sum()
+            total_cancelled_standard = history_df['cancelled_qty'].sum()
+            
             if uom_converter.needs_conversion(oc_info.get('uom_conversion', '1')):
                 total_effective_selling = uom_converter.convert_quantity(
                     total_effective_standard,
@@ -1273,27 +1296,32 @@ def show_allocation_summary_metrics(oc_info):
                     'selling',
                     oc_info.get('uom_conversion', '1')
                 )
-                st.metric("Total Allocated", f"{format_number(total_effective_standard)} {standard_uom}")
+                st.metric("Effective Allocated", f"{format_number(total_effective_standard)} {standard_uom}")
                 st.caption(f"= {format_number(total_effective_selling)} {selling_uom}")
             else:
-                st.metric("Total Allocated", f"{format_number(total_effective_standard)} {standard_uom}")
+                st.metric("Effective Allocated", f"{format_number(total_effective_standard)} {standard_uom}")
             
-            # Show total cancelled if any
-            total_cancelled = history_df['cancelled_qty'].sum()
-            if total_cancelled > 0:
-                st.caption(f"(Total cancelled: {format_number(total_cancelled)} {standard_uom})")
+            # Show total allocated và cancelled if any
+            if total_cancelled_standard > 0:
+                st.caption(f"(Total: {format_number(total_allocated_standard)}, Cancelled: {format_number(total_cancelled_standard)} {standard_uom})")
         else:
-            st.metric("Total Allocated", f"0 {standard_uom}")
+            st.metric("Effective Allocated", f"0 {standard_uom}")
     
     with metrics_cols[2]:
         if not history_df.empty:
-            pending_standard = oc_info.get('pending_standard_delivery_quantity', oc_info.get('pending_quantity', oc_info.get('pending_selling_delivery_quantity', 0)))
+            # Coverage dựa trên effective allocation
+            pending_standard = oc_info.get('pending_standard_delivery_quantity', 0)
+            effective_standard = oc_info.get('standard_quantity', 0)  # OC effective quantity
             total_effective_standard = history_df['effective_qty'].sum()
-            coverage = (total_effective_standard / pending_standard * 100) if pending_standard > 0 else 0
+            
+            # Tính coverage dựa trên OC effective quantity
+            coverage = (total_effective_standard / effective_standard * 100) if effective_standard > 0 else 0
             st.metric("Coverage", format_percentage(coverage))
             
             if coverage > 100:
-                st.caption("⚡ Over-allocated")
+                st.caption("⚡ Over-committed")
+            elif coverage > 95:
+                st.caption("✅ Fully covered")
         else:
             st.metric("Coverage", "0%")
 

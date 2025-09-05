@@ -46,12 +46,12 @@ class AllocationValidator:
     # ==================== Create Allocation Validation ====================
     
     def validate_create_allocation(self, 
-                                 allocations: List[Dict],
-                                 oc_info: Dict,
-                                 mode: str,
-                                 user_role: str = 'viewer') -> List[str]:
+                                allocations: List[Dict],
+                                oc_info: Dict,
+                                mode: str,
+                                user_role: str = 'viewer') -> List[str]:
         """
-        Validate allocation creation request with proper UOM context
+        Validate allocation creation request with correct UOM context
         
         Returns:
             List of error messages (empty if valid)
@@ -99,18 +99,38 @@ class AllocationValidator:
                     errors.append(f"Item {idx + 1}: Duplicate allocation from same source")
                 source_keys.add(source_key)
         
-        # 5. Check over-allocation with UOM context
-        if total_quantity > 0 and oc_info.get('pending_standard_delivery_quantity'):
-            pending_qty = float(oc_info['pending_standard_delivery_quantity'])
-            standard_uom = oc_info.get('standard_uom', '')
-            max_allowed = pending_qty * (self.MAX_OVER_ALLOCATION_PERCENT / 100)
+        # 5. Check over-allocation với logic ĐÚNG
+        if total_quantity > 0:
+            # Sử dụng effective quantity từ view (đã trừ OC cancellation)
+            effective_qty = float(oc_info.get('standard_quantity', 0))
             
-            if total_quantity > max_allowed:
-                # KEY FIX: Include UOM in error message
+            # Lấy phân bổ hiệu lực hiện tại
+            current_effective_allocated = float(oc_info.get('total_effective_allocated_qty_standard', 0))
+            
+            standard_uom = oc_info.get('standard_uom', '')
+            
+            # Tính tổng phân bổ hiệu lực mới
+            new_total_effective = current_effective_allocated + total_quantity
+            
+            # Giới hạn cho phép
+            max_allowed = effective_qty * (self.MAX_OVER_ALLOCATION_PERCENT / 100)
+            
+            if new_total_effective > max_allowed:
                 errors.append(
-                    f"Total allocation ({total_quantity:.0f} {standard_uom}) exceeds maximum allowed "
-                    f"({max_allowed:.0f} {standard_uom} = {self.MAX_OVER_ALLOCATION_PERCENT}% of {pending_qty:.0f} {standard_uom})"
+                    f"Total allocation would be {new_total_effective:.0f} {standard_uom} "
+                    f"(current effective: {current_effective_allocated:.0f} + new: {total_quantity:.0f}). "
+                    f"Maximum allowed is {max_allowed:.0f} {standard_uom} "
+                    f"({self.MAX_OVER_ALLOCATION_PERCENT}% of effective OC quantity {effective_qty:.0f} {standard_uom})"
                 )
+                
+                # Add context về pending quantity
+                pending_qty = float(oc_info.get('pending_standard_delivery_quantity', 0))
+                if pending_qty < effective_qty:
+                    delivered_qty = effective_qty - pending_qty
+                    errors.append(
+                        f"Note: {delivered_qty:.0f} {standard_uom} already delivered, "
+                        f"only {pending_qty:.0f} {standard_uom} pending delivery"
+                    )
                 
                 # Add helpful context if selling UOM is different
                 if oc_info.get('selling_uom') and oc_info.get('selling_uom') != standard_uom:
@@ -120,7 +140,7 @@ class AllocationValidator:
                     if converter.needs_conversion(oc_info.get('uom_conversion', '1')):
                         # Convert to selling UOM for user reference
                         total_selling = converter.convert_quantity(
-                            total_quantity,
+                            new_total_effective,
                             'standard',
                             'selling',
                             oc_info.get('uom_conversion', '1')
@@ -131,28 +151,32 @@ class AllocationValidator:
                             'selling',
                             oc_info.get('uom_conversion', '1')
                         )
-                        pending_selling = oc_info.get('pending_quantity', pending_qty)
+                        effective_selling = oc_info.get('selling_quantity', effective_qty)
                         
                         errors.append(
                             f"For reference: {total_selling:.0f} {oc_info['selling_uom']} exceeds "
                             f"{max_selling:.0f} {oc_info['selling_uom']} "
-                            f"(110% of {pending_selling:.0f} {oc_info['selling_uom']})"
+                            f"(110% of {effective_selling:.0f} {oc_info['selling_uom']})"
                         )
         
         # 6. Warning for over-allocation (not an error, just a warning)
-        if total_quantity > 0 and oc_info.get('pending_standard_delivery_quantity'):
-            pending_qty = float(oc_info['pending_standard_delivery_quantity'])
+        if total_quantity > 0 and len(errors) == 0:
+            effective_qty = float(oc_info.get('standard_quantity', 0))
+            current_effective_allocated = float(oc_info.get('total_effective_allocated_qty_standard', 0))
+            new_total_effective = current_effective_allocated + total_quantity
+            
             standard_uom = oc_info.get('standard_uom', '')
             
-            if total_quantity > pending_qty and total_quantity <= max_allowed:
-                over_qty = total_quantity - pending_qty
-                over_pct = (over_qty / pending_qty * 100)
+            if effective_qty > 0 and new_total_effective > effective_qty:
+                over_qty = new_total_effective - effective_qty
+                over_pct = (over_qty / effective_qty * 100)
                 logger.warning(
-                    f"Over-allocating by {over_qty:.0f} {standard_uom} ({over_pct:.1f}%)"
+                    f"Over-allocating by {over_qty:.0f} {standard_uom} ({over_pct:.1f}%) "
+                    f"vs effective OC quantity"
                 )
         
         return errors
-    
+
     # ==================== Update Allocation Validation ====================
         
     def validate_update_etd(self,

@@ -589,7 +589,7 @@ class AllocationService:
     
     def _validate_allocation_request(self, conn, oc_info: Dict, 
                                     allocations: List[Dict], mode: str) -> Dict[str, Any]:
-        """Validate allocation request with over-allocation checks"""
+        """Validate allocation request with correct over-allocation checks"""
         if not allocations:
             return {'valid': False, 'error': 'Please select at least one supply source'}
         
@@ -598,32 +598,51 @@ class AllocationService:
         if total_to_allocate <= 0:
             return {'valid': False, 'error': 'Total allocation quantity must be greater than zero'}
         
-        # Get quantities in standard UOM
+        # Lấy EFFECTIVE quantity (sau OC cancellation) để check over-commitment
+        effective_qty_standard = float(oc_info.get('standard_quantity', 0))  # Đã là effective trong view
+        # Lấy PENDING quantity để check pending over-allocation
         pending_qty_standard = float(oc_info.get('pending_standard_delivery_quantity', 0))
         standard_uom = oc_info.get('standard_uom', '')
         
         # Get existing allocations
         allocation_summary = self._get_enhanced_allocation_summary(conn, oc_info['ocd_id'])
         
-        # Check total commitment
-        new_total_allocated = allocation_summary['total_allocated'] + total_to_allocate
+        # Check 1: Total commitment vs effective OC quantity
+        # SỬ DỤNG total_effective_allocated thay vì total_allocated
+        new_total_effective_allocated = allocation_summary['total_effective_allocated'] + total_to_allocate
         
-        if new_total_allocated > pending_qty_standard:
-            # Check if within 110% limit
-            max_allowed = pending_qty_standard * (self.MAX_OVER_ALLOCATION_PERCENT / 100)
+        if new_total_effective_allocated > effective_qty_standard:
+            # Check if within 110% limit of EFFECTIVE quantity
+            max_allowed = effective_qty_standard * (self.MAX_OVER_ALLOCATION_PERCENT / 100)
             
-            if new_total_allocated > max_allowed:
+            if new_total_effective_allocated > max_allowed:
                 return {
                     'valid': False,
                     'error': (
                         f"Over-commitment exceeds limit. "
-                        f"OC quantity: {pending_qty_standard:.0f} {standard_uom}, "
-                        f"Already allocated: {allocation_summary['total_allocated']:.0f} {standard_uom}, "
+                        f"OC effective quantity: {effective_qty_standard:.0f} {standard_uom}, "
+                        f"Current effective allocation: {allocation_summary['total_effective_allocated']:.0f} {standard_uom}, "
                         f"Attempting to add: {total_to_allocate:.0f} {standard_uom}, "
-                        f"Total would be: {new_total_allocated:.0f} {standard_uom} "
+                        f"Total would be: {new_total_effective_allocated:.0f} {standard_uom} "
                         f"(limit is {max_allowed:.0f} {standard_uom} = 110%)"
                     )
                 }
+        
+        # Check 2: Pending over-allocation (logic này giữ nguyên)
+        new_undelivered = allocation_summary['undelivered_allocated'] + total_to_allocate
+        
+        if new_undelivered > pending_qty_standard:
+            delivered_qty = oc_info.get('total_delivered_standard_quantity', 0)
+            return {
+                'valid': False,
+                'error': (
+                    f"Would create pending over-allocation. "
+                    f"Pending delivery required: {pending_qty_standard:.0f} {standard_uom}, "
+                    f"Already delivered: {delivered_qty:.0f} {standard_uom}, "
+                    f"Current undelivered allocation: {allocation_summary['undelivered_allocated']:.0f} {standard_uom}, "
+                    f"Adding: {total_to_allocate:.0f} {standard_uom} would exceed pending requirement"
+                )
+            }
         
         # For HARD allocation, check supply availability
         if mode == 'HARD':
@@ -672,6 +691,9 @@ class AllocationService:
                 COALESCE(SUM(ad.allocated_qty), 0) as total_allocated,
                 COALESCE(SUM(CASE WHEN ac.status = 'ACTIVE' THEN ac.cancelled_qty ELSE 0 END), 0) as total_cancelled,
                 COALESCE(SUM(adl.delivered_qty), 0) as total_delivered,
+                -- Thêm total_effective_allocated
+                COALESCE(SUM(ad.allocated_qty - COALESCE(CASE WHEN ac.status = 'ACTIVE' THEN ac.cancelled_qty ELSE 0 END, 0)), 0) as total_effective_allocated,
+                -- undelivered_allocated đã đúng
                 COALESCE(SUM(ad.allocated_qty - 
                             COALESCE(CASE WHEN ac.status = 'ACTIVE' THEN ac.cancelled_qty ELSE 0 END, 0) - 
                             COALESCE(adl.delivered_qty, 0)), 0) as undelivered_allocated
@@ -683,7 +705,6 @@ class AllocationService:
                 GROUP BY allocation_detail_id, status
             ) ac ON ad.id = ac.allocation_detail_id
             LEFT JOIN (
-                -- Get delivered qty from allocation_delivery_links
                 SELECT allocation_detail_id, SUM(delivered_qty) as delivered_qty
                 FROM allocation_delivery_links
                 GROUP BY allocation_detail_id
@@ -695,20 +716,20 @@ class AllocationService:
         
         result = conn.execute(query, {'oc_detail_id': oc_detail_id}).fetchone()
         
-        # Fix: Access the result properly using _mapping
         if result:
             return {
                 'total_allocated': float(result._mapping['total_allocated'] or 0),
                 'total_cancelled': float(result._mapping['total_cancelled'] or 0),
                 'total_delivered': float(result._mapping['total_delivered'] or 0),
+                'total_effective_allocated': float(result._mapping['total_effective_allocated'] or 0),  # THÊM MỚI
                 'undelivered_allocated': float(result._mapping['undelivered_allocated'] or 0)
             }
         else:
-            # Return default values if no result
             return {
                 'total_allocated': 0.0,
                 'total_cancelled': 0.0,
                 'total_delivered': 0.0,
+                'total_effective_allocated': 0.0,  # THÊM MỚI
                 'undelivered_allocated': 0.0
             }
 
@@ -758,11 +779,18 @@ class AllocationService:
                     product_name,
                     pt_code,
                     etd,
+                    -- Thêm effective quantities để validate đúng
+                    standard_quantity as effective_standard_quantity,
+                    selling_quantity as effective_selling_quantity,
+                    -- Pending quantities vẫn giữ để check pending over-allocation
                     pending_standard_delivery_quantity,
                     pending_selling_delivery_quantity as pending_quantity,
                     selling_uom,
                     standard_uom,
-                    uom_conversion
+                    uom_conversion,
+                    -- Thêm thông tin delivered để context đầy đủ
+                    total_delivered_standard_quantity,
+                    total_delivered_selling_quantity
                 FROM outbound_oc_pending_delivery_view
                 WHERE ocd_id = :oc_detail_id
             """)
@@ -777,7 +805,7 @@ class AllocationService:
         except Exception as e:
             logger.error(f"Error getting OC detail info: {e}")
             return None
-    
+
     def _get_allocation_detail_with_pending(self, conn, allocation_detail_id: int) -> Optional[Dict]:
         """Get allocation detail with pending quantity from allocation_delivery_links"""
         detail_query = text("""

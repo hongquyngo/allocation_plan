@@ -476,7 +476,7 @@ class AllocationDataService:
             return {'products': [], 'customers': [], 'brands': [], 'oc_numbers': []}
     
     # ==================== OC Details ====================
-    
+
     @st.cache_data(ttl=300)
     def get_ocs_by_product(_self, product_id: int) -> pd.DataFrame:
         """Get all pending OCs for a product with allocation summary"""
@@ -487,7 +487,10 @@ class AllocationDataService:
                     -- Add alias for UI compatibility
                     ocpd.pending_selling_delivery_quantity as pending_quantity,
                     -- Total delivered from allocation_delivery_links
-                    COALESCE(alloc_delivery.total_delivered_qty_standard, 0) as actual_delivered_qty_standard
+                    COALESCE(alloc_delivery.total_delivered_qty_standard, 0) as actual_delivered_qty_standard,
+                    -- Add effective quantities for proper validation
+                    ocpd.standard_quantity as effective_standard_quantity,
+                    ocpd.selling_quantity as effective_selling_quantity
                 FROM outbound_oc_pending_delivery_view ocpd
                 LEFT JOIN (
                     SELECT 
@@ -517,7 +520,8 @@ class AllocationDataService:
         except Exception as e:
             logger.error(f"Error loading OCs for product {product_id}: {e}")
             return pd.DataFrame()
-    
+
+
     # ==================== Allocation History ====================
     
     def get_allocation_history_with_details(_self, oc_detail_id: int) -> pd.DataFrame:
@@ -539,6 +543,7 @@ class AllocationDataService:
                     COALESCE(ad.supply_source_type, 'No specific source') as supply_source_type,
                     ad.notes,
                     COALESCE(ac.cancelled_qty, 0) as cancelled_qty,
+                    -- Effective qty đã đúng
                     (ad.allocated_qty - COALESCE(ac.cancelled_qty, 0)) as effective_qty,
                     -- Pending qty = allocated - cancelled - delivered
                     (ad.allocated_qty - COALESCE(ac.cancelled_qty, 0) - COALESCE(adl.delivered_qty, 0)) as pending_qty,
@@ -597,6 +602,7 @@ class AllocationDataService:
         except Exception as e:
             logger.error(f"Error loading allocation history: {e}")
             return pd.DataFrame()
+
 
     def get_allocation_delivery_details(_self, allocation_detail_id: int) -> pd.DataFrame:
         """Get delivery details for a specific allocation"""
