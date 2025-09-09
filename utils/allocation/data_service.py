@@ -52,6 +52,11 @@ class AllocationDataService:
         if not filters:
             return where_conditions, params
         
+        # THÊM MỚI: Xử lý product_id filter
+        if filters.get('product_id'):
+            where_conditions.append("p.id = :product_id")
+            params['product_id'] = filters['product_id']
+        
         # Search filter
         if filters.get('search'):
             search_term = filters['search'].strip()[:50]  # Limit length

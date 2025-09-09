@@ -8,6 +8,8 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 import logging
 import time
+from sqlalchemy import text
+
 
 # Import utilities
 from utils.auth import AuthManager
@@ -935,16 +937,27 @@ def show_allocation_action_button(oc):
 
 def show_etd_with_urgency(etd):
     """Show ETD with urgency indicator"""
-    etd_days = (pd.to_datetime(etd).date() - datetime.now().date()).days
-    etd_color = ""
-    if etd_days <= 0:
-        etd_color = "⚫"  # Overdue
-    elif etd_days <= 7:
-        etd_color = "🔴"  # Urgent
-    elif etd_days <= 14:
-        etd_color = "🟡"  # Soon
-    
-    st.text(f"{etd_color} {format_date(etd)}")
+    # Kiểm tra ETD có None không
+    if etd is None or pd.isna(etd):
+        st.text("⚫ No ETD")
+        return
+        
+    try:
+        etd_date = pd.to_datetime(etd).date()
+        etd_days = (etd_date - datetime.now().date()).days
+        
+        etd_color = ""
+        if etd_days <= 0:
+            etd_color = "⚫"  # Overdue
+        elif etd_days <= 7:
+            etd_color = "🔴"  # Urgent
+        elif etd_days <= 14:
+            etd_color = "🟡"  # Soon
+        
+        st.text(f"{etd_color} {format_date(etd)}")
+    except Exception as e:
+        logger.error(f"Error formatting ETD {etd}: {e}")
+        st.text(f"📅 {etd}")
 
 def show_pending_quantity_dual_uom(oc):
     """Show pending quantity with dual UOM display"""
@@ -1021,22 +1034,31 @@ def show_allocated_quantity_dual_uom(oc, is_over_allocated):
     else:
         st.text(f"0 {standard_uom}")
 
+def get_product_standard_uom(product_id):
+    """Get standard UOM directly from products table"""
+    try:
+        query = text("SELECT id, pt_code, name, uom FROM products WHERE id = :product_id AND delete_flag = 0")
+        with data_service.engine.connect() as conn:
+            result = conn.execute(query, {'product_id': product_id}).fetchone()
+            if result:
+                # Debug log
+                logger.info(f"Found product {product_id}: pt_code={result[1]}, name={result[2]}, uom={result[3]}")
+                return result[3] if result[3] else 'pcs'
+            else:
+                logger.warning(f"Product {product_id} not found in database")
+                return 'pcs'
+    except Exception as e:
+        logger.error(f"Error getting product UOM for product_id {product_id}: {e}", exc_info=True)
+        return 'pcs'
 
 def show_product_supply_details(product_id):
     """Show supply sources for a product with overview"""
-    # Get supply summary first
-    supply_summary = data_service.get_product_supply_summary(product_id)
     
-    # Get product info to get correct UOM
-    products_df = data_service.get_products_with_demand_supply(
-        filters={'product_id': product_id},
-        page=1,
-        page_size=1
-    )
-    if not products_df.empty:
-        standard_uom = products_df.iloc[0]['standard_uom']
-    else:
-        standard_uom = 'pcs'
+    # Lấy UOM trực tiếp từ products table - đơn giản và chính xác
+    standard_uom = get_product_standard_uom(product_id)
+    
+    # Get supply summary
+    supply_summary = data_service.get_product_supply_summary(product_id)
     
     # Show overview section
     st.markdown("### 📊 Supply Overview")
@@ -1085,20 +1107,19 @@ def show_product_supply_details(product_id):
     col1, col2, col3, col4 = st.columns(4)
     
     with col1:
-        show_supply_summary(product_id, 'inventory', data_service.get_inventory_summary)
+        show_supply_summary(product_id, 'inventory', data_service.get_inventory_summary, standard_uom)
     
     with col2:
-        show_supply_summary(product_id, 'can', data_service.get_can_summary)
+        show_supply_summary(product_id, 'can', data_service.get_can_summary, standard_uom)
     
     with col3:
-        show_supply_summary(product_id, 'po', data_service.get_po_summary)
+        show_supply_summary(product_id, 'po', data_service.get_po_summary, standard_uom)
     
     with col4:
-        show_supply_summary(product_id, 'wht', data_service.get_wht_summary)
+        show_supply_summary(product_id, 'wht', data_service.get_wht_summary, standard_uom)
 
-
-def show_supply_summary(product_id, supply_type, data_fetcher):
-    """Generic supply summary display"""
+def show_supply_summary(product_id, supply_type, data_fetcher, standard_uom):
+    """Generic supply summary display with consistent UOM"""
     titles = {
         'inventory': '📦 Inventory',
         'can': '🚢 Pending CAN',
@@ -1117,34 +1138,32 @@ def show_supply_summary(product_id, supply_type, data_fetcher):
                     label += f" | {item['warehouse_name']}"
                 st.metric(
                     label,
-                    f"{format_number(item['available_quantity'])} {item.get('standard_uom', '')}",
+                    f"{format_number(item['available_quantity'])} {standard_uom}",
                     delta=f"Exp: {format_date(item['expiry_date'])}"
                 )
                 if item.get('location'):
                     st.caption(f"📍 Location: {item['location']}")
                     
             elif supply_type == 'can':
-                qty_str = f"{format_number(item['pending_quantity'])} {item.get('standard_uom', '')}"
                 st.metric(
                     item['arrival_note_number'],
-                    qty_str,
+                    f"{format_number(item['pending_quantity'])} {standard_uom}",
                     delta=f"Arr: {format_date(item['arrival_date'])}"
                 )
                 
             elif supply_type == 'po':
-                qty_str = f"{format_number(item['pending_quantity'])} {item.get('standard_uom', '')}"
                 etd_str = format_date(item['etd'])
                 eta_str = format_date(item.get('eta')) if item.get('eta') else 'N/A'
                 st.metric(
                     item['po_number'],
-                    qty_str,
+                    f"{format_number(item['pending_quantity'])} {standard_uom}",
                     delta=f"ETD: {etd_str} | ETA: {eta_str}"
                 )
                 
             elif supply_type == 'wht':
                 st.metric(
                     f"{item['from_warehouse']} → {item['to_warehouse']}",
-                    f"{format_number(item['transfer_quantity'])} {item.get('standard_uom', '')}",
+                    f"{format_number(item['transfer_quantity'])} {standard_uom}",
                     delta=item['status']
                 )
     else:
