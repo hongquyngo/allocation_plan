@@ -505,7 +505,23 @@ class AllocationDataService:
             
             with _self.engine.connect() as conn:
                 df = pd.read_sql(text(query), conn, params={'product_id': product_id})
+
+            # Fix floating point precision issues for quantity columns
+            quantity_columns = [
+                'original_selling_quantity', 'original_standard_quantity',
+                'selling_quantity', 'standard_quantity',
+                'total_delivered_selling_quantity', 'total_delivered_standard_quantity',
+                'pending_selling_delivery_quantity', 'pending_standard_delivery_quantity',
+                'total_allocated_qty_standard', 'total_allocation_cancelled_qty_standard',
+                'total_effective_allocated_qty_standard', 'undelivered_allocated_qty_standard'
+            ]
             
+            for col in quantity_columns:
+                if col in df.columns:
+                    # Round to 10 decimal places first to fix precision issues
+                    # then round to 2 for display
+                    df[col] = df[col].apply(lambda x: round(round(x, 10), 2) if pd.notna(x) else x)
+
             return df
             
         except Exception as e:
