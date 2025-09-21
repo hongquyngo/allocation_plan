@@ -36,8 +36,8 @@ class AllocationValidator:
             'GM': ['create', 'update', 'cancel', 'reverse', 'view'],
             'MD': ['create', 'update', 'cancel', 'reverse', 'view'],
             'sales_manager': ['create', 'update', 'cancel', 'view'],
-            'sales': ['create', 'update', 'cancel', 'view'],
             'supply_chain': ['create', 'update', 'cancel', 'view'],
+            'sales': ['create', 'update', 'view'],
             'viewer': ['view'],
             'customer': ['view'],
             'vendor': ['view']

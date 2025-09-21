@@ -2386,9 +2386,12 @@ def show_update_etd_modal():
 # ==================== CANCEL ALLOCATION MODAL ====================
 @st.dialog("Cancel Allocation", width="medium")
 def show_cancel_allocation_modal():
-    """Modal for cancelling allocation"""
-    allocation = st.session_state.selections['allocation_for_cancel']
+    """Modal for cancelling allocation with proper error handling"""
     
+    # Get allocation from session state
+    allocation = st.session_state.selections.get('allocation_for_cancel')
+    
+    # Early return if no allocation selected
     if not allocation:
         st.error("No allocation selected")
         if st.button("Close"):
@@ -2397,17 +2400,45 @@ def show_cancel_allocation_modal():
             st.rerun()
         return
     
-    st.markdown(f"### Cancel Allocation {allocation['allocation_number']}")
+    # Display header
+    st.markdown(f"### Cancel Allocation {allocation.get('allocation_number', '')}")
     
-    # Get UOM info
-    oc_info = st.session_state.selections.get('oc_info', {})
-    standard_uom = oc_info.get('standard_uom', '')
-    selling_uom = oc_info.get('selling_uom', '')
-    conversion = oc_info.get('uom_conversion', '1')
+    # Get UOM info with multiple fallback options
+    oc_info = st.session_state.selections.get('oc_info')
     
-    # Show pending quantity
-    pending_qty_std = allocation.get('pending_allocated_qty', 0)
+    # Extract UOM information with fallbacks
+    if oc_info and isinstance(oc_info, dict):
+        standard_uom = oc_info.get('standard_uom', 'pcs')
+        selling_uom = oc_info.get('selling_uom', 'pcs')
+        conversion = oc_info.get('uom_conversion', '1')
+    else:
+        # Try to get from allocation data itself
+        standard_uom = allocation.get('standard_uom', 'pcs')
+        selling_uom = allocation.get('selling_uom', 'pcs')
+        conversion = allocation.get('uom_conversion', '1')
+        
+        # If still not available, use defaults
+        if not standard_uom:
+            standard_uom = 'pcs'
+        if not selling_uom:
+            selling_uom = standard_uom
+        if not conversion:
+            conversion = '1'
     
+    # Get pending quantity with validation
+    pending_qty_std = float(allocation.get('pending_allocated_qty', 0))
+    
+    # Check if there's anything to cancel
+    if pending_qty_std <= 0:
+        st.error("❌ Cannot cancel - no pending quantity available")
+        if st.button("Close"):
+            st.session_state.modals['cancel'] = False
+            st.session_state.selections['allocation_for_cancel'] = None
+            return_to_history_if_context()
+            st.rerun()
+        return
+    
+    # Display pending quantity information
     if uom_converter.needs_conversion(conversion):
         pending_qty_sell = uom_converter.convert_quantity(
             pending_qty_std, 'standard', 'selling', conversion
@@ -2420,8 +2451,8 @@ def show_cancel_allocation_modal():
     else:
         st.info(f"Pending quantity (not yet delivered): {format_number(pending_qty_std)} {standard_uom}")
     
-    # Show delivered quantity if any
-    delivered_qty = allocation.get('delivered_qty', 0)
+    # Show delivered quantity warning if applicable
+    delivered_qty = float(allocation.get('delivered_qty', 0))
     if delivered_qty > 0:
         if uom_converter.needs_conversion(conversion):
             delivered_qty_sell = uom_converter.convert_quantity(
@@ -2433,108 +2464,159 @@ def show_cancel_allocation_modal():
                 f"already delivered and cannot be cancelled"
             )
         else:
-            st.warning(f"⚠️ {format_number(delivered_qty)} {standard_uom} already delivered and cannot be cancelled")
+            st.warning(
+                f"⚠️ {format_number(delivered_qty)} {standard_uom} "
+                f"already delivered and cannot be cancelled"
+            )
     
-    if pending_qty_std <= 0:
-        st.error("❌ Cannot cancel - all quantity has been delivered")
-        if st.button("Close"):
-            st.session_state.modals['cancel'] = False
-            st.rerun()
-        return
+    st.divider()
     
     # Cancel quantity input
     st.markdown(f"**Cancel quantity in {standard_uom} (standard UOM):**")
+    
     cancel_qty = st.number_input(
         f"Quantity to Cancel",
         min_value=0.0,
         max_value=float(pending_qty_std),
         value=float(pending_qty_std),
         step=1.0,
-        help=f"Maximum cancellable: {format_number(pending_qty_std)} {standard_uom}"
+        help=f"Maximum cancellable: {format_number(pending_qty_std)} {standard_uom}",
+        label_visibility="collapsed"
     )
     
-    # Show equivalent in selling UOM
+    # Show equivalent in selling UOM if different
     if cancel_qty > 0 and uom_converter.needs_conversion(conversion):
         cancel_qty_sell = uom_converter.convert_quantity(
             cancel_qty, 'standard', 'selling', conversion
         )
         st.caption(f"= {format_number(cancel_qty_sell)} {selling_uom}")
     
-    # Reason category
+    # Reason category selection
     reason_category = st.selectbox(
         "Reason Category",
         options=['CUSTOMER_REQUEST', 'SUPPLY_ISSUE', 'QUALITY_ISSUE', 'BUSINESS_DECISION', 'OTHER'],
         format_func=lambda x: format_reason_category(x)
     )
     
-    # Detailed reason
+    # Detailed reason input
     reason = st.text_area(
         "Detailed Reason", 
         help="Please provide a detailed reason (minimum 10 characters)",
         placeholder="Explain why this allocation is being cancelled..."
     )
     
-    # Validation
+    # Validate inputs
     errors = validator.validate_cancel_allocation(
         allocation,
         cancel_qty,
         reason,
         reason_category,
-        st.session_state.user['role']
+        st.session_state.user.get('role', 'viewer')
     )
     
+    # Display validation errors if any
     if errors:
         for error in errors:
             st.error(f"❌ {error}")
     
+    st.divider()
+    
     # Action buttons
     col1, col2 = st.columns(2)
+    
     with col1:
-        if st.button("Cancel Allocation", type="primary", disabled=len(errors) > 0):
-            result = allocation_service.cancel_allocation(
-                allocation['allocation_detail_id'],
-                cancel_qty,
-                reason,
-                reason_category,
-                st.session_state.user['id']
-            )
+        # Determine if button should be disabled
+        button_disabled = len(errors) > 0 or cancel_qty <= 0
+        
+        if st.button(
+            "Cancel Allocation", 
+            type="primary", 
+            use_container_width=True,
+            disabled=button_disabled
+        ):
+            # Store UOM info before any state changes
+            saved_standard_uom = standard_uom
+            saved_selling_uom = selling_uom
+            saved_conversion = conversion
+            saved_cancel_qty = cancel_qty
             
-            if result['success']:
-                if uom_converter.needs_conversion(conversion):
-                    cancel_qty_sell = uom_converter.convert_quantity(
-                        cancel_qty, 'standard', 'selling', conversion
-                    )
-                    st.success(
-                        f"✅ Successfully cancelled {format_number(cancel_qty)} {standard_uom} "
-                        f"(= {format_number(cancel_qty_sell)} {selling_uom})"
-                    )
-                else:
-                    st.success(f"✅ Successfully cancelled {format_number(cancel_qty)} {standard_uom}")
+            try:
+                # Execute cancellation
+                result = allocation_service.cancel_allocation(
+                    allocation_detail_id=allocation.get('allocation_detail_id'),
+                    cancelled_qty=cancel_qty,
+                    reason=reason,
+                    reason_category=reason_category,
+                    user_id=st.session_state.user.get('id', 1)
+                )
                 
-                if result.get('remaining_pending_qty', 0) > 0:
-                    remaining_std = result['remaining_pending_qty']
-                    if uom_converter.needs_conversion(conversion):
-                        remaining_sell = uom_converter.convert_quantity(
-                            remaining_std, 'standard', 'selling', conversion
+                if result['success']:
+                    # Prepare success message using saved values
+                    if uom_converter.needs_conversion(saved_conversion):
+                        cancel_qty_sell = uom_converter.convert_quantity(
+                            saved_cancel_qty, 'standard', 'selling', saved_conversion
                         )
-                        st.info(
-                            f"Remaining pending: {format_number(remaining_std)} {standard_uom} "
-                            f"(= {format_number(remaining_sell)} {selling_uom})"
+                        success_msg = (
+                            f"✅ Successfully cancelled {format_number(saved_cancel_qty)} {saved_standard_uom} "
+                            f"(= {format_number(cancel_qty_sell)} {saved_selling_uom})"
                         )
                     else:
-                        st.info(f"Remaining pending: {format_number(remaining_std)} {standard_uom}")
-                
-                time.sleep(1)
-                return_to_history_if_context()
-                st.cache_data.clear()
-                st.rerun()
-            else:
-                st.error(f"❌ {result['error']}")
+                        success_msg = f"✅ Successfully cancelled {format_number(saved_cancel_qty)} {saved_standard_uom}"
+                    
+                    # Display success message
+                    st.success(success_msg)
+                    
+                    # Display remaining quantity if any
+                    remaining_qty = result.get('remaining_pending_qty', 0)
+                    if remaining_qty > 0:
+                        if uom_converter.needs_conversion(saved_conversion):
+                            remaining_sell = uom_converter.convert_quantity(
+                                remaining_qty, 'standard', 'selling', saved_conversion
+                            )
+                            st.info(
+                                f"Remaining pending: {format_number(remaining_qty)} {saved_standard_uom} "
+                                f"(= {format_number(remaining_sell)} {saved_selling_uom})"
+                            )
+                        else:
+                            st.info(f"Remaining pending: {format_number(remaining_qty)} {saved_standard_uom}")
+                    
+                    # Wait briefly for user to see the message
+                    time.sleep(1.5)
+                    
+                    # Clear modal state
+                    st.session_state.modals['cancel'] = False
+                    st.session_state.selections['allocation_for_cancel'] = None
+                    
+                    # Return to history if context exists
+                    return_to_history_if_context()
+                    
+                    # Clear cache and refresh
+                    st.cache_data.clear()
+                    st.rerun()
+                    
+                else:
+                    # Display error message
+                    error_msg = result.get('error', 'Unknown error occurred')
+                    st.error(f"❌ {error_msg}")
+                    
+                    # Log technical error if available
+                    if result.get('technical_error'):
+                        logger.error(f"Technical error: {result['technical_error']}")
+                        
+            except Exception as e:
+                # Handle unexpected errors
+                logger.error(f"Unexpected error during cancellation: {e}", exc_info=True)
+                st.error("❌ An unexpected error occurred. Please try again or contact support.")
     
     with col2:
-        if st.button("Close"):
+        if st.button("Close", use_container_width=True):
+            # Clear modal state
             st.session_state.modals['cancel'] = False
+            st.session_state.selections['allocation_for_cancel'] = None
+            
+            # Return to history if context exists
             return_to_history_if_context()
+            
             st.rerun()
 
 # ==================== REVERSE CANCELLATION MODAL ====================
