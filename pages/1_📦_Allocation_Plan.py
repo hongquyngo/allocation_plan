@@ -1916,11 +1916,11 @@ def show_allocation_history_modal():
         st.rerun()
 
 def show_allocation_summary_metrics(oc_info):
-    """Show summary metrics with data from allocation_delivery_links"""
+    """Show summary metrics with correct coverage calculation"""
     metrics_cols = st.columns(3)
     
     with metrics_cols[0]:
-        # Pending quantity
+        # Pending quantity (giữ nguyên)
         standard_qty = oc_info.get('pending_standard_delivery_quantity', 0)
         standard_uom = oc_info.get('standard_uom', '')
         selling_qty = oc_info['pending_quantity']
@@ -1936,48 +1936,47 @@ def show_allocation_summary_metrics(oc_info):
         history_df = data_service.get_allocation_history_with_details(st.session_state.selections['oc_for_history'])
         
         if not history_df.empty:
-            # Calculate total effective (allocated - cancelled)
-            total_effective_standard = history_df['effective_qty'].sum()
-            
-            # Hiển thị cả tổng allocated và effective
-            total_allocated_standard = history_df['allocated_qty'].sum()
-            total_cancelled_standard = history_df['cancelled_qty'].sum()
+            # Undelivered allocated (phần đã phân bổ nhưng chưa giao)
+            undelivered_allocated = history_df['pending_qty'].sum()
             
             if uom_converter.needs_conversion(oc_info.get('uom_conversion', '1')):
-                total_effective_selling = uom_converter.convert_quantity(
-                    total_effective_standard,
+                undelivered_selling = uom_converter.convert_quantity(
+                    undelivered_allocated,
                     'standard',
                     'selling',
                     oc_info.get('uom_conversion', '1')
                 )
-                st.metric("Effective Allocated", f"{format_number(total_effective_standard)} {standard_uom}")
-                st.caption(f"= {format_number(total_effective_selling)} {selling_uom}")
+                st.metric("Undelivered Allocated", f"{format_number(undelivered_allocated)} {standard_uom}")
+                st.caption(f"= {format_number(undelivered_selling)} {selling_uom}")
             else:
-                st.metric("Effective Allocated", f"{format_number(total_effective_standard)} {standard_uom}")
-            
-            # Show total allocated và cancelled if any
-            if total_cancelled_standard > 0:
-                st.caption(f"(Total: {format_number(total_allocated_standard)}, Cancelled: {format_number(total_cancelled_standard)} {standard_uom})")
+                st.metric("Undelivered Allocated", f"{format_number(undelivered_allocated)} {standard_uom}")
         else:
-            st.metric("Effective Allocated", f"0 {standard_uom}")
+            st.metric("Undelivered Allocated", f"0 {standard_uom}")
     
     with metrics_cols[2]:
         if not history_df.empty:
-            # Coverage dựa trên effective allocation
+            # CÁCH 2: Coverage = Undelivered Allocated / Pending Delivery
             pending_standard = oc_info.get('pending_standard_delivery_quantity', 0)
-            effective_standard = oc_info.get('standard_quantity', 0)  # OC effective quantity
-            total_effective_standard = history_df['effective_qty'].sum()
+            undelivered_allocated = history_df['pending_qty'].sum()
             
-            # Tính coverage dựa trên OC effective quantity
-            coverage = (total_effective_standard / effective_standard * 100) if effective_standard > 0 else 0
+            coverage = (undelivered_allocated / pending_standard * 100) if pending_standard > 0 else 0
             st.metric("Coverage", format_percentage(coverage))
             
+            # Action-oriented status
             if coverage > 100:
-                st.caption("⚡ Over-committed")
-            elif coverage > 95:
+                st.caption("⚡ Over-allocated - Review & cancel excess")
+            elif coverage == 100:
                 st.caption("✅ Fully covered")
+            elif coverage >= 80:
+                st.caption("🟡 Nearly covered - Allocate remaining")
+            elif coverage > 0:
+                st.caption("🔴 Partially covered - Need more allocation")
+            else:
+                st.caption("⚫ Not allocated - Urgent action needed")
         else:
             st.metric("Coverage", "0%")
+            st.caption("⚫ Not allocated - Urgent action needed")
+
 
 def show_allocation_history_item_dual_uom(alloc, oc_info):
     """Show single allocation history item with tooltip"""
