@@ -12,7 +12,7 @@ from .db import get_db_engine
 logger = logging.getLogger(__name__)
 
 class AuthManager:
-    """Authentication manager for SCM app"""
+    """Authentication manager for SCM app with consistent session state management"""
     
     def __init__(self):
         self.session_timeout = timedelta(hours=8)
@@ -107,41 +107,65 @@ class AuthManager:
         if not st.session_state.authenticated:
             return False
         
+        # Check if user_id exists and is valid
+        if not st.session_state.get('user_id'):
+            logger.warning("No user_id in session state")
+            return False
+        
         # Check session timeout
         login_time = st.session_state.get('login_time')
         if login_time:
             elapsed = datetime.now() - login_time
             if elapsed > self.session_timeout:
+                logger.info(f"Session timeout for user {st.session_state.get('username', 'unknown')}")
                 self.logout()
                 return False
         
         return True
     
     def login(self, user_info: Dict):
-        """Set up user session"""
+        """Set up user session with consistent naming"""
+        # Main authentication flags
         st.session_state.authenticated = True
+        st.session_state.login_time = user_info['login_time']
+        
+        # User information - using consistent keys
         st.session_state.user_id = user_info['id']
         st.session_state.username = user_info['username']
         st.session_state.user_email = user_info['email']
         st.session_state.user_role = user_info['role']
         st.session_state.user_fullname = user_info['full_name']
         st.session_state.employee_id = user_info['employee_id']
-        st.session_state.login_time = user_info['login_time']
+        
+        # IMPORTANT: Also set authenticated_user_id for backward compatibility
+        st.session_state.authenticated_user_id = user_info['id']
+        
+        # Initialize user dict for modules that use it
+        st.session_state.user = {
+            'id': user_info['id'],
+            'username': user_info['username'],
+            'email': user_info['email'],
+            'role': user_info['role'],
+            'full_name': user_info['full_name'],
+            'employee_id': user_info['employee_id']
+        }
         
         # Initialize other session state variables
         st.session_state.debug_mode = False
         
-        logger.info(f"User {user_info['username']} logged in successfully")
+        logger.info(f"User {user_info['username']} (ID: {user_info['id']}) logged in successfully")
     
     def logout(self):
         """Clear user session"""
         # Get username before clearing
         username = st.session_state.get('username', 'Unknown')
+        user_id = st.session_state.get('user_id', 'Unknown')
         
         # Clear authentication-related session state
         auth_keys = [
             'authenticated', 'user_id', 'username', 'user_email', 
-            'user_role', 'user_fullname', 'employee_id', 'login_time'
+            'user_role', 'user_fullname', 'employee_id', 'login_time',
+            'authenticated_user_id', 'user'
         ]
         
         for key in auth_keys:
@@ -151,7 +175,7 @@ class AuthManager:
         # Clear cache
         st.cache_data.clear()
         
-        logger.info(f"User {username} logged out")
+        logger.info(f"User {username} (ID: {user_id}) logged out")
     
     def require_auth(self):
         """Decorator to require authentication for a page"""
@@ -161,14 +185,49 @@ class AuthManager:
             return False
         return True
     
+    def get_current_user_id(self) -> Optional[int]:
+        """Get current authenticated user ID with validation"""
+        user_id = st.session_state.get('user_id')
+        
+        if not user_id:
+            logger.error("No user_id found in session state")
+            return None
+        
+        try:
+            # Ensure it's an integer
+            return int(user_id)
+        except (ValueError, TypeError) as e:
+            logger.error(f"Invalid user_id format: {user_id}, error: {e}")
+            return None
+    
     def get_user_display_name(self) -> str:
         """Get user display name"""
         if 'user_fullname' in st.session_state and st.session_state.user_fullname:
             return st.session_state.user_fullname
         return st.session_state.get('username', 'User')
     
+    def validate_user_exists(self, user_id: int) -> bool:
+        """Validate that a user exists in the database"""
+        try:
+            engine = get_db_engine()
+            query = text("""
+                SELECT id 
+                FROM users 
+                WHERE id = :user_id 
+                AND delete_flag = 0 
+                AND is_active = 1
+            """)
+            
+            with engine.connect() as conn:
+                result = conn.execute(query, {'user_id': user_id}).fetchone()
+                return result is not None
+                
+        except Exception as e:
+            logger.error(f"Error validating user {user_id}: {e}")
+            return False
+    
     def update_session_activity(self):
         """Update session activity to prevent timeout"""
         if 'login_time' in st.session_state:
-            # You could implement activity tracking here if needed
-            pass
+            # Reset timeout by updating activity timestamp
+            st.session_state.last_activity = datetime.now()

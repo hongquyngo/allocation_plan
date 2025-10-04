@@ -1,6 +1,6 @@
 """
-Allocation Planning System - Cleaned Version
-Product-centric view with dual UOM display and proper delivery tracking
+Allocation Planning System - Complete Fixed Version
+Product-centric view with proper user session management
 """
 import streamlit as st
 import pandas as pd
@@ -9,7 +9,6 @@ from typing import List, Dict, Any, Optional
 import logging
 import time
 from sqlalchemy import text
-
 
 # Import utilities
 from utils.auth import AuthManager
@@ -42,7 +41,7 @@ allocation_service = AllocationService()
 validator = AllocationValidator()
 uom_converter = UOMConverter()
 
-# Check authentication
+# Check authentication first
 if not auth.check_session():
     st.warning("⚠️ Please login to access this page")
     st.switch_page("app.py")
@@ -71,17 +70,13 @@ DEFAULT_SESSION_STATE = {
         'page_number': 1,
         'expanded_products': set()
     },
-    'user': {
-        'id': None,
-        'role': 'viewer'
-    },
     'context': {
         'return_to_history': None
     }
 }
 
 def init_session_state():
-    """Initialize session state with default values"""
+    """Initialize session state with proper user validation"""
     if 'state_initialized' not in st.session_state:
         for key, value in DEFAULT_SESSION_STATE.items():
             if key not in st.session_state:
@@ -92,13 +87,42 @@ def init_session_state():
     if 'modals' not in st.session_state:
         st.session_state.modals = DEFAULT_SESSION_STATE['modals'].copy()
     
-    # Set user info
-    if st.session_state.user['id'] is None:
-        st.session_state.user['id'] = st.session_state.get('authenticated_user_id', 1)
-    if st.session_state.user['role'] == 'viewer':
-        st.session_state.user['role'] = st.session_state.get('user_role', 'viewer')
+    # FIXED: Properly handle user session with validation
+    if 'user' not in st.session_state:
+        st.session_state.user = {}
+    
+    # Get user ID with proper validation
+    user_id = auth.get_current_user_id()
+    
+    if user_id is None:
+        # No valid user session - redirect to login
+        logger.error("No valid user session found, redirecting to login")
+        st.error("⚠️ Your session has expired. Please login again.")
+        time.sleep(2)
+        auth.logout()
+        st.switch_page("app.py")
+        st.stop()
+    
+    # Validate user still exists and is active
+    if not auth.validate_user_exists(user_id):
+        logger.error(f"User {user_id} no longer exists or is inactive")
+        st.error("⚠️ Your account is no longer active. Please contact an administrator.")
+        time.sleep(2)
+        auth.logout()
+        st.switch_page("app.py")
+        st.stop()
+    
+    # Update user information in session state
+    if 'user' not in st.session_state or st.session_state.user.get('id') != user_id:
+        st.session_state.user = {
+            'id': user_id,
+            'role': st.session_state.get('user_role', 'viewer'),
+            'username': st.session_state.get('username', 'Unknown'),
+            'full_name': st.session_state.get('user_fullname', st.session_state.get('username', 'User'))
+        }
+        logger.info(f"Session initialized for user {st.session_state.user['username']} (ID: {user_id})")
 
-# Initialize session state
+# Initialize session state with validation
 init_session_state()
 
 # Constants
@@ -106,7 +130,7 @@ ITEMS_PER_PAGE = config.get_app_setting('ITEMS_PER_PAGE', 50)
 
 # ==================== HEADER ====================
 def show_header():
-    """Display page header"""
+    """Display page header with current user info"""
     col1, col2 = st.columns([6, 1])
     with col1:
         st.title("📦 Allocation Planning System")
@@ -117,7 +141,13 @@ def show_header():
             auth.logout()
             st.switch_page("app.py")
 
-    st.caption(f"👤 {auth.get_user_display_name()} ({st.session_state.user['role']}) | 🕐 {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    # Show current user info with ID for debugging
+    user_display = auth.get_user_display_name()
+    user_role = st.session_state.user.get('role', 'viewer')
+    user_id = st.session_state.user.get('id', 'Unknown')
+    current_time = datetime.now().strftime('%Y-%m-%d %H:%M')
+    
+    st.caption(f"👤 {user_display} (ID: {user_id}, Role: {user_role}) | 🕐 {current_time}")
 
 # ==================== METRICS ====================
 def get_supply_status_indicator(total_demand, total_supply):
@@ -185,7 +215,6 @@ def show_metrics_row():
         st.error(f"Error loading metrics: {str(e)}")
 
 # ==================== SEARCH AND FILTERS ====================
-
 def show_search_bar():
     """Display search bar with autocomplete"""
     col1, col2 = st.columns([3, 1])
@@ -959,81 +988,6 @@ def show_etd_with_urgency(etd):
         logger.error(f"Error formatting ETD {etd}: {e}")
         st.text(f"📅 {etd}")
 
-def show_pending_quantity_dual_uom(oc):
-    """Show pending quantity with dual UOM display"""
-    standard_qty = format_number(oc.get('pending_standard_delivery_quantity', 0))
-    standard_uom = oc.get('standard_uom', '')
-    selling_qty = format_number(oc['pending_quantity'])
-    selling_uom = oc.get('selling_uom', '')
-    
-    if uom_converter.needs_conversion(oc.get('uom_conversion', '1')):
-        st.markdown(f"**{standard_qty} {standard_uom}**")
-        st.caption(f"= {selling_qty} {selling_uom}")
-    else:
-        st.markdown(f"**{standard_qty} {standard_uom}**")
-
-def show_allocated_quantity_dual_uom(oc, is_over_allocated):
-    """Show allocated quantity with dual UOM display"""
-    allocated_qty_standard = oc.get('total_allocated_qty_standard', 0)
-    cancelled_qty_standard = oc.get('total_allocation_cancelled_qty', 0)
-    
-    # Calculate effective allocated
-    effective_allocated_standard = allocated_qty_standard - cancelled_qty_standard
-    
-    standard_uom = oc.get('standard_uom', '')
-    selling_uom = oc.get('selling_uom', '')
-    allocation_count = oc.get('allocation_count', 0)
-    
-    if effective_allocated_standard > 0:
-        # Build button label
-        if uom_converter.needs_conversion(oc.get('uom_conversion', '1')):
-            effective_allocated_selling = uom_converter.convert_quantity(
-                effective_allocated_standard,
-                'standard',
-                'selling',
-                oc.get('uom_conversion', '1')
-            )
-            button_label = f"{format_number(effective_allocated_standard)} {standard_uom}"
-            if allocation_count > 1:
-                button_label += f" ({allocation_count})"
-            help_text = f"= {format_number(effective_allocated_selling)} {selling_uom}. Click to view allocation history"
-        else:
-            button_label = f"{format_number(effective_allocated_standard)} {standard_uom}"
-            if allocation_count > 1:
-                button_label += f" ({allocation_count})"
-            help_text = f"Click to view {allocation_count} allocation(s)"
-        
-        if cancelled_qty_standard > 0:
-            help_text += f". Cancelled: {format_number(cancelled_qty_standard)} {standard_uom}"
-        
-        if st.button(
-            button_label, 
-            key=f"view_alloc_{oc['ocd_id']}", 
-            help=help_text,
-            use_container_width=True,
-            type="secondary"
-        ):
-            reset_all_modals()
-            st.session_state.modals['history'] = True
-            st.session_state.selections['oc_for_history'] = oc['ocd_id']
-            st.session_state.selections['oc_info'] = {
-                'oc_number': oc['oc_number'],
-                'customer': oc['customer'],
-                'product_name': oc['product_name'],
-                'selling_uom': oc.get('selling_uom', ''),
-                'standard_uom': oc.get('standard_uom', ''),
-                'pending_quantity': oc['pending_quantity'],
-                'pending_standard_delivery_quantity': oc.get('pending_standard_delivery_quantity', 0),
-                'allocation_warning': oc.get('allocation_warning', ''),
-                'uom_conversion': oc.get('uom_conversion', '1'),
-                'over_allocation_type': oc.get('over_allocation_type', 'Normal'),
-                'total_allocated_qty_standard': allocated_qty_standard,
-                'total_allocation_cancelled_qty': cancelled_qty_standard
-            }
-            st.rerun()
-    else:
-        st.text(f"0 {standard_uom}")
-
 def get_product_standard_uom(product_id):
     """Get standard UOM directly from products table"""
     try:
@@ -1257,7 +1211,7 @@ def format_supply_info_with_real_time_availability(supply, source_type, oc, curr
 
 @st.dialog("Create Allocation", width="large")
 def show_allocation_modal():
-    """Allocation modal with dual UOM display and supply validation"""
+    """Allocation modal with user validation"""
     oc = st.session_state.selections['oc_for_allocation']
     
     if not oc:
@@ -1267,6 +1221,15 @@ def show_allocation_modal():
             st.session_state.selections['oc_for_allocation'] = None
             st.rerun()
         return
+    
+    # Validate user session before allowing allocation
+    user_id = st.session_state.user.get('id')
+    if not user_id:
+        st.error("⚠️ Session error. Please login again.")
+        time.sleep(2)
+        auth.logout()
+        st.switch_page("app.py")
+        st.stop()
     
     # Header
     st.markdown(f"### Allocate to {oc['oc_number']}")
@@ -1629,6 +1592,15 @@ def show_allocation_modal():
             disabled=not can_save,
             help=button_help
         ):
+            # FIXED: Validate user session again before saving
+            user_id = st.session_state.user.get('id')
+            if not user_id:
+                st.error("⚠️ Session error. Please login again.")
+                time.sleep(2)
+                auth.logout()
+                st.switch_page("app.py")
+                st.stop()
+            
             # Validate allocation
             errors = validator.validate_create_allocation(
                 selected_supplies,
@@ -1641,17 +1613,23 @@ def show_allocation_modal():
                 for error in errors:
                     st.error(f"❌ {error}")
             else:
-                # Save allocation
+                # Save allocation with validated user_id
                 result = allocation_service.create_allocation(
                     oc_detail_id=oc['ocd_id'],
                     allocations=selected_supplies,
                     mode='SOFT' if use_soft else 'HARD',
                     etd=allocated_etd,
                     notes=notes,
-                    user_id=st.session_state.user['id']
+                    user_id=user_id  # Using validated user_id
                 )
                 
                 if result['success']:
+                    # Log successful allocation with user info
+                    logger.info(
+                        f"User {st.session_state.user.get('username', 'Unknown')} (ID: {user_id}) "
+                        f"created allocation {result['allocation_number']}"
+                    )
+                    
                     success_msg = f"✅ Allocation Successful\nAllocated: {format_number(total_selected_standard)} {standard_uom}"
                     
                     if uom_converter.needs_conversion(oc.get('uom_conversion', '1')):
@@ -1665,6 +1643,7 @@ def show_allocation_modal():
                         success_msg += f" (= {format_number(total_selected_selling)} {selling_uom})"
                     
                     success_msg += f" to {oc['oc_number']}\nAllocation Number: {result['allocation_number']}"
+                    success_msg += f"\nCreated by: {st.session_state.user.get('full_name', 'Unknown')}"
                     
                     st.success(success_msg)
                     st.balloons()
@@ -1675,7 +1654,15 @@ def show_allocation_modal():
                     st.cache_data.clear()
                     st.rerun()
                 else:
-                    st.error(f"❌ {result['error']}")
+                    error_msg = result.get('error', 'Unknown error')
+                    if 'session' in error_msg.lower() or 'user' in error_msg.lower():
+                        st.error(f"⚠️ {error_msg}")
+                        time.sleep(2)
+                        auth.logout()
+                        st.switch_page("app.py")
+                        st.stop()
+                    else:
+                        st.error(f"❌ {error_msg}")
     
     with col2:
         if st.button("Cancel", use_container_width=True):
@@ -1693,163 +1680,6 @@ def show_dual_uom_metric(label: str,
         st.caption(f"= {format_number(selling_qty)} {selling_uom}")
     else:
         st.metric(label, f"{format_number(standard_qty)} {standard_uom}")
-
-def format_supply_info_dual_uom(supply, source_type, oc):
-    """Format supply information with actual availability display"""
-    if source_type == 'INVENTORY':
-        info = f"Batch {supply['batch_number']} - Exp: {format_date(supply['expiry_date'])}"
-    elif source_type == 'PENDING_CAN':
-        info = f"{supply['arrival_note_number']} - Arr: {format_date(supply['arrival_date'])}"
-    elif source_type == 'PENDING_PO':
-        info = f"{supply['po_number']} - ETD: {format_date(supply['etd'])}"
-    else:
-        info = f"{supply['from_warehouse']} → {supply['to_warehouse']}"
-    
-    # Get quantities
-    total_qty = supply.get('total_quantity', supply.get('available_quantity', 0))
-    committed_qty = supply.get('committed_quantity', 0)
-    available_qty = supply.get('available_quantity', total_qty - committed_qty)
-    standard_uom = supply.get('uom', 'pcs')
-    
-    # Format quantity with committed info
-    if committed_qty > 0:
-        qty_str = f"Total: {format_number(total_qty)} | Committed: {format_number(committed_qty)} | Available: {format_number(available_qty)} {standard_uom}"
-    else:
-        qty_str = f"Available: {format_number(available_qty)} {standard_uom}"
-    
-    # Add selling UOM if different
-    if available_qty > 0 and uom_converter.needs_conversion(oc.get('uom_conversion', '1')):
-        qty_selling = uom_converter.convert_quantity(
-            available_qty,
-            'standard',
-            'selling',
-            oc.get('uom_conversion', '1')
-        )
-        selling_uom = oc.get('selling_uom', 'pcs')
-        qty_str += f" (= {format_number(qty_selling)} {selling_uom})"
-    
-    return f"{info} - {qty_str}"
-
-def show_allocation_summary_dual_uom(oc, total_selected_standard, selected_supplies, use_soft):
-    """Show allocation summary with dual UOM display"""
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        standard_uom = oc.get('standard_uom', 'pcs')
-        
-        if uom_converter.needs_conversion(oc.get('uom_conversion', '1')):
-            total_selected_selling = uom_converter.convert_quantity(
-                total_selected_standard,
-                'standard',
-                'selling',
-                oc.get('uom_conversion', '1')
-            )
-            selling_uom = oc.get('selling_uom', 'pcs')
-            
-            st.metric(
-                "Total Selected", 
-                f"{format_number(total_selected_standard)} {standard_uom}"
-            )
-            st.caption(f"= {format_number(total_selected_selling)} {selling_uom}")
-        else:
-            st.metric(
-                "Total Selected", 
-                f"{format_number(total_selected_standard)} {standard_uom}"
-            )
-    
-    with col2:
-        pending_standard = oc.get('pending_standard_delivery_quantity', oc['pending_quantity'])
-        coverage = (total_selected_standard / pending_standard * 100) if pending_standard > 0 else 0
-        st.metric("Coverage", format_percentage(coverage))
-    
-    # Over-allocation warning
-    if total_selected_standard > pending_standard:
-        over_qty_standard = total_selected_standard - pending_standard
-        over_pct = (over_qty_standard / pending_standard * 100)
-        max_allowed = pending_standard * 1.1
-        
-        if total_selected_standard > max_allowed:
-            if uom_converter.needs_conversion(oc.get('uom_conversion', '1')):
-                over_qty_selling = uom_converter.convert_quantity(
-                    over_qty_standard,
-                    'standard',
-                    'selling',
-                    oc.get('uom_conversion', '1')
-                )
-                st.error(
-                    f"⚡ Over-allocating by {format_number(over_qty_standard)} {oc.get('standard_uom')} "
-                    f"(= {format_number(over_qty_selling)} {oc.get('selling_uom')}) - "
-                    f"{format_percentage(over_pct)}! Maximum allowed is 100%."
-                )
-            else:
-                st.error(
-                    f"⚡ Over-allocating by {format_number(over_qty_standard)} {oc.get('standard_uom')} "
-                    f"({format_percentage(over_pct)})! Maximum allowed is 100%."
-                )
-    
-    # Additional fields
-    allocated_etd = st.date_input("Allocated ETD", value=oc['etd'])
-    notes = st.text_area("Notes (optional)")
-    
-    # Action buttons
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        if st.button("💾 Save Allocation", type="primary", use_container_width=True, disabled=total_selected_standard == 0):
-            # Validate allocation
-            errors = validator.validate_create_allocation(
-                selected_supplies,
-                oc,
-                'SOFT' if use_soft else 'HARD',
-                st.session_state.user['role']
-            )
-            
-            if errors:
-                for error in errors:
-                    st.error(f"❌ {error}")
-            else:
-                # Save allocation
-                result = allocation_service.create_allocation(
-                    oc_detail_id=oc['ocd_id'],
-                    allocations=selected_supplies,
-                    mode='SOFT' if use_soft else 'HARD',
-                    etd=allocated_etd,
-                    notes=notes,
-                    user_id=st.session_state.user['id']
-                )
-                
-                if result['success']:
-                    standard_uom = oc.get('standard_uom', 'pcs')
-                    success_msg = f"✅ Allocation Successful\nAllocated: {format_number(total_selected_standard)} {standard_uom}"
-                    
-                    if uom_converter.needs_conversion(oc.get('uom_conversion', '1')):
-                        total_selected_selling = uom_converter.convert_quantity(
-                            total_selected_standard,
-                            'standard',
-                            'selling',
-                            oc.get('uom_conversion', '1')
-                        )
-                        selling_uom = oc.get('selling_uom', 'pcs')
-                        success_msg += f" (= {format_number(total_selected_selling)} {selling_uom})"
-                    
-                    success_msg += f" to {oc['oc_number']}\nAllocation Number: {result['allocation_number']}"
-                    
-                    st.success(success_msg)
-                    st.balloons()
-                    
-                    time.sleep(2)
-                    st.session_state.modals['allocation'] = False
-                    st.session_state.selections['oc_for_allocation'] = None
-                    st.cache_data.clear()
-                    st.rerun()
-                else:
-                    st.error(f"❌ {result['error']}")
-    
-    with col2:
-        if st.button("Cancel", use_container_width=True):
-            st.session_state.modals['allocation'] = False
-            st.session_state.selections['oc_for_allocation'] = None
-            st.rerun()
 
 # ==================== ALLOCATION HISTORY MODAL ====================
 @st.dialog("Allocation History", width="large")
@@ -1977,7 +1807,6 @@ def show_allocation_summary_metrics(oc_info):
             st.metric("Coverage", "0%")
             st.caption("⚫ Not allocated - Urgent action needed")
 
-
 def show_allocation_history_item_dual_uom(alloc, oc_info):
     """Show single allocation history item with tooltip"""
     with st.container():
@@ -2021,22 +1850,6 @@ def show_allocation_header_with_tooltip(alloc, oc_info):
             f"{status_color} **{alloc['allocation_number']}**",
             help=tooltip
         )
-    with col2:
-        st.caption(f"Mode: {format_allocation_mode(alloc['allocation_mode'])}")
-    with col3:
-        st.caption(f"Status: {alloc['status']}")
-
-def show_allocation_header(alloc):
-    """Show allocation header"""
-    status_color = {
-        'ALLOCATED': '🟢',
-        'DRAFT': '🟡',
-        'CANCELLED': '🔴'
-    }.get(alloc['status'], '⚪')
-    
-    col1, col2, col3 = st.columns([2, 1, 1])
-    with col1:
-        st.markdown(f"{status_color} **{alloc['allocation_number']}**")
     with col2:
         st.caption(f"Mode: {format_allocation_mode(alloc['allocation_mode'])}")
     with col3:
@@ -2095,7 +1908,6 @@ def show_allocation_quantities_dual_uom(alloc, oc_info):
             st.caption(f"= {format_number(cancelled_sell)} {selling_uom}")
         else:
             st.metric("Cancelled", f"{format_number(cancelled_std)} {standard_uom}")
-
 
 def show_allocation_info(alloc):
     """Show allocation additional info"""
@@ -2297,7 +2109,7 @@ def show_delivery_details(alloc):
 # ==================== UPDATE ETD MODAL ====================
 @st.dialog("Update Allocated ETD", width="medium")
 def show_update_etd_modal():
-    """Modal for updating allocated ETD"""
+    """Modal for updating allocated ETD with user validation"""
     allocation = st.session_state.selections['allocation_for_update']
     
     if not allocation:
@@ -2307,6 +2119,15 @@ def show_update_etd_modal():
             st.session_state.selections['allocation_for_update'] = None
             st.rerun()
         return
+    
+    # Validate user session
+    user_id = st.session_state.user.get('id')
+    if not user_id:
+        st.error("⚠️ Session error. Please login again.")
+        time.sleep(2)
+        auth.logout()
+        st.switch_page("app.py")
+        st.stop()
     
     st.markdown(f"### Update ETD for {allocation['allocation_number']}")
     
@@ -2360,7 +2181,7 @@ def show_update_etd_modal():
             result = allocation_service.update_allocation_etd(
                 allocation['allocation_detail_id'],
                 new_etd,
-                st.session_state.user['id']
+                user_id  # Using validated user_id
             )
             
             if result['success']:
@@ -2374,7 +2195,15 @@ def show_update_etd_modal():
                 st.cache_data.clear()
                 st.rerun()
             else:
-                st.error(f"❌ {result['error']}")
+                error_msg = result.get('error', 'Unknown error')
+                if 'session' in error_msg.lower() or 'user' in error_msg.lower():
+                    st.error(f"⚠️ {error_msg}")
+                    time.sleep(2)
+                    auth.logout()
+                    st.switch_page("app.py")
+                    st.stop()
+                else:
+                    st.error(f"❌ {error_msg}")
     
     with col2:
         if st.button("Close"):
@@ -2385,7 +2214,7 @@ def show_update_etd_modal():
 # ==================== CANCEL ALLOCATION MODAL ====================
 @st.dialog("Cancel Allocation", width="medium")
 def show_cancel_allocation_modal():
-    """Modal for cancelling allocation with proper error handling"""
+    """Modal for cancelling allocation with user validation"""
     
     # Get allocation from session state
     allocation = st.session_state.selections.get('allocation_for_cancel')
@@ -2398,6 +2227,15 @@ def show_cancel_allocation_modal():
             st.session_state.selections['allocation_for_cancel'] = None
             st.rerun()
         return
+    
+    # Validate user session
+    user_id = st.session_state.user.get('id')
+    if not user_id:
+        st.error("⚠️ Session error. Please login again.")
+        time.sleep(2)
+        auth.logout()
+        st.switch_page("app.py")
+        st.stop()
     
     # Display header
     st.markdown(f"### Cancel Allocation {allocation.get('allocation_number', '')}")
@@ -2540,13 +2378,13 @@ def show_cancel_allocation_modal():
             saved_cancel_qty = cancel_qty
             
             try:
-                # Execute cancellation
+                # Execute cancellation with validated user_id
                 result = allocation_service.cancel_allocation(
                     allocation_detail_id=allocation.get('allocation_detail_id'),
                     cancelled_qty=cancel_qty,
                     reason=reason,
                     reason_category=reason_category,
-                    user_id=st.session_state.user.get('id', 1)
+                    user_id=user_id  # Using validated user_id
                 )
                 
                 if result['success']:
@@ -2596,7 +2434,14 @@ def show_cancel_allocation_modal():
                 else:
                     # Display error message
                     error_msg = result.get('error', 'Unknown error occurred')
-                    st.error(f"❌ {error_msg}")
+                    if 'session' in error_msg.lower() or 'user' in error_msg.lower():
+                        st.error(f"⚠️ {error_msg}")
+                        time.sleep(2)
+                        auth.logout()
+                        st.switch_page("app.py")
+                        st.stop()
+                    else:
+                        st.error(f"❌ {error_msg}")
                     
                     # Log technical error if available
                     if result.get('technical_error'):
@@ -2621,7 +2466,7 @@ def show_cancel_allocation_modal():
 # ==================== REVERSE CANCELLATION MODAL ====================
 @st.dialog("Reverse Cancellation", width="medium")
 def show_reverse_cancellation_modal():
-    """Modal for reversing a cancellation"""
+    """Modal for reversing a cancellation with user validation"""
     cancellation = st.session_state.selections['cancellation_for_reverse']
     
     if not cancellation:
@@ -2631,6 +2476,15 @@ def show_reverse_cancellation_modal():
             st.session_state.selections['cancellation_for_reverse'] = None
             st.rerun()
         return
+    
+    # Validate user session
+    user_id = st.session_state.user.get('id')
+    if not user_id:
+        st.error("⚠️ Session error. Please login again.")
+        time.sleep(2)
+        auth.logout()
+        st.switch_page("app.py")
+        st.stop()
     
     st.markdown("### Reverse Cancellation")
     
@@ -2681,7 +2535,7 @@ def show_reverse_cancellation_modal():
             result = allocation_service.reverse_cancellation(
                 cancellation['cancellation_id'],
                 reversal_reason,
-                st.session_state.user['id']
+                user_id  # Using validated user_id
             )
             
             if result['success']:
@@ -2692,7 +2546,15 @@ def show_reverse_cancellation_modal():
                 st.cache_data.clear()
                 st.rerun()
             else:
-                st.error(f"❌ {result['error']}")
+                error_msg = result.get('error', 'Unknown error')
+                if 'session' in error_msg.lower() or 'user' in error_msg.lower():
+                    st.error(f"⚠️ {error_msg}")
+                    time.sleep(2)
+                    auth.logout()
+                    st.switch_page("app.py")
+                    st.stop()
+                else:
+                    st.error(f"❌ {error_msg}")
     
     with col2:
         if st.button("Close"):
@@ -2711,16 +2573,28 @@ def return_to_history_if_context():
 # ==================== MAIN EXECUTION ====================
 def main():
     """Main function to run the allocation planning page"""
-    # Safety checks
-    if st.session_state.modals['history'] and not st.session_state.selections.get('oc_for_history'):
+    
+    # Validate user session at the start
+    if not auth.check_session():
+        st.warning("⚠️ Your session has expired. Please login again.")
+        time.sleep(2)
+        st.switch_page("app.py")
+        st.stop()
+    
+    # Ensure user data is properly loaded
+    if not st.session_state.get('user', {}).get('id'):
+        init_session_state()
+    
+    # Safety checks for modals
+    if st.session_state.modals.get('history') and not st.session_state.selections.get('oc_for_history'):
         st.session_state.modals['history'] = False
-    if st.session_state.modals['allocation'] and not st.session_state.selections.get('oc_for_allocation'):
+    if st.session_state.modals.get('allocation') and not st.session_state.selections.get('oc_for_allocation'):
         st.session_state.modals['allocation'] = False
-    if st.session_state.modals['cancel'] and not st.session_state.selections.get('allocation_for_cancel'):
+    if st.session_state.modals.get('cancel') and not st.session_state.selections.get('allocation_for_cancel'):
         st.session_state.modals['cancel'] = False
-    if st.session_state.modals['update_etd'] and not st.session_state.selections.get('allocation_for_update'):
+    if st.session_state.modals.get('update_etd') and not st.session_state.selections.get('allocation_for_update'):
         st.session_state.modals['update_etd'] = False
-    if st.session_state.modals['reverse'] and not st.session_state.selections.get('cancellation_for_reverse'):
+    if st.session_state.modals.get('reverse') and not st.session_state.selections.get('cancellation_for_reverse'):
         st.session_state.modals['reverse'] = False
     
     show_header()

@@ -1,6 +1,6 @@
 """
-Allocation Service for Business Logic - Clean Refactored Version
-Core business logic for allocation operations with proper type handling
+Allocation Service for Business Logic - Complete Fixed Version
+Core business logic for allocation operations with proper user validation
 """
 import logging
 from datetime import datetime
@@ -50,9 +50,13 @@ class AllocationNotFoundError(AllocationError):
     """Raised when allocation is not found"""
     pass
 
+class InvalidUserError(AllocationError):
+    """Raised when user validation fails"""
+    pass
+
 # ==================== ALLOCATION SERVICE ====================
 class AllocationService:
-    """Service for handling allocation business logic with proper type conversion"""
+    """Service for handling allocation business logic with proper user validation"""
     
     def __init__(self):
         self.engine = get_db_engine()
@@ -153,13 +157,74 @@ class AllocationService:
                 self._current_transaction = None
                 conn.close()
     
+    # ==================== USER VALIDATION HELPER ====================
+    def _validate_user_id(self, conn, user_id: int) -> Tuple[bool, Optional[str], Optional[Dict]]:
+        """
+        Validate that user exists and is active
+        
+        Returns:
+            Tuple of (is_valid, error_message, user_info)
+        """
+        if not user_id:
+            return False, "User ID is required for this operation", None
+        
+        try:
+            query = text("""
+                SELECT 
+                    u.id,
+                    u.username,
+                    u.role,
+                    u.is_active,
+                    u.email,
+                    CONCAT(COALESCE(e.first_name, u.username), ' ', COALESCE(e.last_name, '')) as full_name
+                FROM users u
+                LEFT JOIN employees e ON u.employee_id = e.id
+                WHERE u.id = :user_id
+                AND u.delete_flag = 0
+            """)
+            
+            result = conn.execute(query, {'user_id': user_id}).fetchone()
+            
+            if not result:
+                logger.error(f"User ID {user_id} not found in database")
+                return False, f"User account not found. Please login again.", None
+            
+            user_data = dict(result._mapping)
+            
+            if not user_data['is_active']:
+                logger.error(f"User ID {user_id} ({user_data['username']}) is inactive")
+                return False, "Your account is inactive. Please contact an administrator.", None
+            
+            logger.debug(f"User validated: {user_data['username']} (ID: {user_id}, Role: {user_data['role']})")
+            return True, None, user_data
+            
+        except Exception as e:
+            logger.error(f"Error validating user {user_id}: {e}")
+            return False, "Unable to validate user session. Please login again.", None
+    
     # ==================== CREATE ALLOCATION ====================
     def create_allocation(self, oc_detail_id: int, allocations: List[Dict], 
                          mode: str, etd: datetime, notes: str, 
                          user_id: int) -> Dict[str, Any]:
-        """Create new allocation with proper type handling"""
+        """Create new allocation with proper user validation"""
         try:
+            # Early validation of user_id
+            if not user_id:
+                logger.error("create_allocation called without user_id")
+                return {
+                    'success': False,
+                    'error': "Session error. Please login again."
+                }
+            
             with self.db_transaction() as conn:
+                # ADDED: Validate user exists and is active
+                user_valid, user_error, user_info = self._validate_user_id(conn, user_id)
+                if not user_valid:
+                    return {
+                        'success': False,
+                        'error': user_error
+                    }
+                
                 # Get OC detail information
                 oc_info = self._get_oc_detail_info(conn, oc_detail_id)
                 if not oc_info:
@@ -176,12 +241,12 @@ class AllocationService:
                 # Generate allocation number
                 allocation_number = self._generate_allocation_number(conn)
                 
-                # Create allocation context
+                # Create allocation context with user info
                 allocation_context = self._create_allocation_context(
-                    oc_info, allocations, mode, user_id
+                    oc_info, allocations, mode, user_id, user_info
                 )
                 
-                # Create allocation plan
+                # Create allocation plan with validated user_id
                 plan_query = text("""
                     INSERT INTO allocation_plans 
                     (allocation_number, allocation_date, creator_id, notes, allocation_context)
@@ -190,12 +255,18 @@ class AllocationService:
                 
                 result = conn.execute(plan_query, {
                     'allocation_number': allocation_number,
-                    'creator_id': user_id,
+                    'creator_id': user_id,  # Validated user_id
                     'notes': notes,
                     'allocation_context': json.dumps(allocation_context)
                 })
                 
                 allocation_plan_id = result.lastrowid
+                
+                # Log allocation creation with user info
+                logger.info(
+                    f"User {user_info['username']} (ID: {user_id}, Role: {user_info['role']}) "
+                    f"created allocation plan {allocation_number} (Plan ID: {allocation_plan_id})"
+                )
                 
                 # Create allocation details
                 detail_ids = []
@@ -212,8 +283,8 @@ class AllocationService:
                 st.cache_data.clear()
                 
                 logger.info(
-                    f"Created allocation {allocation_number} with {len(allocations)} items, "
-                    f"total qty: {self._to_float(total_allocated):.0f}"
+                    f"Successfully created allocation {allocation_number} by user {user_info['username']} "
+                    f"with {len(allocations)} items, total qty: {self._to_float(total_allocated):.0f}"
                 )
                 
                 return {
@@ -221,14 +292,24 @@ class AllocationService:
                     'allocation_number': allocation_number,
                     'allocation_plan_id': allocation_plan_id,
                     'detail_ids': detail_ids,
-                    'total_allocated': self._to_float(total_allocated)
+                    'total_allocated': self._to_float(total_allocated),
+                    'creator_id': user_id,
+                    'creator_username': user_info['username']
                 }
                 
         except AllocationError as e:
-            logger.warning(f"Allocation validation error: {e}")
+            logger.warning(f"Allocation validation error for user {user_id}: {e}")
             return {'success': False, 'error': str(e)}
         except Exception as e:
-            logger.error(f"Unexpected error creating allocation: {e}", exc_info=True)
+            # Check for foreign key constraint violation
+            if "foreign key constraint" in str(e).lower() and "creator_id" in str(e).lower():
+                logger.error(f"Foreign key violation for creator_id {user_id}: {e}")
+                return {
+                    'success': False,
+                    'error': "Session error. Your user account may have been deactivated. Please login again."
+                }
+            
+            logger.error(f"Unexpected error creating allocation for user {user_id}: {e}", exc_info=True)
             return {
                 'success': False,
                 'error': "Unable to create allocation. Please try again or contact support.",
@@ -238,9 +319,25 @@ class AllocationService:
     # ==================== CANCEL ALLOCATION ====================
     def cancel_allocation(self, allocation_detail_id: int, cancelled_qty: float,
                          reason: str, reason_category: str, user_id: int) -> Dict[str, Any]:
-        """Cancel allocation with proper type conversion"""
+        """Cancel allocation with proper user validation"""
         try:
+            # Early validation of user_id
+            if not user_id:
+                logger.error("cancel_allocation called without user_id")
+                return {
+                    'success': False,
+                    'error': "Session error. Please login again."
+                }
+            
             with self.db_transaction() as conn:
+                # ADDED: Validate user exists and is active
+                user_valid, user_error, user_info = self._validate_user_id(conn, user_id)
+                if not user_valid:
+                    return {
+                        'success': False,
+                        'error': user_error
+                    }
+                
                 # Convert input to Decimal for database operations
                 cancelled_qty_decimal = self._to_decimal(cancelled_qty)
                 
@@ -270,7 +367,7 @@ class AllocationService:
                 # Calculate remaining after cancellation
                 remaining_pending = pending_qty_decimal - cancelled_qty_decimal
                 
-                # Insert cancellation record
+                # Insert cancellation record with validated user_id
                 cancel_query = text("""
                     INSERT INTO allocation_cancellations (
                         allocation_detail_id, allocation_plan_id, cancelled_qty,
@@ -287,7 +384,7 @@ class AllocationService:
                     'cancelled_qty': cancelled_qty_decimal,
                     'reason': reason,
                     'reason_category': reason_category,
-                    'cancelled_by_user_id': user_id
+                    'cancelled_by_user_id': user_id  # Validated user_id
                 })
                 
                 cancellation_id = result.lastrowid
@@ -296,7 +393,8 @@ class AllocationService:
                 st.cache_data.clear()
                 
                 logger.info(
-                    f"Cancelled {self._to_float(cancelled_qty_decimal):.0f} from allocation detail {allocation_detail_id}. "
+                    f"User {user_info['username']} (ID: {user_id}) cancelled "
+                    f"{self._to_float(cancelled_qty_decimal):.0f} from allocation detail {allocation_detail_id}. "
                     f"Delivered: {self._to_float(delivered_qty_decimal):.0f}, "
                     f"Remaining pending: {self._to_float(remaining_pending):.0f}"
                 )
@@ -306,14 +404,22 @@ class AllocationService:
                     'cancellation_id': cancellation_id,
                     'cancelled_qty': self._to_float(cancelled_qty_decimal),
                     'remaining_pending_qty': self._to_float(remaining_pending),
-                    'delivered_qty': self._to_float(delivered_qty_decimal)
+                    'delivered_qty': self._to_float(delivered_qty_decimal),
+                    'cancelled_by': user_info['username']
                 }
                 
         except AllocationError as e:
-            logger.warning(f"Allocation cancellation error: {e}")
+            logger.warning(f"Allocation cancellation error for user {user_id}: {e}")
             return {'success': False, 'error': str(e)}
         except Exception as e:
-            logger.error(f"Unexpected error cancelling allocation: {e}", exc_info=True)
+            if "foreign key constraint" in str(e).lower() and "cancelled_by_user_id" in str(e).lower():
+                logger.error(f"Foreign key violation for cancelled_by_user_id {user_id}: {e}")
+                return {
+                    'success': False,
+                    'error': "Session error. Your user account may have been deactivated. Please login again."
+                }
+            
+            logger.error(f"Unexpected error cancelling allocation for user {user_id}: {e}", exc_info=True)
             return {
                 'success': False,
                 'error': "Unable to cancel allocation. Please try again or contact support.",
@@ -323,9 +429,25 @@ class AllocationService:
     # ==================== UPDATE ALLOCATION ETD ====================
     def update_allocation_etd(self, allocation_detail_id: int, new_etd: datetime,
                              user_id: int) -> Dict[str, Any]:
-        """Update allocated ETD with delivery check"""
+        """Update allocated ETD with user validation"""
         try:
+            # Early validation of user_id
+            if not user_id:
+                logger.error("update_allocation_etd called without user_id")
+                return {
+                    'success': False,
+                    'error': "Session error. Please login again."
+                }
+            
             with self.db_transaction() as conn:
+                # ADDED: Validate user exists and is active
+                user_valid, user_error, user_info = self._validate_user_id(conn, user_id)
+                if not user_valid:
+                    return {
+                        'success': False,
+                        'error': user_error
+                    }
+                
                 # Check allocation details
                 detail = self._get_allocation_detail_for_update(conn, allocation_detail_id)
                 
@@ -364,7 +486,8 @@ class AllocationService:
                 update_count = (detail.get('etd_update_count', 0) or 0) + 1
                 
                 logger.info(
-                    f"Updated ETD for allocation detail {allocation_detail_id} "
+                    f"User {user_info['username']} (ID: {user_id}) updated ETD "
+                    f"for allocation detail {allocation_detail_id} "
                     f"from {old_etd} to {new_etd}. Update #{update_count}"
                 )
                 
@@ -372,14 +495,15 @@ class AllocationService:
                     'success': True,
                     'new_etd': new_etd,
                     'update_count': update_count,
-                    'pending_qty_affected': self._to_float(pending_qty)
+                    'pending_qty_affected': self._to_float(pending_qty),
+                    'updated_by': user_info['username']
                 }
                 
         except AllocationError as e:
-            logger.warning(f"ETD update error: {e}")
+            logger.warning(f"ETD update error for user {user_id}: {e}")
             return {'success': False, 'error': str(e)}
         except Exception as e:
-            logger.error(f"Unexpected error updating ETD: {e}", exc_info=True)
+            logger.error(f"Unexpected error updating ETD for user {user_id}: {e}", exc_info=True)
             return {
                 'success': False,
                 'error': "Unable to update ETD. Please try again or contact support.",
@@ -389,9 +513,25 @@ class AllocationService:
     # ==================== REVERSE CANCELLATION ====================
     def reverse_cancellation(self, cancellation_id: int, reversal_reason: str,
                            user_id: int) -> Dict[str, Any]:
-        """Reverse a cancellation"""
+        """Reverse a cancellation with user validation"""
         try:
+            # Early validation of user_id
+            if not user_id:
+                logger.error("reverse_cancellation called without user_id")
+                return {
+                    'success': False,
+                    'error': "Session error. Please login again."
+                }
+            
             with self.db_transaction() as conn:
+                # ADDED: Validate user exists and is active
+                user_valid, user_error, user_info = self._validate_user_id(conn, user_id)
+                if not user_valid:
+                    return {
+                        'success': False,
+                        'error': user_error
+                    }
+                
                 # Check if cancellation exists and is active
                 check_query = text("""
                     SELECT 
@@ -414,7 +554,7 @@ class AllocationService:
                 
                 cancelled_qty = self._to_decimal(result._mapping['cancelled_qty'])
                 
-                # Update cancellation status
+                # Update cancellation status with validated user_id
                 update_query = text("""
                     UPDATE allocation_cancellations 
                     SET 
@@ -426,7 +566,7 @@ class AllocationService:
                 """)
                 
                 conn.execute(update_query, {
-                    'user_id': user_id,
+                    'user_id': user_id,  # Validated user_id
                     'reason': reversal_reason,
                     'cancellation_id': cancellation_id
                 })
@@ -435,20 +575,28 @@ class AllocationService:
                 st.cache_data.clear()
                 
                 logger.info(
-                    f"Reversed cancellation {cancellation_id}. "
+                    f"User {user_info['username']} (ID: {user_id}) reversed cancellation {cancellation_id}. "
                     f"Restored quantity: {self._to_float(cancelled_qty):.0f}"
                 )
                 
                 return {
                     'success': True,
-                    'restored_qty': self._to_float(cancelled_qty)
+                    'restored_qty': self._to_float(cancelled_qty),
+                    'reversed_by': user_info['username']
                 }
                 
         except AllocationError as e:
-            logger.warning(f"Cancellation reversal error: {e}")
+            logger.warning(f"Cancellation reversal error for user {user_id}: {e}")
             return {'success': False, 'error': str(e)}
         except Exception as e:
-            logger.error(f"Unexpected error reversing cancellation: {e}", exc_info=True)
+            if "foreign key constraint" in str(e).lower() and "reversed_by_user_id" in str(e).lower():
+                logger.error(f"Foreign key violation for reversed_by_user_id {user_id}: {e}")
+                return {
+                    'success': False,
+                    'error': "Session error. Your user account may have been deactivated. Please login again."
+                }
+            
+            logger.error(f"Unexpected error reversing cancellation for user {user_id}: {e}", exc_info=True)
             return {
                 'success': False,
                 'error': "Unable to reverse cancellation. Please try again or contact support.",
@@ -606,8 +754,17 @@ class AllocationService:
         return None
     
     def _create_allocation_context(self, oc_info: Dict, allocations: List[Dict],
-                                  mode: str, user_id: int) -> Dict:
-        """Create allocation context for audit trail"""
+                                  mode: str, user_id: int, user_info: Dict = None) -> Dict:
+        """Create allocation context with validated user info for audit trail"""
+        # Use provided user_info or set defaults
+        if not user_info:
+            user_info = {
+                'username': 'Unknown',
+                'full_name': 'Unknown',
+                'role': 'Unknown',
+                'email': ''
+            }
+        
         return {
             'oc_detail': {
                 'id': oc_info['ocd_id'],
@@ -633,7 +790,13 @@ class AllocationService:
                 } for alloc in allocations
             ],
             'mode': mode,
-            'created_by': user_id,
+            'created_by': {
+                'user_id': user_id,
+                'username': user_info['username'],
+                'full_name': user_info['full_name'],
+                'role': user_info['role'],
+                'email': user_info.get('email', '')
+            },
             'created_at': datetime.now().isoformat()
         }
     
