@@ -1,11 +1,10 @@
 """
-Allocation Planning System - Complete Fixed Version
+Allocation Planning System - Refactored Main Page
 Product-centric view with proper user session management
 """
 import streamlit as st
 import pandas as pd
-from datetime import datetime, timedelta
-from typing import List, Dict, Any, Optional
+from datetime import datetime
 import logging
 import time
 from sqlalchemy import text
@@ -13,12 +12,24 @@ from sqlalchemy import text
 # Import utilities
 from utils.auth import AuthManager
 from utils.config import config
-from utils.allocation.data_service import AllocationDataService
+
+# Import data repositories
+from utils.allocation.product_data import ProductData
+from utils.allocation.supply_data import SupplyData
+from utils.allocation.allocation_data import AllocationData
+
+# Import modals
+from utils.allocation.modal_allocation import show_allocation_modal
+from utils.allocation.modal_history import show_allocation_history_modal
+from utils.allocation.modal_cancel import show_cancel_allocation_modal
+from utils.allocation.modal_update_etd import show_update_etd_modal
+from utils.allocation.modal_reverse import show_reverse_cancellation_modal
+
+# Import core utilities
 from utils.allocation.allocation_service import AllocationService
 from utils.allocation.formatters import (
     format_number, format_date, 
-    format_percentage, format_allocation_mode,
-    format_reason_category
+    format_percentage, format_allocation_mode
 )
 from utils.allocation.validators import AllocationValidator
 from utils.allocation.uom_converter import UOMConverter
@@ -36,7 +47,9 @@ st.set_page_config(
 
 # Initialize services
 auth = AuthManager()
-data_service = AllocationDataService()
+product_data = ProductData()
+supply_data = SupplyData()
+allocation_data = AllocationData()
 allocation_service = AllocationService()
 validator = AllocationValidator()
 uom_converter = UOMConverter()
@@ -87,7 +100,7 @@ def init_session_state():
     if 'modals' not in st.session_state:
         st.session_state.modals = DEFAULT_SESSION_STATE['modals'].copy()
     
-    # FIXED: Properly handle user session with validation
+    # Handle user session with validation
     if 'user' not in st.session_state:
         st.session_state.user = {}
     
@@ -95,7 +108,6 @@ def init_session_state():
     user_id = auth.get_current_user_id()
     
     if user_id is None:
-        # No valid user session - redirect to login
         logger.error("No valid user session found, redirecting to login")
         st.error("⚠️ Your session has expired. Please login again.")
         time.sleep(2)
@@ -141,7 +153,7 @@ def show_header():
             auth.logout()
             st.switch_page("app.py")
 
-    # Show current user info with ID for debugging
+    # Show current user info
     user_display = auth.get_user_display_name()
     user_role = st.session_state.user.get('role', 'viewer')
     user_id = st.session_state.user.get('id', 'Unknown')
@@ -164,7 +176,7 @@ def get_supply_status_indicator(total_demand, total_supply):
 def show_metrics_row():
     """Display key metrics in a row"""
     try:
-        metrics = data_service.get_dashboard_metrics_product_view()
+        metrics = allocation_data.get_dashboard_metrics_product_view()
         
         col1, col2, col3, col4, col5, col6 = st.columns(6)
         
@@ -244,7 +256,6 @@ def show_search_bar():
             with clear_col:
                 if search_query:
                     if st.button("✖", key="clear_search", help="Clear search"):
-                        # Set a flag to clear the search on rerun
                         st.session_state.clear_search_flag = True
                         st.session_state.filters.pop('search', None)
                         st.rerun()
@@ -260,21 +271,16 @@ def show_search_bar():
 
 def show_search_suggestions(search_query):
     """Display search suggestions"""
-    suggestions = data_service.get_search_suggestions(search_query)
+    suggestions = product_data.get_search_suggestions(search_query)
     
     has_suggestions = any(suggestions.values())
     
     if has_suggestions:
         with st.container():
-            # Display suggestions by category
             if suggestions['products']:
                 st.markdown("**📦 Products**")
                 for idx, product in enumerate(suggestions['products'][:5]):
-                    if st.button(
-                        product, 
-                        key=f"prod_suggest_{idx}",
-                        use_container_width=True
-                    ):
+                    if st.button(product, key=f"prod_suggest_{idx}", use_container_width=True):
                         product_name = product.split(" | ")[0]
                         st.session_state.search_input = product_name
                         reset_all_modals()
@@ -283,11 +289,7 @@ def show_search_suggestions(search_query):
             if suggestions['brands']:
                 st.markdown("**🏷️ Brands**")
                 for idx, brand in enumerate(suggestions['brands'][:5]):
-                    if st.button(
-                        brand,
-                        key=f"brand_suggest_{idx}",
-                        use_container_width=True
-                    ):
+                    if st.button(brand, key=f"brand_suggest_{idx}", use_container_width=True):
                         st.session_state.search_input = brand
                         reset_all_modals()
                         st.rerun()
@@ -295,11 +297,7 @@ def show_search_suggestions(search_query):
             if suggestions['customers']:
                 st.markdown("**🏢 Customers**")
                 for idx, customer in enumerate(suggestions['customers'][:5]):
-                    if st.button(
-                        customer,
-                        key=f"cust_suggest_{idx}",
-                        use_container_width=True
-                    ):
+                    if st.button(customer, key=f"cust_suggest_{idx}", use_container_width=True):
                         st.session_state.search_input = customer
                         reset_all_modals()
                         st.rerun()
@@ -307,16 +305,11 @@ def show_search_suggestions(search_query):
             if suggestions['oc_numbers']:
                 st.markdown("**📄 OC Numbers**")
                 for idx, oc in enumerate(suggestions['oc_numbers'][:5]):
-                    if st.button(
-                        oc,
-                        key=f"oc_suggest_{idx}",
-                        use_container_width=True
-                    ):
+                    if st.button(oc, key=f"oc_suggest_{idx}", use_container_width=True):
                         st.session_state.search_input = oc
                         reset_all_modals()
                         st.rerun()
 
-# ==================== QUICK FILTERS ====================
 def show_quick_filters():
     """Display quick filter buttons"""
     st.markdown("**Quick Filters:**")
@@ -376,8 +369,16 @@ def show_active_filters():
     with filter_container:
         display_filters = []
         
+        filter_labels = {
+            'supply_status': '⚠️ Low Supply',
+            'etd_urgency': '🔴 Urgent ETD',
+            'allocation_status': '⏳ Not Allocated',
+            'has_inventory': '📦 Has Inventory',
+            'over_allocated': '⚡ Over Allocated'
+        }
+        
         for key, value in active_filters:
-            filter_label = get_filter_label(key, value)
+            filter_label = filter_labels.get(key, f"{key}: {value}")
             if filter_label:
                 display_filters.append((filter_label, key))
         
@@ -389,196 +390,11 @@ def show_active_filters():
                     st.session_state.ui['page_number'] = 1
                     st.rerun()
 
-def get_filter_label(key, value):
-    """Get display label for filter"""
-    filter_labels = {
-        'supply_status': '⚠️ Low Supply',
-        'etd_urgency': '🔴 Urgent ETD',
-        'allocation_status': '⏳ Not Allocated',
-        'has_inventory': '📦 Has Inventory',
-        'over_allocated': '⚡ Over Allocated'
-    }
-    return filter_labels.get(key, f"{key}: {value}")
-
-# ==================== TOOLTIP HELPERS ====================
-def create_oc_tooltip(oc) -> str:
-    """Create unified tooltip for OC details - handles both dict and Series"""
-    tooltip_lines = []
-    
-    # Helper function to safely get value from dict or Series
-    def get_value(key, default=0):
-        try:
-            if isinstance(oc, pd.Series):
-                if key in oc.index:
-                    value = oc[key]
-                    # Handle numpy types and ensure scalar
-                    if hasattr(value, 'item'):
-                        return value.item()
-                    elif isinstance(value, pd.Series):
-                        return value.iloc[0] if len(value) > 0 else default
-                    return value
-                else:
-                    return default
-            else:
-                return oc.get(key, default)
-        except Exception:
-            return default
-    
-    # Get values with proper defaults
-    original_qty = float(get_value('original_standard_quantity', 0))
-    oc_cancelled = float(get_value('total_oc_cancelled_qty', 0))
-    effective_oc = float(get_value('standard_quantity', 0))
-    delivered = float(get_value('total_delivered_standard_quantity', 0))
-    pending = float(get_value('pending_standard_delivery_quantity', 0))
-    standard_uom = str(get_value('standard_uom', ''))
-    
-    # OC Details section
-    tooltip_lines.append("📄 OC Details")
-    tooltip_lines.append("")
-    tooltip_lines.append(f"• Original Quantity: {format_number(original_qty)} {standard_uom}")
-    if oc_cancelled > 0:
-        tooltip_lines.append(f"• OC Cancelled: {format_number(oc_cancelled)} {standard_uom}")
-    tooltip_lines.append(f"• Effective OC: {format_number(effective_oc)} {standard_uom}")
-    if delivered > 0:
-        tooltip_lines.append(f"• Delivered: {format_number(delivered)} {standard_uom}")
-    tooltip_lines.append(f"• Pending Delivery: {format_number(pending)} {standard_uom}")
-    
-    # Allocation Summary section
-    if get_value('allocation_count', 0) > 0:
-        tooltip_lines.append("")
-        tooltip_lines.append("📦 Allocation Summary")
-        tooltip_lines.append("")
-        
-        total_allocated = float(get_value('total_allocated_qty_standard', 0))
-        alloc_cancelled = float(get_value('total_allocation_cancelled_qty_standard', 0))
-        effective_allocated = float(get_value('total_effective_allocated_qty_standard', 0))
-        alloc_delivered = float(get_value('total_allocation_delivered_qty_standard', 0))
-        undelivered = float(get_value('undelivered_allocated_qty_standard', 0))
-        
-        tooltip_lines.append(f"• Total Allocated: {format_number(total_allocated)} {standard_uom}")
-        if alloc_cancelled > 0:
-            tooltip_lines.append(f"• Allocation Cancelled: {format_number(alloc_cancelled)} {standard_uom}")
-        tooltip_lines.append(f"• Effective Allocated: {format_number(effective_allocated)} {standard_uom}")
-        if alloc_delivered > 0:
-            tooltip_lines.append(f"• Delivered from Allocation: {format_number(alloc_delivered)} {standard_uom}")
-        tooltip_lines.append(f"• Undelivered: {format_number(undelivered)} {standard_uom}")
-    
-    # Status
-    status = get_oc_allocation_status(oc)
-    tooltip_lines.append("")
-    tooltip_lines.append(f"Status: {status}")
-    
-    # Join with explicit line breaks
-    return "\n".join(tooltip_lines)
-
-def create_allocation_tooltip(alloc, oc_info) -> str:
-    """Create unified tooltip for allocation details - handles both dict and Series"""
-    tooltip_lines = []
-    
-    # Helper function to safely get value
-    def get_value(obj, key, default=0):
-        try:
-            if isinstance(obj, pd.Series):
-                if key in obj.index:
-                    value = obj[key]
-                    # Handle numpy types and ensure scalar
-                    if hasattr(value, 'item'):
-                        return value.item()
-                    elif isinstance(value, pd.Series):
-                        return value.iloc[0] if len(value) > 0 else default
-                    return value
-                else:
-                    return default
-            else:
-                return obj.get(key, default)
-        except Exception:
-            return default
-    
-    # Get values
-    allocated_qty = float(get_value(alloc, 'allocated_qty', 0))
-    cancelled_qty = float(get_value(alloc, 'cancelled_qty', 0))
-    effective_qty = float(get_value(alloc, 'effective_qty', 0))
-    delivered_qty = float(get_value(alloc, 'delivered_qty', 0))
-    pending_qty = float(get_value(alloc, 'pending_qty', 0))
-    standard_uom = str(get_value(oc_info, 'standard_uom', ''))
-    
-    # Header
-    tooltip_lines.append(f"📦 Allocation {get_value(alloc, 'allocation_number', '')}")
-    tooltip_lines.append("")
-    
-    # Quantities with bullet points
-    tooltip_lines.append(f"• Allocated Quantity: {format_number(allocated_qty)} {standard_uom}")
-    if cancelled_qty > 0:
-        tooltip_lines.append(f"• Cancelled: {format_number(cancelled_qty)} {standard_uom}")
-    tooltip_lines.append(f"• Effective: {format_number(effective_qty)} {standard_uom}")
-    if delivered_qty > 0:
-        tooltip_lines.append(f"• Delivered: {format_number(delivered_qty)} {standard_uom}")
-    tooltip_lines.append(f"• Pending: {format_number(pending_qty)} {standard_uom}")
-    
-    # Metadata
-    tooltip_lines.append("")
-    tooltip_lines.append(f"• Created: {format_date(get_value(alloc, 'allocation_date'))}")
-    tooltip_lines.append(f"• By: {str(get_value(alloc, 'created_by', ''))}")
-    tooltip_lines.append(f"• Mode: {format_allocation_mode(get_value(alloc, 'allocation_mode', ''))}")
-    
-    if get_value(alloc, 'supply_source_type'):
-        tooltip_lines.append(f"• Source: {str(get_value(alloc, 'supply_source_type', ''))}")
-    
-    return "\n".join(tooltip_lines)
-
-def get_oc_allocation_status(oc) -> str:
-    """Get allocation status for OC - handles both dict and Series"""
-    # Helper function
-    def get_value(key, default=0):
-        try:
-            if isinstance(oc, pd.Series):
-                if key in oc.index:
-                    value = oc[key]
-                    # Handle numpy types and ensure scalar
-                    if hasattr(value, 'item'):
-                        return value.item()
-                    elif isinstance(value, pd.Series):
-                        return value.iloc[0] if len(value) > 0 else default
-                    return value
-                else:
-                    return default
-            else:
-                return oc.get(key, default)
-        except Exception:
-            return default
-    
-    pending = float(get_value('pending_standard_delivery_quantity', 0))
-    undelivered = float(get_value('undelivered_allocated_qty_standard', 0))
-    over_type = get_value('over_allocation_type', 'Normal')
-    
-    if over_type == 'Over-Committed':
-        return "❌ Over-Committed"
-    elif over_type == 'Pending-Over-Allocated':
-        return "⚠️ Pending Over-Allocated"
-    elif undelivered == 0:
-        return "⏳ Not Allocated"
-    elif undelivered >= pending:
-        return "✅ Fully Allocated"
-    else:
-        coverage = (undelivered / pending * 100) if pending > 0 else 0
-        return f"🟡 Partially Allocated ({coverage:.0f}%)"
-
-def get_allocation_status_color(pending: float, undelivered: float) -> str:
-    """Get color indicator based on allocation status"""
-    if undelivered > pending:
-        return "🔴"  # Over-allocated
-    elif undelivered == pending:
-        return "🟢"  # Fully allocated
-    elif undelivered > 0:
-        return "🟡"  # Partially allocated
-    else:
-        return "⚪"  # Not allocated
-
 # ==================== PRODUCT LIST ====================
 def show_product_list():
     """Display product list with demand/supply summary"""
     try:
-        products_df = data_service.get_products_with_demand_supply(
+        products_df = product_data.get_products_with_demand_supply(
             filters=st.session_state.filters,
             page=st.session_state.ui['page_number'],
             page_size=ITEMS_PER_PAGE
@@ -658,7 +474,6 @@ def show_product_row(row):
     
     # Expanded details
     if is_expanded:
-        # Safety check
         if st.session_state.modals.get('history') and not st.session_state.selections.get('oc_for_history'):
             st.session_state.modals['history'] = False
         
@@ -747,14 +562,14 @@ def show_product_details(product_row):
             show_product_supply_details(product_row['product_id'])
 
 def show_product_demand_details(product_id):
-    """Show OCs for a product with improved headers"""
-    ocs_df = data_service.get_ocs_by_product(product_id)
+    """Show OCs for a product"""
+    ocs_df = product_data.get_ocs_by_product(product_id)
     
     if ocs_df.empty:
         st.info("No pending OCs for this product")
         return
     
-    # Updated headers
+    # Headers
     header_cols = st.columns([2, 2, 1, 1.5, 1.5, 1])
     with header_cols[0]:
         st.markdown("**OC Number**")
@@ -771,53 +586,20 @@ def show_product_demand_details(product_id):
     
     # Create OC rows
     for idx, oc in ocs_df.iterrows():
-        show_oc_row_dual_uom(oc)
+        show_oc_row(oc)
 
-def show_oc_row_dual_uom(oc):
-    """Display a single OC row with improved Pending/Undelivered display"""
-    # Check for over-allocation warnings first
+def show_oc_row(oc):
+    """Display a single OC row"""
+    # Check for over-allocation warnings
     over_allocation_type = oc.get('over_allocation_type', 'Normal')
     
     if over_allocation_type == 'Over-Committed':
         over_qty = oc.get('over_committed_qty_standard', 0)
-        effective_qty = oc.get('standard_quantity', 0)
-        total_allocated = oc.get('total_allocated_qty_standard', 0)
-        cancelled_allocated = oc.get('total_allocation_cancelled_qty_standard', 0)
-        effective_allocated = total_allocated - cancelled_allocated
-        
-        if uom_converter.needs_conversion(oc.get('uom_conversion', '1')):
-            over_qty_selling = uom_converter.convert_quantity(
-                over_qty, 'standard', 'selling', oc.get('uom_conversion', '1')
-            )
-            effective_qty_selling = uom_converter.convert_quantity(
-                effective_qty, 'standard', 'selling', oc.get('uom_conversion', '1')
-            )
-            effective_allocated_selling = uom_converter.convert_quantity(
-                effective_allocated, 'standard', 'selling', oc.get('uom_conversion', '1')
-            )
-            st.error(
-                f"❌ Over-committed by {format_number(over_qty_selling)} {oc.get('selling_uom')} - "
-                f"Effective allocation ({format_number(effective_allocated_selling)} {oc.get('selling_uom')}) "
-                f"exceeds OC effective quantity ({format_number(effective_qty_selling)} {oc.get('selling_uom')})"
-            )
-        else:
-            st.error(
-                f"❌ Over-committed by {format_number(over_qty)} {oc.get('standard_uom')} - "
-                f"Effective allocation ({format_number(effective_allocated)} {oc.get('standard_uom')}) "
-                f"exceeds OC effective quantity ({format_number(effective_qty)} {oc.get('standard_uom')})"
-            )
-    
+        st.error(f"❌ Over-committed by {format_number(over_qty)} {oc.get('standard_uom')}")
     elif over_allocation_type == 'Pending-Over-Allocated':
         over_qty = oc.get('pending_over_allocated_qty_standard', 0)
-        if uom_converter.needs_conversion(oc.get('uom_conversion', '1')):
-            over_qty_selling = uom_converter.convert_quantity(
-                over_qty, 'standard', 'selling', oc.get('uom_conversion', '1')
-            )
-            st.warning(f"⚠️ Pending over-allocated by {format_number(over_qty_selling)} {oc.get('selling_uom')} - Undelivered allocation exceeds pending delivery")
-        else:
-            st.warning(f"⚠️ Pending over-allocated by {format_number(over_qty)} {oc.get('standard_uom')} - Undelivered allocation exceeds pending delivery")
+        st.warning(f"⚠️ Pending over-allocated by {format_number(over_qty)} {oc.get('standard_uom')}")
     
-    # Row display
     cols = st.columns([2, 2, 1, 1.5, 1.5, 1])
     
     with cols[0]:
@@ -829,43 +611,58 @@ def show_oc_row_dual_uom(oc):
     with cols[2]:
         show_etd_with_urgency(oc['etd'])
     
-    with cols[3]:  # Pending Delivery
-        show_pending_delivery_with_tooltip(oc)
+    with cols[3]:
+        pending_std = float(oc.get('pending_standard_delivery_quantity', 0))
+        st.markdown(f"**{format_number(pending_std)} {oc.get('standard_uom')}**")
+        
+        if uom_converter.needs_conversion(oc.get('uom_conversion', '1')):
+            pending_selling = float(oc.get('pending_quantity', pending_std))
+            st.caption(f"= {format_number(pending_selling)} {oc.get('selling_uom')}")
     
-    with cols[4]:  # Undelivered Allocated
-        show_undelivered_allocated_with_tooltip(oc)
+    with cols[4]:
+        show_undelivered_allocated(oc)
     
-    with cols[5]:  # Action button
+    with cols[5]:
         show_allocation_action_button(oc)
 
-def show_pending_delivery_with_tooltip(oc):
-    """Show pending delivery quantity with tooltip"""
-    pending_std = float(oc.get('pending_standard_delivery_quantity', 0))
-    standard_uom = oc.get('standard_uom', '')
-    
-    # Create tooltip
-    tooltip = create_oc_tooltip(oc)
-    
-    # Main display
-    st.markdown(
-        f"**{format_number(pending_std)} {standard_uom}**",
-        help=tooltip
-    )
-    
-    # Show selling UOM if different
-    if uom_converter.needs_conversion(oc.get('uom_conversion', '1')):
-        pending_selling = float(oc.get('pending_quantity', pending_std))
-        selling_uom = oc.get('selling_uom', '')
-        st.caption(f"= {format_number(pending_selling)} {selling_uom}")
+def show_etd_with_urgency(etd):
+    """Show ETD with urgency indicator"""
+    if etd is None or pd.isna(etd):
+        st.text("⚫ No ETD")
+        return
+        
+    try:
+        etd_date = pd.to_datetime(etd).date()
+        etd_days = (etd_date - datetime.now().date()).days
+        
+        etd_color = ""
+        if etd_days <= 0:
+            etd_color = "⚫"
+        elif etd_days <= 7:
+            etd_color = "🔴"
+        elif etd_days <= 14:
+            etd_color = "🟡"
+        
+        st.text(f"{etd_color} {format_date(etd)}")
+    except Exception as e:
+        logger.error(f"Error formatting ETD {etd}: {e}")
+        st.text(f"📅 {etd}")
 
-def show_undelivered_allocated_with_tooltip(oc):
+def show_undelivered_allocated(oc):
     """Show undelivered allocated quantity with color coding"""
     undelivered_std = float(oc.get('undelivered_allocated_qty_standard', 0))
     pending_std = float(oc.get('pending_standard_delivery_quantity', 0))
     standard_uom = oc.get('standard_uom', '')
     
     # Get color indicator
-    color = get_allocation_status_color(pending_std, undelivered_std)
+    if undelivered_std > pending_std:
+        color = "🔴"
+    elif undelivered_std == pending_std:
+        color = "🟢"
+    elif undelivered_std > 0:
+        color = "🟡"
+    else:
+        color = "⚪"
     
     # Create clickable metric if there are allocations
     if oc.get('allocation_count', 0) > 0:
@@ -887,43 +684,34 @@ def show_undelivered_allocated_with_tooltip(oc):
                 'standard_uom': oc.get('standard_uom', ''),
                 'pending_quantity': oc['pending_quantity'],
                 'pending_standard_delivery_quantity': oc.get('pending_standard_delivery_quantity', 0),
-                'allocation_warning': oc.get('allocation_warning', ''),
                 'uom_conversion': oc.get('uom_conversion', '1'),
-                'over_allocation_type': oc.get('over_allocation_type', 'Normal'),
-                'total_allocated_qty_standard': oc.get('total_allocated_qty_standard', 0),
-                'total_allocation_cancelled_qty': oc.get('total_allocation_cancelled_qty_standard', 0)
+                'over_allocation_type': oc.get('over_allocation_type', 'Normal')
             }
             st.rerun()
         
-        # Show allocation count if multiple
         if oc.get('allocation_count', 0) > 1:
             st.caption(f"({oc['allocation_count']} allocations)")
     else:
-        # Not allocated
         st.markdown(f"{color} {format_number(undelivered_std)} {standard_uom}")
     
-    # Show selling UOM if different
     if uom_converter.needs_conversion(oc.get('uom_conversion', '1')):
         undelivered_selling = uom_converter.convert_quantity(
             undelivered_std, 'standard', 'selling', oc.get('uom_conversion', '1')
         )
-        selling_uom = oc.get('selling_uom', '')
-        st.caption(f"= {format_number(undelivered_selling)} {selling_uom}")
+        st.caption(f"= {format_number(undelivered_selling)} {oc.get('selling_uom')}")
 
 def show_allocation_action_button(oc):
-    """Show allocation action button with proper validation"""
+    """Show allocation action button"""
     pending_qty_standard = oc.get('pending_standard_delivery_quantity', 0)
     undelivered_allocated_qty = oc.get('undelivered_allocated_qty_standard', 0)
     
     is_over_committed = oc.get('is_over_committed', 'No') == 'Yes'
     is_pending_over_allocated = oc.get('is_pending_over_allocated', 'No') == 'Yes'
     
-    # Check supply availability for this product
     product_id = oc.get('product_id')
-    supply_summary = data_service.get_product_supply_summary(product_id)
+    supply_summary = supply_data.get_product_supply_summary(product_id)
     has_available_supply = supply_summary.get('available', 0) > 0
     
-    # Determine if can allocate more
     can_allocate_more = (
         not is_over_committed and 
         not is_pending_over_allocated and 
@@ -931,7 +719,6 @@ def show_allocation_action_button(oc):
         pending_qty_standard > undelivered_allocated_qty
     )
     
-    # Set help text based on conditions
     if is_over_committed:
         help_text = "Cannot allocate more - Over-committed"
         button_type = "secondary"
@@ -964,116 +751,67 @@ def show_allocation_action_button(oc):
         st.session_state.modals['allocation'] = True
         st.rerun()
 
-def show_etd_with_urgency(etd):
-    """Show ETD with urgency indicator"""
-    # Kiểm tra ETD có None không
-    if etd is None or pd.isna(etd):
-        st.text("⚫ No ETD")
-        return
-        
-    try:
-        etd_date = pd.to_datetime(etd).date()
-        etd_days = (etd_date - datetime.now().date()).days
-        
-        etd_color = ""
-        if etd_days <= 0:
-            etd_color = "⚫"  # Overdue
-        elif etd_days <= 7:
-            etd_color = "🔴"  # Urgent
-        elif etd_days <= 14:
-            etd_color = "🟡"  # Soon
-        
-        st.text(f"{etd_color} {format_date(etd)}")
-    except Exception as e:
-        logger.error(f"Error formatting ETD {etd}: {e}")
-        st.text(f"📅 {etd}")
-
-def get_product_standard_uom(product_id):
-    """Get standard UOM directly from products table"""
-    try:
-        query = text("SELECT id, pt_code, name, uom FROM products WHERE id = :product_id AND delete_flag = 0")
-        with data_service.engine.connect() as conn:
-            result = conn.execute(query, {'product_id': product_id}).fetchone()
-            if result:
-                # Debug log
-                logger.info(f"Found product {product_id}: pt_code={result[1]}, name={result[2]}, uom={result[3]}")
-                return result[3] if result[3] else 'pcs'
-            else:
-                logger.warning(f"Product {product_id} not found in database")
-                return 'pcs'
-    except Exception as e:
-        logger.error(f"Error getting product UOM for product_id {product_id}: {e}", exc_info=True)
-        return 'pcs'
-
 def show_product_supply_details(product_id):
-    """Show supply sources for a product with overview"""
-    
-    # Lấy UOM trực tiếp từ products table - đơn giản và chính xác
-    standard_uom = get_product_standard_uom(product_id)
+    """Show supply sources for a product"""
+    # Get product standard UOM
+    try:
+        query = text("SELECT uom FROM products WHERE id = :product_id AND delete_flag = 0")
+        with product_data.engine.connect() as conn:
+            result = conn.execute(query, {'product_id': product_id}).fetchone()
+            standard_uom = result[0] if result else 'pcs'
+    except Exception as e:
+        logger.error(f"Error getting product UOM: {e}")
+        standard_uom = 'pcs'
     
     # Get supply summary
-    supply_summary = data_service.get_product_supply_summary(product_id)
+    supply_summary = supply_data.get_product_supply_summary(product_id)
     
-    # Show overview section
+    # Show overview
     st.markdown("### 📊 Supply Overview")
     overview_cols = st.columns(4)
     
     with overview_cols[0]:
-        st.metric(
-            "Total Supply",
-            f"{format_number(supply_summary['total_supply'])} {standard_uom}",
-            help="Total quantity available from all sources"
-        )
+        st.metric("Total Supply", f"{format_number(supply_summary['total_supply'])} {standard_uom}")
     
     with overview_cols[1]:
-        st.metric(
-            "Committed",
-            f"{format_number(supply_summary['total_committed'])} {standard_uom}",
-            help="Already allocated but not yet delivered"
-        )
+        st.metric("Committed", f"{format_number(supply_summary['total_committed'])} {standard_uom}")
     
     with overview_cols[2]:
         availability_color = "🟢" if supply_summary['coverage_ratio'] > 50 else "🟡" if supply_summary['coverage_ratio'] > 20 else "🔴"
         st.metric(
             f"{availability_color} Available",
             f"{format_number(supply_summary['available'])} {standard_uom}",
-            delta=f"{supply_summary['coverage_ratio']:.0f}% of total",
-            help="Quantity available for new allocations"
+            delta=f"{supply_summary['coverage_ratio']:.0f}% of total"
         )
     
     with overview_cols[3]:
-        st.metric(
-            "Max SOFT Allocation",
-            f"{format_number(supply_summary['available'])} {standard_uom}",
-            help="Maximum quantity that can be allocated without specifying source"
-        )
+        st.metric("Max SOFT Allocation", f"{format_number(supply_summary['available'])} {standard_uom}")
     
-    # Show warnings if needed
     if supply_summary['available'] <= 0:
-        st.error("❌ No supply available for allocation. All supply has been committed to other orders.")
+        st.error("❌ No supply available for allocation")
     elif supply_summary['coverage_ratio'] < 20:
-        st.warning(f"⚠️ Low supply availability! Only {supply_summary['coverage_ratio']:.0f}% of total supply is uncommitted.")
+        st.warning(f"⚠️ Low supply availability! Only {supply_summary['coverage_ratio']:.0f}% available")
     
     st.divider()
     
-    # Show supply details by type
+    # Show details by type
     st.markdown("### 📦 Supply Details by Source")
     col1, col2, col3, col4 = st.columns(4)
     
     with col1:
-        show_supply_summary(product_id, 'inventory', data_service.get_inventory_summary, standard_uom)
+        show_supply_type_summary(product_id, 'inventory', standard_uom)
     
     with col2:
-        show_supply_summary(product_id, 'can', data_service.get_can_summary, standard_uom)
+        show_supply_type_summary(product_id, 'can', standard_uom)
     
     with col3:
-        show_supply_summary(product_id, 'po', data_service.get_po_summary, standard_uom)
+        show_supply_type_summary(product_id, 'po', standard_uom)
     
     with col4:
-        show_supply_summary(product_id, 'wht', data_service.get_wht_summary, standard_uom)
+        show_supply_type_summary(product_id, 'wht', standard_uom)
 
-def show_supply_summary(product_id, supply_type, data_fetcher, standard_uom):
-    """Generic supply summary display with consistent UOM"""
+def show_supply_type_summary(product_id, supply_type, standard_uom):
+    """Show individual supply type summary"""
     titles = {
         'inventory': '📦 Inventory',
         'can': '🚢 Pending CAN',
@@ -1083,51 +821,53 @@ def show_supply_summary(product_id, supply_type, data_fetcher, standard_uom):
     
     st.markdown(f"**{titles.get(supply_type, supply_type)}**")
     
-    df = data_fetcher(product_id)
-    if not df.empty:
-        for _, item in df.iterrows():
-            if supply_type == 'inventory':
-                label = f"Batch {item['batch_number']}"
-                if item.get('warehouse_name'):
-                    label += f" | {item['warehouse_name']}"
+    if supply_type == 'inventory':
+        df = supply_data.get_inventory_summary(product_id)
+        if not df.empty:
+            for _, item in df.iterrows():
                 st.metric(
-                    label,
+                    f"Batch {item['batch_number']}",
                     f"{format_number(item['available_quantity'])} {standard_uom}",
                     delta=f"Exp: {format_date(item['expiry_date'])}"
                 )
-                if item.get('location'):
-                    st.caption(f"📍 Location: {item['location']}")
-                    
-            elif supply_type == 'can':
+        else:
+            st.caption("No inventory")
+    
+    elif supply_type == 'can':
+        df = supply_data.get_can_summary(product_id)
+        if not df.empty:
+            for _, item in df.iterrows():
                 st.metric(
                     item['arrival_note_number'],
                     f"{format_number(item['pending_quantity'])} {standard_uom}",
                     delta=f"Arr: {format_date(item['arrival_date'])}"
                 )
-                
-            elif supply_type == 'po':
-                etd_str = format_date(item['etd'])
-                eta_str = format_date(item.get('eta')) if item.get('eta') else 'N/A'
+        else:
+            st.caption("No pending CAN")
+    
+    elif supply_type == 'po':
+        df = supply_data.get_po_summary(product_id)
+        if not df.empty:
+            for _, item in df.iterrows():
                 st.metric(
                     item['po_number'],
                     f"{format_number(item['pending_quantity'])} {standard_uom}",
-                    delta=f"ETD: {etd_str} | ETA: {eta_str}"
+                    delta=f"ETD: {format_date(item['etd'])}"
                 )
-                
-            elif supply_type == 'wht':
+        else:
+            st.caption("No pending PO")
+    
+    elif supply_type == 'wht':
+        df = supply_data.get_wht_summary(product_id)
+        if not df.empty:
+            for _, item in df.iterrows():
                 st.metric(
                     f"{item['from_warehouse']} → {item['to_warehouse']}",
                     f"{format_number(item['transfer_quantity'])} {standard_uom}",
                     delta=item['status']
                 )
-    else:
-        captions = {
-            'inventory': "No inventory",
-            'can': "No pending CAN",
-            'po': "No pending PO",
-            'wht': "No transfers"
-        }
-        st.caption(captions.get(supply_type, "No data"))
+        else:
+            st.caption("No transfers")
 
 def show_pagination(df):
     """Show pagination controls"""
@@ -1167,1414 +907,11 @@ def reset_all_modals():
     st.session_state.selections['cancellation_for_reverse'] = None
     st.session_state.context['return_to_history'] = None
 
-# ==================== ALLOCATION MODAL ====================
-
-def format_supply_info_with_real_time_availability(supply, source_type, oc, current_total_selected):
-    """Format supply information with real-time availability considering current selections"""
-    if source_type == 'INVENTORY':
-        info = f"Batch {supply['batch_number']} - Exp: {format_date(supply['expiry_date'])}"
-    elif source_type == 'PENDING_CAN':
-        info = f"{supply['arrival_note_number']} - Arr: {format_date(supply['arrival_date'])}"
-    elif source_type == 'PENDING_PO':
-        etd_str = format_date(supply['etd'])
-        eta_str = format_date(supply.get('eta')) if supply.get('eta') else 'N/A'
-        info = f"{supply['po_number']} - ETD: {etd_str} | ETA: {eta_str}"
-    else:
-        info = f"{supply['from_warehouse']} → {supply['to_warehouse']}"
-    
-    # Get quantities
-    total_qty = supply.get('total_quantity', 0)
-    committed_qty = supply.get('committed_quantity', 0)
-    available_qty = supply.get('available_quantity', 0)
-    standard_uom = supply.get('uom', 'pcs')
-    
-    # Format quantity string with real-time context
-    if available_qty <= 0:
-        qty_str = f"Total: {format_number(total_qty)} | ❌ Fully committed"
-    elif committed_qty > 0:
-        qty_str = f"Total: {format_number(total_qty)} | Committed: {format_number(committed_qty)} | ✅ Available: {format_number(available_qty)} {standard_uom}"
-    else:
-        qty_str = f"✅ Available: {format_number(available_qty)} {standard_uom}"
-    
-    # Add selling UOM if different
-    if available_qty > 0 and uom_converter.needs_conversion(oc.get('uom_conversion', '1')):
-        qty_selling = uom_converter.convert_quantity(
-            available_qty,
-            'standard',
-            'selling',
-            oc.get('uom_conversion', '1')
-        )
-        selling_uom = oc.get('selling_uom', 'pcs')
-        qty_str += f" (= {format_number(qty_selling)} {selling_uom})"
-    
-    return f"{info} - {qty_str}"
-
-@st.dialog("Create Allocation", width="large")
-def show_allocation_modal():
-    """Allocation modal with user validation"""
-    oc = st.session_state.selections['oc_for_allocation']
-    
-    if not oc:
-        st.error("No OC selected")
-        if st.button("Close"):
-            st.session_state.modals['allocation'] = False
-            st.session_state.selections['oc_for_allocation'] = None
-            st.rerun()
-        return
-    
-    # Validate user session before allowing allocation
-    user_id = st.session_state.user.get('id')
-    if not user_id:
-        st.error("⚠️ Session error. Please login again.")
-        time.sleep(2)
-        auth.logout()
-        st.switch_page("app.py")
-        st.stop()
-    
-    # Header
-    st.markdown(f"### Allocate to {oc['oc_number']}")
-    
-    # Show warning if over-allocated
-    if oc.get('is_over_allocated') == 'Yes':
-        st.warning(f"⚠️ This OC is already over-allocated! {oc.get('allocation_warning', '')}")
-    
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("Customer", oc['customer'])
-    with col2:
-        st.metric("Product", oc['product_name'][:30])
-    with col3:
-        show_dual_uom_metric(
-            "Required",
-            oc.get('pending_standard_delivery_quantity', 0),
-            oc.get('standard_uom', 'pcs'),
-            oc.get('pending_quantity', 0),
-            oc.get('selling_uom', 'pcs'),
-            oc.get('uom_conversion', '1')
-        )
-    
-    st.divider()
-    
-    # Get supply summary first
-    standard_uom = oc.get('standard_uom', 'pcs')
-    supply_summary = data_service.get_product_supply_summary(oc['product_id'])
-    
-    # Show supply availability overview
-    st.markdown("**📊 Supply Overview:**")
-    col1, col2, col3, col4 = st.columns(4)
-    
-    with col1:
-        st.metric(
-            "Total Supply",
-            f"{format_number(supply_summary['total_supply'])} {standard_uom}",
-            help="Total quantity available from all sources"
-        )
-    
-    with col2:
-        st.metric(
-            "Committed",
-            f"{format_number(supply_summary['total_committed'])} {standard_uom}",
-            help="Already allocated but not yet delivered"
-        )
-    
-    with col3:
-        availability_color = "🟢" if supply_summary['coverage_ratio'] > 50 else "🟡" if supply_summary['coverage_ratio'] > 20 else "🔴"
-        st.metric(
-            f"{availability_color} Available",
-            f"{format_number(supply_summary['available'])} {standard_uom}",
-            delta=f"{supply_summary['coverage_ratio']:.0f}% of total",
-            help="Quantity available for new allocations"
-        )
-    
-    with col4:
-        st.metric(
-            "Max SOFT Allocation",
-            f"{format_number(supply_summary['available'])} {standard_uom}",
-            help="Maximum quantity for SOFT allocation"
-        )
-    
-    # Show warnings if needed
-    if supply_summary['available'] <= 0:
-        st.error("❌ No supply available for allocation. All supply has been committed to other orders.")
-    elif supply_summary['coverage_ratio'] < 20:
-        st.warning(f"⚠️ Low supply availability! Only {supply_summary['coverage_ratio']:.0f}% of total supply is available.")
-    
-    st.divider()
-    
-    # Get supply details with availability
-    supply_details = data_service.get_supply_with_availability(oc['product_id'])
-    
-    if supply_details.empty and supply_summary['available'] <= 0:
-        st.error("⛔ No supply available for this product")
-        st.info("All existing supply has been committed. Please check with procurement team.")
-        if st.button("Close", use_container_width=True):
-            st.session_state.modals['allocation'] = False
-            st.session_state.selections['oc_for_allocation'] = None
-            st.rerun()
-        return
-    
-    st.info("ℹ️ **Allocation Rule**: All allocations are made in standard UOM to ensure whole container quantities")
-    
-    # Supply selection
-    st.markdown("**Supply Sources:**")
-    
-    selected_supplies = []
-    total_selected_standard = 0
-    
-    # Group by source type
-    for source_type in ['INVENTORY', 'PENDING_CAN', 'PENDING_PO', 'PENDING_WHT']:
-        type_supplies = supply_details[supply_details['source_type'] == source_type]
-        
-        if not type_supplies.empty:
-            source_label = {
-                'INVENTORY': '📦 Inventory',
-                'PENDING_CAN': '🚢 Pending CAN',
-                'PENDING_PO': '📋 Pending PO',
-                'PENDING_WHT': '🚚 WH Transfer'
-            }.get(source_type, source_type)
-            
-            st.markdown(f"**{source_label}**")
-            
-            for idx, supply in type_supplies.iterrows():
-                col1, col2 = st.columns([3, 1])
-                
-                with col1:
-                    # Format supply info with real-time availability
-                    info = format_supply_info_with_real_time_availability(
-                        supply, source_type, oc, total_selected_standard
-                    )
-                    
-                    # Check availability
-                    is_available = supply.get('available_quantity', 0) > 0
-                    
-                    # Check if selecting this would exceed total available
-                    would_exceed_supply = False
-                    if is_available:
-                        max_selectable = min(
-                            supply.get('available_quantity', 0),
-                            supply_summary['available'] - total_selected_standard
-                        )
-                        would_exceed_supply = max_selectable <= 0
-                    
-                    # Set appropriate help text
-                    if not is_available:
-                        help_text = "No quantity available - fully committed"
-                    elif would_exceed_supply:
-                        help_text = "⚠️ Cannot select - would exceed total available supply"
-                    else:
-                        help_text = None
-                    
-                    selected = st.checkbox(
-                        info,
-                        key=f"supply_{supply['source_id']}_{source_type}",
-                        disabled=(not is_available or would_exceed_supply),
-                        help=help_text
-                    )
-                
-                with col2:
-                    if selected and is_available and not would_exceed_supply:
-                        # Calculate remaining requirement
-                        pending_standard = oc.get('pending_standard_delivery_quantity', oc['pending_quantity'])
-                        available_qty = supply.get('available_quantity', 0)
-                        remaining_supply_cap = supply_summary['available'] - total_selected_standard
-                        max_qty_standard = min(
-                            available_qty, 
-                            pending_standard - total_selected_standard,
-                            remaining_supply_cap
-                        )
-                        
-                        # Show equivalent selling quantity
-                        if uom_converter.needs_conversion(oc.get('uom_conversion', '1')):
-                            max_qty_selling = uom_converter.convert_quantity(
-                                max_qty_standard,
-                                'standard',
-                                'selling',
-                                oc.get('uom_conversion', '1')
-                            )
-                            help_text = f"Max: {format_number(max_qty_standard)} {standard_uom} (= {format_number(max_qty_selling)} {oc.get('selling_uom', 'pcs')})"
-                        else:
-                            help_text = f"Max: {format_number(max_qty_standard)} {standard_uom}"
-                        
-                        qty_standard = st.number_input(
-                            f"Qty ({standard_uom})",
-                            min_value=0.0,
-                            max_value=float(max_qty_standard),
-                            value=float(max_qty_standard),
-                            step=1.0,
-                            key=f"qty_{supply['source_id']}_{source_type}",
-                            help=help_text
-                        )
-                        
-                        if qty_standard > 0:
-                            selected_supplies.append({
-                                'source_type': source_type,
-                                'source_id': supply['source_id'],
-                                'quantity': qty_standard,
-                                'supply_info': supply.to_dict()
-                            })
-                            total_selected_standard += qty_standard
-    
-    st.divider()
-    
-    # SOFT allocation option
-    st.markdown("**OR**")
-    use_soft = st.checkbox("🔄 SOFT Allocation (no specific source)")
-    
-    if use_soft:
-        pending_standard = oc.get('pending_standard_delivery_quantity', oc['pending_quantity'])
-        
-        # Check available supply for SOFT allocation
-        max_soft_qty = min(
-            pending_standard,
-            supply_summary.get('available', 0)
-        )
-        
-        if max_soft_qty <= 0:
-            st.error("❌ Cannot create SOFT allocation - no supply available")
-        else:
-            if uom_converter.needs_conversion(oc.get('uom_conversion', '1')):
-                pending_selling = oc.get('pending_quantity', pending_standard)
-                selling_uom = oc.get('selling_uom', 'pcs')
-                max_soft_qty_selling = uom_converter.convert_quantity(
-                    max_soft_qty,
-                    'standard',
-                    'selling',
-                    oc.get('uom_conversion', '1')
-                )
-                help_text = f"Max: {format_number(max_soft_qty)} {standard_uom} (= {format_number(max_soft_qty_selling)} {selling_uom})"
-            else:
-                help_text = f"Max: {format_number(max_soft_qty)} {standard_uom}"
-            
-            # Show warning if supply is limited
-            if max_soft_qty < pending_standard:
-                st.warning(
-                    f"⚠️ Available supply ({format_number(supply_summary['available'])} {standard_uom}) "
-                    f"is less than pending quantity ({format_number(pending_standard)} {standard_uom})"
-                )
-            
-            st.caption(f"Allocate quantity in {standard_uom} (standard UOM)")
-            soft_qty_standard = st.number_input(
-                "Quantity",
-                min_value=0.0,
-                max_value=float(max_soft_qty),
-                value=0.0,
-                step=1.0,
-                help=help_text,
-                disabled=max_soft_qty <= 0
-            )
-            
-            if soft_qty_standard > 0:
-                selected_supplies = [{
-                    'source_type': None,
-                    'source_id': None,
-                    'quantity': soft_qty_standard,
-                    'supply_info': {'type': 'SOFT', 'description': 'No specific source'}
-                }]
-                total_selected_standard = soft_qty_standard
-    
-    st.divider()
-    
-    # Summary section
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        if uom_converter.needs_conversion(oc.get('uom_conversion', '1')):
-            total_selected_selling = uom_converter.convert_quantity(
-                total_selected_standard,
-                'standard',
-                'selling',
-                oc.get('uom_conversion', '1')
-            )
-            selling_uom = oc.get('selling_uom', 'pcs')
-            
-            st.metric(
-                "Total Selected", 
-                f"{format_number(total_selected_standard)} {standard_uom}"
-            )
-            st.caption(f"= {format_number(total_selected_selling)} {selling_uom}")
-        else:
-            st.metric(
-                "Total Selected", 
-                f"{format_number(total_selected_standard)} {standard_uom}"
-            )
-    
-    with col2:
-        pending_standard = oc.get('pending_standard_delivery_quantity', oc['pending_quantity'])
-        coverage = (total_selected_standard / pending_standard * 100) if pending_standard > 0 else 0
-        st.metric("Coverage", format_percentage(coverage))
-    
-    # Supply availability check
-    if total_selected_standard > 0 and total_selected_standard > supply_summary.get('available', 0):
-        st.error(
-            f"❌ Total allocation ({format_number(total_selected_standard)} {standard_uom}) "
-            f"exceeds available supply ({format_number(supply_summary['available'])} {standard_uom})"
-        )
-    
-    # Over-allocation warning (OC level)
-    effective_qty_standard = oc.get('standard_quantity', pending_standard)
-    current_effective_allocated = oc.get('total_effective_allocated_qty_standard', 0)
-    new_total_effective = current_effective_allocated + total_selected_standard
-    
-    if new_total_effective > effective_qty_standard:
-        over_qty_standard = new_total_effective - effective_qty_standard
-        over_pct = (over_qty_standard / effective_qty_standard * 100) if effective_qty_standard > 0 else 0
-        max_allowed = effective_qty_standard  # 100% limit
-        
-        if new_total_effective > max_allowed:
-            if uom_converter.needs_conversion(oc.get('uom_conversion', '1')):
-                over_qty_selling = uom_converter.convert_quantity(
-                    over_qty_standard,
-                    'standard',
-                    'selling',
-                    oc.get('uom_conversion', '1')
-                )
-                st.error(
-                    f"⚡ Would exceed OC limit by {format_number(over_qty_standard)} {standard_uom} "
-                    f"(= {format_number(over_qty_selling)} {oc.get('selling_uom')}) - "
-                    f"{format_percentage(over_pct)} over! Maximum allowed is 100% of OC quantity."
-                )
-            else:
-                st.error(
-                    f"⚡ Would exceed OC limit by {format_number(over_qty_standard)} {standard_uom} "
-                    f"({format_percentage(over_pct)} over)! Maximum allowed is 100% of OC quantity."
-                )
-    
-    # Additional fields
-    allocated_etd = st.date_input("Allocated ETD", value=oc['etd'])
-
-    # Validate allocated ETD against PO ETAs
-    if not use_soft and selected_supplies:
-        max_eta = None
-        po_with_max_eta = None
-        
-        for supply_item in selected_supplies:
-            if supply_item['source_type'] == 'PENDING_PO':
-                supply_info = supply_item['supply_info']
-                if supply_info.get('eta'):
-                    try:
-                        eta_date = pd.to_datetime(supply_info['eta']).date()
-                        if max_eta is None or eta_date > max_eta:
-                            max_eta = eta_date
-                            po_with_max_eta = supply_info.get('po_number', 'PO')
-                    except:
-                        pass
-        
-        if max_eta and allocated_etd < max_eta:
-            st.warning(
-                f"⚠️ Allocated ETD ({format_date(allocated_etd)}) is earlier than the ETA of {po_with_max_eta} ({format_date(max_eta)}). "
-                "The goods won't arrive until the ETA date. Consider adjusting the allocated ETD to be on or after the ETA."
-            )
-
-    notes = st.text_area("Notes (optional)")
-    
-    # Action buttons
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        # Determine if save button should be enabled
-        can_save = (
-            total_selected_standard > 0 and 
-            total_selected_standard <= supply_summary.get('available', float('inf'))
-        )
-        
-        # Create helpful button text
-        if not can_save and total_selected_standard == 0:
-            button_help = "Please select at least one supply source or enter SOFT allocation quantity"
-        elif not can_save and total_selected_standard > supply_summary.get('available', 0):
-            button_help = f"Total selection exceeds available supply by {format_number(total_selected_standard - supply_summary['available'])} {standard_uom}"
-        else:
-            button_help = "Click to save allocation"
-        
-        if st.button(
-            "💾 Save Allocation", 
-            type="primary", 
-            use_container_width=True, 
-            disabled=not can_save,
-            help=button_help
-        ):
-            # FIXED: Validate user session again before saving
-            user_id = st.session_state.user.get('id')
-            if not user_id:
-                st.error("⚠️ Session error. Please login again.")
-                time.sleep(2)
-                auth.logout()
-                st.switch_page("app.py")
-                st.stop()
-            
-            # Validate allocation
-            errors = validator.validate_create_allocation(
-                selected_supplies,
-                oc,
-                'SOFT' if use_soft else 'HARD',
-                st.session_state.user['role']
-            )
-            
-            if errors:
-                for error in errors:
-                    st.error(f"❌ {error}")
-            else:
-                # Save allocation with validated user_id
-                result = allocation_service.create_allocation(
-                    oc_detail_id=oc['ocd_id'],
-                    allocations=selected_supplies,
-                    mode='SOFT' if use_soft else 'HARD',
-                    etd=allocated_etd,
-                    notes=notes,
-                    user_id=user_id  # Using validated user_id
-                )
-                
-                if result['success']:
-                    # Log successful allocation with user info
-                    logger.info(
-                        f"User {st.session_state.user.get('username', 'Unknown')} (ID: {user_id}) "
-                        f"created allocation {result['allocation_number']}"
-                    )
-                    
-                    success_msg = f"✅ Allocation Successful\nAllocated: {format_number(total_selected_standard)} {standard_uom}"
-                    
-                    if uom_converter.needs_conversion(oc.get('uom_conversion', '1')):
-                        total_selected_selling = uom_converter.convert_quantity(
-                            total_selected_standard,
-                            'standard',
-                            'selling',
-                            oc.get('uom_conversion', '1')
-                        )
-                        selling_uom = oc.get('selling_uom', 'pcs')
-                        success_msg += f" (= {format_number(total_selected_selling)} {selling_uom})"
-                    
-                    success_msg += f" to {oc['oc_number']}\nAllocation Number: {result['allocation_number']}"
-                    success_msg += f"\nCreated by: {st.session_state.user.get('full_name', 'Unknown')}"
-                    
-                    st.success(success_msg)
-                    st.balloons()
-                    
-                    time.sleep(2)
-                    st.session_state.modals['allocation'] = False
-                    st.session_state.selections['oc_for_allocation'] = None
-                    st.cache_data.clear()
-                    st.rerun()
-                else:
-                    error_msg = result.get('error', 'Unknown error')
-                    if 'session' in error_msg.lower() or 'user' in error_msg.lower():
-                        st.error(f"⚠️ {error_msg}")
-                        time.sleep(2)
-                        auth.logout()
-                        st.switch_page("app.py")
-                        st.stop()
-                    else:
-                        st.error(f"❌ {error_msg}")
-    
-    with col2:
-        if st.button("Cancel", use_container_width=True):
-            st.session_state.modals['allocation'] = False
-            st.session_state.selections['oc_for_allocation'] = None
-            st.rerun()
-
-def show_dual_uom_metric(label: str, 
-                         standard_qty: float, standard_uom: str,
-                         selling_qty: float, selling_uom: str,
-                         conversion_ratio: str):
-    """Show metric with both standard and selling UOM"""
-    if uom_converter.needs_conversion(conversion_ratio):
-        st.metric(label, f"{format_number(standard_qty)} {standard_uom}")
-        st.caption(f"= {format_number(selling_qty)} {selling_uom}")
-    else:
-        st.metric(label, f"{format_number(standard_qty)} {standard_uom}")
-
-# ==================== ALLOCATION HISTORY MODAL ====================
-@st.dialog("Allocation History", width="large")
-def show_allocation_history_modal():
-    """Show allocation history with delivery data from allocation_delivery_links"""
-    if 'oc_for_history' not in st.session_state.selections or not st.session_state.selections['oc_for_history']:
-        st.error("No OC selected")
-        if st.button("Close"):
-            st.session_state.modals['history'] = False
-            st.rerun()
-        return
-    
-    oc_detail_id = st.session_state.selections['oc_for_history']
-    oc_info = st.session_state.selections.get('oc_info')
-    
-    if not oc_info:
-        st.error("OC information not found")
-        if st.button("Close"):
-            st.session_state.modals['history'] = False
-            st.session_state.selections['oc_for_history'] = None
-            st.rerun()
-        return
-    
-    # Header
-    st.markdown(f"### Allocation History for {oc_info['oc_number']}")
-    
-    # Show over-allocation warning
-    if oc_info.get('over_allocation_type') == 'Over-Committed':
-        st.error("⚡ This OC is over-committed - total allocations exceed order quantity")
-    elif oc_info.get('over_allocation_type') == 'Pending-Over-Allocated':
-        st.warning("⚠️ This OC has pending over-allocation - undelivered allocations exceed pending quantity")
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        st.caption(f"**Customer:** {oc_info['customer']}")
-    with col2:
-        st.caption(f"**Product:** {oc_info['product_name']}")
-    
-    # Summary metrics
-    show_allocation_summary_metrics(oc_info)
-    
-    st.divider()
-    
-    # Get allocation history
-    history_df = data_service.get_allocation_history_with_details(oc_detail_id)
-    
-    if history_df.empty:
-        st.info("No allocation history found")
-    else:
-        for idx, alloc in history_df.iterrows():
-            show_allocation_history_item_dual_uom(alloc, oc_info)
-    
-    # Note about UOM
-    if uom_converter.needs_conversion(oc_info.get('uom_conversion', '1')):
-        st.info(f"ℹ️ Note: Allocation quantities are stored in {oc_info.get('standard_uom', 'standard UOM')}. " +
-                f"Conversion: {oc_info.get('uom_conversion', 'N/A')}")
-    
-    # Close button
-    if st.button("Close", use_container_width=True):
-        st.session_state.modals['history'] = False
-        st.session_state.selections['oc_for_history'] = None
-        st.session_state.selections['oc_info'] = None
-        st.session_state.context['return_to_history'] = None
-        st.rerun()
-
-def show_allocation_summary_metrics(oc_info):
-    """Show summary metrics with correct coverage calculation"""
-    metrics_cols = st.columns(3)
-    
-    with metrics_cols[0]:
-        # Pending quantity (giữ nguyên)
-        standard_qty = oc_info.get('pending_standard_delivery_quantity', 0)
-        standard_uom = oc_info.get('standard_uom', '')
-        selling_qty = oc_info['pending_quantity']
-        selling_uom = oc_info.get('selling_uom', '')
-        
-        st.metric("Pending Qty", f"{format_number(standard_qty)} {standard_uom}")
-        
-        if uom_converter.needs_conversion(oc_info.get('uom_conversion', '1')):
-            st.caption(f"= {format_number(selling_qty)} {selling_uom}")
-    
-    with metrics_cols[1]:
-        # Get actual data from history
-        history_df = data_service.get_allocation_history_with_details(st.session_state.selections['oc_for_history'])
-        
-        if not history_df.empty:
-            # Undelivered allocated (phần đã phân bổ nhưng chưa giao)
-            undelivered_allocated = history_df['pending_qty'].sum()
-            
-            if uom_converter.needs_conversion(oc_info.get('uom_conversion', '1')):
-                undelivered_selling = uom_converter.convert_quantity(
-                    undelivered_allocated,
-                    'standard',
-                    'selling',
-                    oc_info.get('uom_conversion', '1')
-                )
-                st.metric("Undelivered Allocated", f"{format_number(undelivered_allocated)} {standard_uom}")
-                st.caption(f"= {format_number(undelivered_selling)} {selling_uom}")
-            else:
-                st.metric("Undelivered Allocated", f"{format_number(undelivered_allocated)} {standard_uom}")
-        else:
-            st.metric("Undelivered Allocated", f"0 {standard_uom}")
-    
-    with metrics_cols[2]:
-        if not history_df.empty:
-            # CÁCH 2: Coverage = Undelivered Allocated / Pending Delivery
-            pending_standard = oc_info.get('pending_standard_delivery_quantity', 0)
-            undelivered_allocated = history_df['pending_qty'].sum()
-            
-            coverage = (undelivered_allocated / pending_standard * 100) if pending_standard > 0 else 0
-            st.metric("Coverage", format_percentage(coverage))
-            
-            # Action-oriented status
-            if coverage > 100:
-                st.caption("⚡ Over-allocated - Review & cancel excess")
-            elif coverage == 100:
-                st.caption("✅ Fully covered")
-            elif coverage >= 80:
-                st.caption("🟡 Nearly covered - Allocate remaining")
-            elif coverage > 0:
-                st.caption("🔴 Partially covered - Need more allocation")
-            else:
-                st.caption("⚫ Not allocated - Urgent action needed")
-        else:
-            st.metric("Coverage", "0%")
-            st.caption("⚫ Not allocated - Urgent action needed")
-
-def show_allocation_history_item_dual_uom(alloc, oc_info):
-    """Show single allocation history item with tooltip"""
-    with st.container():
-        # Allocation header with tooltip
-        show_allocation_header_with_tooltip(alloc, oc_info)
-        
-        # Allocation quantities
-        show_allocation_quantities_dual_uom(alloc, oc_info)
-        
-        # Additional info
-        show_allocation_info(alloc)
-        
-        # Action buttons
-        show_allocation_actions(alloc, oc_info)
-        
-        # Show cancellation history
-        if alloc.get('has_cancellations'):
-            show_cancellation_history_dual_uom(alloc, oc_info)
-        
-        # Show delivery details if any
-        delivery_count = alloc.get('delivery_count')
-        if delivery_count is not None and delivery_count > 0:
-            show_delivery_details(alloc)
-        
-        st.divider()
-
-def show_allocation_header_with_tooltip(alloc, oc_info):
-    """Show allocation header with tooltip"""
-    status_color = {
-        'ALLOCATED': '🟢',
-        'DRAFT': '🟡',
-        'CANCELLED': '🔴'
-    }.get(alloc['status'], '⚪')
-    
-    # Create tooltip
-    tooltip = create_allocation_tooltip(alloc, oc_info)
-    
-    col1, col2, col3 = st.columns([2, 1, 1])
-    with col1:
-        st.markdown(
-            f"{status_color} **{alloc['allocation_number']}**",
-            help=tooltip
-        )
-    with col2:
-        st.caption(f"Mode: {format_allocation_mode(alloc['allocation_mode'])}")
-    with col3:
-        st.caption(f"Status: {alloc['status']}")
-
-def show_allocation_quantities_dual_uom(alloc, oc_info):
-    """Show allocation quantities with delivery data from allocation_delivery_links"""
-    detail_cols = st.columns([1, 1, 1, 1])
-    
-    standard_uom = oc_info.get('standard_uom', '')
-    selling_uom = oc_info.get('selling_uom', '')
-    conversion = oc_info.get('uom_conversion', '1')
-    needs_conversion = uom_converter.needs_conversion(conversion)
-    
-    with detail_cols[0]:
-        allocated_std = alloc.get('allocated_qty', 0) or 0  # Handle None
-        if needs_conversion:
-            allocated_sell = uom_converter.convert_quantity(
-                allocated_std, 'standard', 'selling', conversion
-            )
-            st.metric("Allocated", f"{format_number(allocated_std)} {standard_uom}")
-            st.caption(f"= {format_number(allocated_sell)} {selling_uom}")
-        else:
-            st.metric("Allocated", f"{format_number(allocated_std)} {standard_uom}")
-    
-    with detail_cols[1]:
-        effective_std = alloc.get('effective_qty', 0) or 0  # Handle None
-        if needs_conversion:
-            effective_sell = uom_converter.convert_quantity(
-                effective_std, 'standard', 'selling', conversion
-            )
-            st.metric("Effective", f"{format_number(effective_std)} {standard_uom}")
-            st.caption(f"= {format_number(effective_sell)} {selling_uom}")
-        else:
-            st.metric("Effective", f"{format_number(effective_std)} {standard_uom}")
-    
-    with detail_cols[2]:
-        # Delivered qty now comes from allocation_delivery_links
-        delivered_std = alloc.get('delivered_qty', 0) or 0  # Handle None
-        if needs_conversion:
-            delivered_sell = uom_converter.convert_quantity(
-                delivered_std, 'standard', 'selling', conversion
-            )
-            st.metric("Delivered", f"{format_number(delivered_std)} {standard_uom}")
-            st.caption(f"= {format_number(delivered_sell)} {selling_uom}")
-        else:
-            st.metric("Delivered", f"{format_number(delivered_std)} {standard_uom}")
-    
-    with detail_cols[3]:
-        cancelled_std = alloc.get('cancelled_qty', 0) or 0  # Handle None
-        if needs_conversion:
-            cancelled_sell = uom_converter.convert_quantity(
-                cancelled_std, 'standard', 'selling', conversion
-            )
-            st.metric("Cancelled", f"{format_number(cancelled_std)} {standard_uom}")
-            st.caption(f"= {format_number(cancelled_sell)} {selling_uom}")
-        else:
-            st.metric("Cancelled", f"{format_number(cancelled_std)} {standard_uom}")
-
-def show_allocation_info(alloc):
-    """Show allocation additional info"""
-    info_cols = st.columns([1, 1, 1])
-    
-    with info_cols[0]:
-        st.caption(f"📅 **Date:** {format_date(alloc['allocation_date'])}")
-    
-    with info_cols[1]:
-        st.caption(f"📅 **Allocated ETD:** {format_date(alloc['allocated_etd'])}")
-    
-    with info_cols[2]:
-        st.caption(f"👤 **Created by:** {alloc['created_by']}")
-    
-    # Supply source and notes
-    st.caption(f"📦 **Source:** {alloc['supply_source_type'] or 'No specific source (SOFT)'}")
-    
-    if alloc.get('notes'):
-        st.caption(f"📝 **Notes:** {alloc['notes']}")
-    
-    if alloc.get('cancellation_info'):
-        st.warning(f"❌ {alloc['cancellation_info']}")
-
-def show_allocation_actions(alloc, oc_info):
-    """Show action buttons for allocation"""
-    if alloc['status'] != 'ALLOCATED':
-        return
-    
-    # Get availability
-    actions_availability = get_allocation_actions_availability(alloc)
-    
-    action_cols = st.columns([1, 1, 2])
-    
-    # Update ETD button
-    with action_cols[0]:
-        show_update_etd_button(alloc, actions_availability)
-    
-    # Cancel button
-    with action_cols[1]:
-        show_cancel_button(alloc, actions_availability)
-
-def get_allocation_actions_availability(allocation_detail: Dict) -> Dict[str, bool]:
-    """Determine available actions based on allocation_delivery_links data"""
-    allocated_qty = allocation_detail.get('allocated_qty', 0)
-    cancelled_qty = allocation_detail.get('cancelled_qty', 0)
-    delivered_qty = allocation_detail.get('delivered_qty', 0)  # From allocation_delivery_links
-    
-    pending_qty = allocation_detail.get('pending_qty', allocated_qty - cancelled_qty - delivered_qty)
-    
-    return {
-        'can_update_etd': (
-            pending_qty > 0 and
-            allocation_detail.get('status') == 'ALLOCATED'
-        ),
-        'can_cancel': (
-            pending_qty > 0 and
-            allocation_detail.get('status') == 'ALLOCATED'
-        ),
-        'pending_qty': pending_qty,
-        'max_cancellable_qty': pending_qty
-    }
-
-def show_update_etd_button(alloc, actions_availability):
-    """Show update ETD button"""
-    can_update_permission = validator.check_permission(st.session_state.user['role'], 'update')
-    can_update = actions_availability['can_update_etd'] and can_update_permission
-    
-    if can_update:
-        if st.button("📅 Update ETD", key=f"update_etd_{alloc['allocation_detail_id']}"):
-            st.session_state.context['return_to_history'] = {
-                'oc_detail_id': st.session_state.selections['oc_for_history'],
-                'oc_info': st.session_state.selections['oc_info']
-            }
-            
-            st.session_state.modals['history'] = False
-            
-            alloc_data = alloc.to_dict() if hasattr(alloc, 'to_dict') else dict(alloc)
-            alloc_data['pending_allocated_qty'] = actions_availability['pending_qty']
-            
-            st.session_state.modals['update_etd'] = True
-            st.session_state.selections['allocation_for_update'] = alloc_data
-            st.rerun()
-    else:
-        if not can_update_permission:
-            help_text = "No permission to update ETD"
-        elif actions_availability['pending_qty'] <= 0:
-            help_text = "Cannot update ETD - all quantity has been delivered"
-        else:
-            help_text = "Cannot update ETD"
-            
-        st.button(
-            "📅 Update ETD", 
-            key=f"update_etd_{alloc['allocation_detail_id']}_disabled", 
-            disabled=True, 
-            help=help_text
-        )
-
-def show_cancel_button(alloc, actions_availability):
-    """Show cancel button"""
-    can_cancel_permission = validator.check_permission(st.session_state.user['role'], 'cancel')
-    can_cancel = actions_availability['can_cancel'] and can_cancel_permission
-    
-    if can_cancel:
-        if st.button("❌ Cancel", key=f"cancel_{alloc['allocation_detail_id']}"):
-            st.session_state.context['return_to_history'] = {
-                'oc_detail_id': st.session_state.selections['oc_for_history'],
-                'oc_info': st.session_state.selections['oc_info']
-            }
-            
-            st.session_state.modals['history'] = False
-            
-            alloc_data = alloc.to_dict() if hasattr(alloc, 'to_dict') else dict(alloc)
-            alloc_data['pending_allocated_qty'] = actions_availability['pending_qty']
-            alloc_data['max_cancellable_qty'] = actions_availability['max_cancellable_qty']
-            
-            st.session_state.modals['cancel'] = True
-            st.session_state.selections['allocation_for_cancel'] = alloc_data
-            st.rerun()
-    else:
-        if not can_cancel_permission:
-            help_text = "No permission to cancel allocation"
-        elif actions_availability['pending_qty'] <= 0:
-            help_text = "Cannot cancel - all quantity has been delivered"
-        else:
-            help_text = "Cannot cancel allocation"
-            
-        st.button(
-            "❌ Cancel", 
-            key=f"cancel_{alloc['allocation_detail_id']}_disabled", 
-            disabled=True, 
-            help=help_text
-        )
-
-def show_cancellation_history_dual_uom(alloc, oc_info):
-    """Show cancellation history"""
-    with st.expander("View Cancellation History"):
-        cancellations = data_service.get_cancellation_history(alloc['allocation_detail_id'])
-        for _, cancel in cancellations.iterrows():
-            cancel_cols = st.columns([2, 1, 1, 1])
-            
-            with cancel_cols[0]:
-                cancelled_std = cancel['cancelled_qty']
-                standard_uom = oc_info.get('standard_uom', '')
-                
-                if uom_converter.needs_conversion(oc_info.get('uom_conversion', '1')):
-                    cancelled_sell = uom_converter.convert_quantity(
-                        cancelled_std, 'standard', 'selling', 
-                        oc_info.get('uom_conversion', '1')
-                    )
-                    selling_uom = oc_info.get('selling_uom', '')
-                    st.text(f"Cancelled {format_number(cancelled_std)} {standard_uom}")
-                    st.caption(f"= {format_number(cancelled_sell)} {selling_uom}")
-                else:
-                    st.text(f"Cancelled {format_number(cancelled_std)} {standard_uom}")
-            
-            with cancel_cols[1]:
-                st.text(format_date(cancel['cancelled_date']))
-            with cancel_cols[2]:
-                st.text(format_reason_category(cancel['reason_category']))
-            with cancel_cols[3]:
-                if cancel['status'] == 'ACTIVE' and validator.check_permission(st.session_state.user['role'], 'reverse'):
-                    if st.button("↩️ Reverse", key=f"reverse_{cancel['cancellation_id']}"):
-                        st.session_state.context['return_to_history'] = {
-                            'oc_detail_id': st.session_state.selections['oc_for_history'],
-                            'oc_info': st.session_state.selections['oc_info']
-                        }
-                        
-                        st.session_state.modals['history'] = False
-                        st.session_state.modals['reverse'] = True
-                        st.session_state.selections['cancellation_for_reverse'] = cancel.to_dict()
-                        st.rerun()
-            
-            st.caption(f"Reason: {cancel['reason']}")
-            if cancel['status'] == 'REVERSED':
-                st.info(f"✅ Reversed on {format_date(cancel['reversed_date'])} by {cancel['reversed_by']}")
-
-def show_delivery_details(alloc):
-    """Show delivery details from allocation_delivery_links"""
-    with st.expander(f"📦 View Delivery History ({alloc['delivery_count']} deliveries)"):
-        delivery_df = data_service.get_allocation_delivery_details(alloc['allocation_detail_id'])
-        
-        if not delivery_df.empty:
-            for _, delivery in delivery_df.iterrows():
-                del_cols = st.columns([2, 1, 1, 1])
-                
-                with del_cols[0]:
-                    st.text(f"📄 {delivery['delivery_number']}")
-                    st.caption(f"Date: {format_date(delivery['delivery_date'])}")
-                
-                with del_cols[1]:
-                    st.text(f"{format_number(delivery['delivered_qty'])} pcs")
-                    
-                with del_cols[2]:
-                    st.text(delivery['delivery_status'])
-                    
-                with del_cols[3]:
-                    st.text(delivery['from_warehouse'])
-
-# ==================== UPDATE ETD MODAL ====================
-@st.dialog("Update Allocated ETD", width="medium")
-def show_update_etd_modal():
-    """Modal for updating allocated ETD with user validation"""
-    allocation = st.session_state.selections['allocation_for_update']
-    
-    if not allocation:
-        st.error("No allocation selected")
-        if st.button("Close"):
-            st.session_state.modals['update_etd'] = False
-            st.session_state.selections['allocation_for_update'] = None
-            st.rerun()
-        return
-    
-    # Validate user session
-    user_id = st.session_state.user.get('id')
-    if not user_id:
-        st.error("⚠️ Session error. Please login again.")
-        time.sleep(2)
-        auth.logout()
-        st.switch_page("app.py")
-        st.stop()
-    
-    st.markdown(f"### Update ETD for {allocation['allocation_number']}")
-    
-    st.info(f"Current Allocated ETD: {format_date(allocation['allocated_etd'])}")
-    
-    # Show pending quantity
-    pending_qty = allocation.get('pending_allocated_qty', 0)
-    oc_info = st.session_state.selections.get('oc_info', {})
-    standard_uom = oc_info.get('standard_uom', '')
-    
-    st.caption(f"**Pending quantity affected:** {format_number(pending_qty)} {standard_uom}")
-    
-    # Show delivered quantity if any
-    delivered_qty = allocation.get('delivered_qty', 0)
-    if delivered_qty > 0:
-        st.warning(f"ℹ️ {format_number(delivered_qty)} {standard_uom} already delivered. ETD update will only affect pending quantity.")
-    
-    # Validate
-    valid, error = validator.validate_update_etd(
-        allocation,
-        allocation['allocated_etd'],
-        st.session_state.user['role']
-    )
-    
-    if not valid and error != "Invalid ETD format" and error != "New ETD is the same as current ETD":
-        st.error(f"❌ {error}")
-        if st.button("Close"):
-            st.session_state.modals['update_etd'] = False
-            st.rerun()
-        return
-    
-    # New ETD input
-    current_etd = pd.to_datetime(allocation['allocated_etd']).date()
-    new_etd = st.date_input(
-        "New Allocated ETD",
-        value=current_etd
-    )
-    
-    # Show ETD change
-    if new_etd != current_etd:
-        diff_days = (new_etd - current_etd).days
-        if diff_days > 0:
-            st.warning(f"⚠️ Delaying by {diff_days} days")
-        else:
-            st.success(f"✅ Advancing by {abs(diff_days)} days")
-    
-    # Action buttons
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("Update ETD", type="primary", disabled=(new_etd == current_etd)):
-            result = allocation_service.update_allocation_etd(
-                allocation['allocation_detail_id'],
-                new_etd,
-                user_id  # Using validated user_id
-            )
-            
-            if result['success']:
-                st.success("✅ ETD updated successfully")
-                if result.get('update_count'):
-                    st.caption(f"This is update #{result['update_count']} for this allocation")
-                time.sleep(1)
-                
-                return_to_history_if_context()
-                
-                st.cache_data.clear()
-                st.rerun()
-            else:
-                error_msg = result.get('error', 'Unknown error')
-                if 'session' in error_msg.lower() or 'user' in error_msg.lower():
-                    st.error(f"⚠️ {error_msg}")
-                    time.sleep(2)
-                    auth.logout()
-                    st.switch_page("app.py")
-                    st.stop()
-                else:
-                    st.error(f"❌ {error_msg}")
-    
-    with col2:
-        if st.button("Close"):
-            st.session_state.modals['update_etd'] = False
-            return_to_history_if_context()
-            st.rerun()
-
-# ==================== CANCEL ALLOCATION MODAL ====================
-@st.dialog("Cancel Allocation", width="medium")
-def show_cancel_allocation_modal():
-    """Modal for cancelling allocation with user validation"""
-    
-    # Get allocation from session state
-    allocation = st.session_state.selections.get('allocation_for_cancel')
-    
-    # Early return if no allocation selected
-    if not allocation:
-        st.error("No allocation selected")
-        if st.button("Close"):
-            st.session_state.modals['cancel'] = False
-            st.session_state.selections['allocation_for_cancel'] = None
-            st.rerun()
-        return
-    
-    # Validate user session
-    user_id = st.session_state.user.get('id')
-    if not user_id:
-        st.error("⚠️ Session error. Please login again.")
-        time.sleep(2)
-        auth.logout()
-        st.switch_page("app.py")
-        st.stop()
-    
-    # Display header
-    st.markdown(f"### Cancel Allocation {allocation.get('allocation_number', '')}")
-    
-    # Get UOM info with multiple fallback options
-    oc_info = st.session_state.selections.get('oc_info')
-    
-    # Extract UOM information with fallbacks
-    if oc_info and isinstance(oc_info, dict):
-        standard_uom = oc_info.get('standard_uom', 'pcs')
-        selling_uom = oc_info.get('selling_uom', 'pcs')
-        conversion = oc_info.get('uom_conversion', '1')
-    else:
-        # Try to get from allocation data itself
-        standard_uom = allocation.get('standard_uom', 'pcs')
-        selling_uom = allocation.get('selling_uom', 'pcs')
-        conversion = allocation.get('uom_conversion', '1')
-        
-        # If still not available, use defaults
-        if not standard_uom:
-            standard_uom = 'pcs'
-        if not selling_uom:
-            selling_uom = standard_uom
-        if not conversion:
-            conversion = '1'
-    
-    # Get pending quantity with validation
-    pending_qty_std = float(allocation.get('pending_allocated_qty', 0))
-    
-    # Check if there's anything to cancel
-    if pending_qty_std <= 0:
-        st.error("❌ Cannot cancel - no pending quantity available")
-        if st.button("Close"):
-            st.session_state.modals['cancel'] = False
-            st.session_state.selections['allocation_for_cancel'] = None
-            return_to_history_if_context()
-            st.rerun()
-        return
-    
-    # Display pending quantity information
-    if uom_converter.needs_conversion(conversion):
-        pending_qty_sell = uom_converter.convert_quantity(
-            pending_qty_std, 'standard', 'selling', conversion
-        )
-        st.info(
-            f"Pending quantity (not yet delivered): "
-            f"{format_number(pending_qty_std)} {standard_uom} "
-            f"(= {format_number(pending_qty_sell)} {selling_uom})"
-        )
-    else:
-        st.info(f"Pending quantity (not yet delivered): {format_number(pending_qty_std)} {standard_uom}")
-    
-    # Show delivered quantity warning if applicable
-    delivered_qty = float(allocation.get('delivered_qty', 0))
-    if delivered_qty > 0:
-        if uom_converter.needs_conversion(conversion):
-            delivered_qty_sell = uom_converter.convert_quantity(
-                delivered_qty, 'standard', 'selling', conversion
-            )
-            st.warning(
-                f"⚠️ {format_number(delivered_qty)} {standard_uom} "
-                f"(= {format_number(delivered_qty_sell)} {selling_uom}) "
-                f"already delivered and cannot be cancelled"
-            )
-        else:
-            st.warning(
-                f"⚠️ {format_number(delivered_qty)} {standard_uom} "
-                f"already delivered and cannot be cancelled"
-            )
-    
-    st.divider()
-    
-    # Cancel quantity input
-    st.markdown(f"**Cancel quantity in {standard_uom} (standard UOM):**")
-    
-    cancel_qty = st.number_input(
-        f"Quantity to Cancel",
-        min_value=0.0,
-        max_value=float(pending_qty_std),
-        value=float(pending_qty_std),
-        step=1.0,
-        help=f"Maximum cancellable: {format_number(pending_qty_std)} {standard_uom}",
-        label_visibility="collapsed"
-    )
-    
-    # Show equivalent in selling UOM if different
-    if cancel_qty > 0 and uom_converter.needs_conversion(conversion):
-        cancel_qty_sell = uom_converter.convert_quantity(
-            cancel_qty, 'standard', 'selling', conversion
-        )
-        st.caption(f"= {format_number(cancel_qty_sell)} {selling_uom}")
-    
-    # Reason category selection
-    reason_category = st.selectbox(
-        "Reason Category",
-        options=['CUSTOMER_REQUEST', 'SUPPLY_ISSUE', 'QUALITY_ISSUE', 'BUSINESS_DECISION', 'OTHER'],
-        format_func=lambda x: format_reason_category(x)
-    )
-    
-    # Detailed reason input
-    reason = st.text_area(
-        "Detailed Reason", 
-        help="Please provide a detailed reason (minimum 10 characters)",
-        placeholder="Explain why this allocation is being cancelled..."
-    )
-    
-    # Validate inputs
-    errors = validator.validate_cancel_allocation(
-        allocation,
-        cancel_qty,
-        reason,
-        reason_category,
-        st.session_state.user.get('role', 'viewer')
-    )
-    
-    # Display validation errors if any
-    if errors:
-        for error in errors:
-            st.error(f"❌ {error}")
-    
-    st.divider()
-    
-    # Action buttons
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        # Determine if button should be disabled
-        button_disabled = len(errors) > 0 or cancel_qty <= 0
-        
-        if st.button(
-            "Cancel Allocation", 
-            type="primary", 
-            use_container_width=True,
-            disabled=button_disabled
-        ):
-            # Store UOM info before any state changes
-            saved_standard_uom = standard_uom
-            saved_selling_uom = selling_uom
-            saved_conversion = conversion
-            saved_cancel_qty = cancel_qty
-            
-            try:
-                # Execute cancellation with validated user_id
-                result = allocation_service.cancel_allocation(
-                    allocation_detail_id=allocation.get('allocation_detail_id'),
-                    cancelled_qty=cancel_qty,
-                    reason=reason,
-                    reason_category=reason_category,
-                    user_id=user_id  # Using validated user_id
-                )
-                
-                if result['success']:
-                    # Prepare success message using saved values
-                    if uom_converter.needs_conversion(saved_conversion):
-                        cancel_qty_sell = uom_converter.convert_quantity(
-                            saved_cancel_qty, 'standard', 'selling', saved_conversion
-                        )
-                        success_msg = (
-                            f"✅ Successfully cancelled {format_number(saved_cancel_qty)} {saved_standard_uom} "
-                            f"(= {format_number(cancel_qty_sell)} {saved_selling_uom})"
-                        )
-                    else:
-                        success_msg = f"✅ Successfully cancelled {format_number(saved_cancel_qty)} {saved_standard_uom}"
-                    
-                    # Display success message
-                    st.success(success_msg)
-                    
-                    # Display remaining quantity if any
-                    remaining_qty = result.get('remaining_pending_qty', 0)
-                    if remaining_qty > 0:
-                        if uom_converter.needs_conversion(saved_conversion):
-                            remaining_sell = uom_converter.convert_quantity(
-                                remaining_qty, 'standard', 'selling', saved_conversion
-                            )
-                            st.info(
-                                f"Remaining pending: {format_number(remaining_qty)} {saved_standard_uom} "
-                                f"(= {format_number(remaining_sell)} {saved_selling_uom})"
-                            )
-                        else:
-                            st.info(f"Remaining pending: {format_number(remaining_qty)} {saved_standard_uom}")
-                    
-                    # Wait briefly for user to see the message
-                    time.sleep(1.5)
-                    
-                    # Clear modal state
-                    st.session_state.modals['cancel'] = False
-                    st.session_state.selections['allocation_for_cancel'] = None
-                    
-                    # Return to history if context exists
-                    return_to_history_if_context()
-                    
-                    # Clear cache and refresh
-                    st.cache_data.clear()
-                    st.rerun()
-                    
-                else:
-                    # Display error message
-                    error_msg = result.get('error', 'Unknown error occurred')
-                    if 'session' in error_msg.lower() or 'user' in error_msg.lower():
-                        st.error(f"⚠️ {error_msg}")
-                        time.sleep(2)
-                        auth.logout()
-                        st.switch_page("app.py")
-                        st.stop()
-                    else:
-                        st.error(f"❌ {error_msg}")
-                    
-                    # Log technical error if available
-                    if result.get('technical_error'):
-                        logger.error(f"Technical error: {result['technical_error']}")
-                        
-            except Exception as e:
-                # Handle unexpected errors
-                logger.error(f"Unexpected error during cancellation: {e}", exc_info=True)
-                st.error("❌ An unexpected error occurred. Please try again or contact support.")
-    
-    with col2:
-        if st.button("Close", use_container_width=True):
-            # Clear modal state
-            st.session_state.modals['cancel'] = False
-            st.session_state.selections['allocation_for_cancel'] = None
-            
-            # Return to history if context exists
-            return_to_history_if_context()
-            
-            st.rerun()
-
-# ==================== REVERSE CANCELLATION MODAL ====================
-@st.dialog("Reverse Cancellation", width="medium")
-def show_reverse_cancellation_modal():
-    """Modal for reversing a cancellation with user validation"""
-    cancellation = st.session_state.selections['cancellation_for_reverse']
-    
-    if not cancellation:
-        st.error("No cancellation selected")
-        if st.button("Close"):
-            st.session_state.modals['reverse'] = False
-            st.session_state.selections['cancellation_for_reverse'] = None
-            st.rerun()
-        return
-    
-    # Validate user session
-    user_id = st.session_state.user.get('id')
-    if not user_id:
-        st.error("⚠️ Session error. Please login again.")
-        time.sleep(2)
-        auth.logout()
-        st.switch_page("app.py")
-        st.stop()
-    
-    st.markdown("### Reverse Cancellation")
-    
-    # Get UOM info
-    oc_info = st.session_state.selections.get('oc_info', {})
-    standard_uom = oc_info.get('standard_uom', '')
-    
-    # Show cancellation info
-    cancelled_std = cancellation['cancelled_qty']
-    
-    if uom_converter.needs_conversion(oc_info.get('uom_conversion', '1')):
-        cancelled_sell = uom_converter.convert_quantity(
-            cancelled_std, 'standard', 'selling', 
-            oc_info.get('uom_conversion', '1')
-        )
-        selling_uom = oc_info.get('selling_uom', '')
-        st.info(
-            f"Cancelled Quantity: {format_number(cancelled_std)} {standard_uom} "
-            f"(= {format_number(cancelled_sell)} {selling_uom})"
-        )
-    else:
-        st.info(f"Cancelled Quantity: {format_number(cancelled_std)} {standard_uom}")
-    
-    st.caption(f"Cancelled on: {format_date(cancellation['cancelled_date'])} by {cancellation['cancelled_by']}")
-    st.caption(f"Original reason: {cancellation['reason']}")
-    
-    # Reversal reason
-    reversal_reason = st.text_area(
-        "Reversal Reason",
-        help="Please explain why this cancellation is being reversed (minimum 10 characters)",
-        placeholder="Explain why you are reversing this cancellation..."
-    )
-    
-    # Validation
-    valid, error = validator.validate_reverse_cancellation(
-        cancellation,
-        reversal_reason,
-        st.session_state.user['role']
-    )
-    
-    if not valid:
-        st.error(f"❌ {error}")
-    
-    # Action buttons
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("Reverse Cancellation", type="primary", disabled=not valid):
-            result = allocation_service.reverse_cancellation(
-                cancellation['cancellation_id'],
-                reversal_reason,
-                user_id  # Using validated user_id
-            )
-            
-            if result['success']:
-                st.success("✅ Cancellation reversed successfully")
-                time.sleep(1)
-                
-                return_to_history_if_context()
-                st.cache_data.clear()
-                st.rerun()
-            else:
-                error_msg = result.get('error', 'Unknown error')
-                if 'session' in error_msg.lower() or 'user' in error_msg.lower():
-                    st.error(f"⚠️ {error_msg}")
-                    time.sleep(2)
-                    auth.logout()
-                    st.switch_page("app.py")
-                    st.stop()
-                else:
-                    st.error(f"❌ {error_msg}")
-    
-    with col2:
-        if st.button("Close"):
-            st.session_state.modals['reverse'] = False
-            return_to_history_if_context()
-            st.rerun()
-
-def return_to_history_if_context():
-    """Return to history modal if context exists"""
-    if st.session_state.context.get('return_to_history'):
-        st.session_state.modals['history'] = True
-        st.session_state.selections['oc_for_history'] = st.session_state.context['return_to_history']['oc_detail_id']
-        st.session_state.selections['oc_info'] = st.session_state.context['return_to_history']['oc_info']
-        st.session_state.context['return_to_history'] = None
-
 # ==================== MAIN EXECUTION ====================
 def main():
-    """Main function to run the allocation planning page"""
+    """Main function - orchestrates the page"""
     
-    # Validate user session at the start
+    # Validate user session
     if not auth.check_session():
         st.warning("⚠️ Your session has expired. Please login again.")
         time.sleep(2)
@@ -2597,21 +934,20 @@ def main():
     if st.session_state.modals.get('reverse') and not st.session_state.selections.get('cancellation_for_reverse'):
         st.session_state.modals['reverse'] = False
     
+    # Display main page
     show_header()
     show_metrics_row()
     st.divider()
     
-    # Search and filters
     show_search_bar()
     show_quick_filters()
     show_active_filters()
     
     st.divider()
     
-    # Product list
     show_product_list()
     
-    # Show modals based on state
+    # Handle modals
     if st.session_state.modals['allocation'] and st.session_state.selections.get('oc_for_allocation'):
         show_allocation_modal()
     
