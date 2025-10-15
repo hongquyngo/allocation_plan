@@ -14,7 +14,7 @@ from threading import local
 
 from ..db import get_db_engine
 from ..config import config
-from .data_service import AllocationDataService
+from .supply_data import SupplyData
 from .uom_converter import UOMConverter
 
 logger = logging.getLogger(__name__)
@@ -60,7 +60,7 @@ class AllocationService:
     
     def __init__(self):
         self.engine = get_db_engine()
-        self.data_service = AllocationDataService()
+        self.supply_data = SupplyData()
         self.uom_converter = UOMConverter()
         
         # Configuration
@@ -217,7 +217,7 @@ class AllocationService:
                 }
             
             with self.db_transaction() as conn:
-                # ADDED: Validate user exists and is active
+                # Validate user exists and is active
                 user_valid, user_error, user_info = self._validate_user_id(conn, user_id)
                 if not user_valid:
                     return {
@@ -255,7 +255,7 @@ class AllocationService:
                 
                 result = conn.execute(plan_query, {
                     'allocation_number': allocation_number,
-                    'creator_id': user_id,  # Validated user_id
+                    'creator_id': user_id,
                     'notes': notes,
                     'allocation_context': json.dumps(allocation_context)
                 })
@@ -330,7 +330,7 @@ class AllocationService:
                 }
             
             with self.db_transaction() as conn:
-                # ADDED: Validate user exists and is active
+                # Validate user exists and is active
                 user_valid, user_error, user_info = self._validate_user_id(conn, user_id)
                 if not user_valid:
                     return {
@@ -384,7 +384,7 @@ class AllocationService:
                     'cancelled_qty': cancelled_qty_decimal,
                     'reason': reason,
                     'reason_category': reason_category,
-                    'cancelled_by_user_id': user_id  # Validated user_id
+                    'cancelled_by_user_id': user_id
                 })
                 
                 cancellation_id = result.lastrowid
@@ -440,7 +440,7 @@ class AllocationService:
                 }
             
             with self.db_transaction() as conn:
-                # ADDED: Validate user exists and is active
+                # Validate user exists and is active
                 user_valid, user_error, user_info = self._validate_user_id(conn, user_id)
                 if not user_valid:
                     return {
@@ -524,7 +524,7 @@ class AllocationService:
                 }
             
             with self.db_transaction() as conn:
-                # ADDED: Validate user exists and is active
+                # Validate user exists and is active
                 user_valid, user_error, user_info = self._validate_user_id(conn, user_id)
                 if not user_valid:
                     return {
@@ -566,7 +566,7 @@ class AllocationService:
                 """)
                 
                 conn.execute(update_query, {
-                    'user_id': user_id,  # Validated user_id
+                    'user_id': user_id,
                     'reason': reversal_reason,
                     'cancellation_id': cancellation_id
                 })
@@ -948,7 +948,7 @@ class AllocationService:
                     }
                 
                 # Check supply availability
-                available = self.data_service.check_supply_availability(
+                available = self.supply_data.check_supply_availability(
                     alloc['source_type'],
                     alloc['source_id'],
                     product_id
