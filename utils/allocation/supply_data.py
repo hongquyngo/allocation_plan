@@ -1,6 +1,7 @@
 """
 Supply Data Repository - Handles supply source queries
-Extracted from data_service.py for better organization
+REFACTORED: Implemented MIN logic for committed quantity calculation
+to handle data inconsistency during transition period
 """
 import pandas as pd
 import logging
@@ -25,59 +26,95 @@ class SupplyData:
     
     @st.cache_data(ttl=60)
     def get_product_supply_summary(_self, product_id: int) -> Dict[str, Any]:
-        """Get supply summary for a product including availability"""
+        """
+        Get supply summary for a product including availability
+        
+        IMPROVED COMMITTED CALCULATION:
+        Uses MIN logic to handle data inconsistency during transition period
+        Formula: Committed = Σ MIN(pending_delivery, undelivered_allocated)
+        
+        This prevents over-blocking supply when allocation_delivery_links
+        are not yet fully populated with historical delivery data.
+        
+        Returns:
+            Dict with keys:
+            - total_supply: Total available supply from all sources
+            - total_committed: Total committed quantity (using MIN logic)
+            - available: Available supply (total - committed)
+            - coverage_ratio: Percentage of supply available
+        """
         try:
             query = text("""
                 WITH supply_summary AS (
+                    -- ===== TOTAL SUPPLY =====
+                    -- Sum from all supply sources: Inventory, CAN, PO, WHT
                     SELECT 
                         'total_supply' as metric,
                         COALESCE(SUM(total_supply), 0) as value
                     FROM (
+                        -- Inventory
                         SELECT SUM(remaining_quantity) as total_supply
                         FROM inventory_detailed_view
-                        WHERE product_id = :product_id AND remaining_quantity > 0
+                        WHERE product_id = :product_id 
+                          AND remaining_quantity > 0
                         
                         UNION ALL
                         
+                        -- Pending CAN (Confirmed Arrival Notice)
                         SELECT SUM(pending_quantity) as total_supply
                         FROM can_pending_stockin_view
-                        WHERE product_id = :product_id AND pending_quantity > 0
+                        WHERE product_id = :product_id 
+                          AND pending_quantity > 0
                         
                         UNION ALL
                         
+                        -- Pending PO (Purchase Order)
                         SELECT SUM(pending_standard_arrival_quantity) as total_supply
                         FROM purchase_order_full_view
-                        WHERE product_id = :product_id AND pending_standard_arrival_quantity > 0
+                        WHERE product_id = :product_id 
+                          AND pending_standard_arrival_quantity > 0
                         
                         UNION ALL
                         
+                        -- Warehouse Transfer
                         SELECT SUM(transfer_quantity) as total_supply
                         FROM warehouse_transfer_details_view
-                        WHERE product_id = :product_id AND is_completed = 0 AND transfer_quantity > 0
+                        WHERE product_id = :product_id 
+                          AND is_completed = 0 
+                          AND transfer_quantity > 0
                     ) supply_union
                     
                     UNION ALL
                     
+                    -- ===== COMMITTED (IMPROVED MIN LOGIC) =====
+                    -- Formula: Committed = Σ MIN(pending_delivery, undelivered_allocated)
+                    --
+                    -- Why MIN?
+                    -- - pending_delivery: Actual demand from OC system (source of truth)
+                    -- - undelivered_allocated: From allocation system
+                    -- 
+                    -- During transition, some deliveries may not be linked yet in
+                    -- allocation_delivery_links, causing undelivered_allocated to be
+                    -- higher than actual pending. Using MIN prevents over-blocking supply.
+                    --
                     SELECT 
                         'total_committed' as metric,
-                        COALESCE(SUM(
-                            ad.allocated_qty - COALESCE(ac.cancelled_qty, 0) - COALESCE(adl.delivered_qty, 0)
-                        ), 0) as value
-                    FROM allocation_details ad
-                    LEFT JOIN (
-                        SELECT allocation_detail_id, 
-                            SUM(CASE WHEN status = 'ACTIVE' THEN cancelled_qty ELSE 0 END) as cancelled_qty
-                        FROM allocation_cancellations
-                        GROUP BY allocation_detail_id
-                    ) ac ON ad.id = ac.allocation_detail_id
-                    LEFT JOIN (
-                        SELECT allocation_detail_id, SUM(delivered_qty) as delivered_qty
-                        FROM allocation_delivery_links  
-                        GROUP BY allocation_detail_id
-                    ) adl ON ad.id = adl.allocation_detail_id
-                    WHERE ad.product_id = :product_id
-                    AND ad.status = 'ALLOCATED'
-                    AND (ad.allocated_qty - COALESCE(ac.cancelled_qty, 0) - COALESCE(adl.delivered_qty, 0)) > 0
+                        COALESCE(
+                            SUM(
+                                GREATEST(0,  -- Ensure non-negative
+                                    LEAST(
+                                        COALESCE(pending_standard_delivery_quantity, 0),
+                                        COALESCE(undelivered_allocated_qty_standard, 0)
+                                    )
+                                )
+                            ), 
+                        0) as value
+                    FROM outbound_oc_pending_delivery_view
+                    WHERE product_id = :product_id
+                      -- Only count OCs with pending delivery
+                      AND pending_standard_delivery_quantity > 0
+                      -- Only count if there's actual allocation
+                      AND undelivered_allocated_qty_standard > 0
                 )
                 SELECT 
                     MAX(CASE WHEN metric = 'total_supply' THEN value END) as total_supply,
@@ -221,25 +258,26 @@ class SupplyData:
                 WHERE product_id = :product_id AND is_completed = 0 AND transfer_quantity > 0
             ),
             commitments AS (
+                -- IMPROVED: Use MIN logic for commitment calculation
                 SELECT 
                     ad.supply_source_type,
                     ad.supply_source_id,
-                    SUM(ad.allocated_qty - COALESCE(ac.cancelled_qty, 0) - COALESCE(adl.delivered_qty, 0)) as committed_qty
+                    SUM(
+                        GREATEST(0,
+                            LEAST(
+                                COALESCE(ocpd.pending_standard_delivery_quantity, 0),
+                                COALESCE(ocpd.undelivered_allocated_qty_standard, 0)
+                            )
+                        )
+                    ) as committed_qty
                 FROM allocation_details ad
-                LEFT JOIN (
-                    SELECT allocation_detail_id, 
-                        SUM(CASE WHEN status = 'ACTIVE' THEN cancelled_qty ELSE 0 END) as cancelled_qty
-                    FROM allocation_cancellations
-                    GROUP BY allocation_detail_id
-                ) ac ON ad.id = ac.allocation_detail_id
-                LEFT JOIN (
-                    SELECT allocation_detail_id, SUM(delivered_qty) as delivered_qty
-                    FROM allocation_delivery_links  
-                    GROUP BY allocation_detail_id
-                ) adl ON ad.id = adl.allocation_detail_id
+                INNER JOIN outbound_oc_pending_delivery_view ocpd
+                    ON ad.demand_reference_id = ocpd.ocd_id
+                    AND ad.demand_type = 'OC'
                 WHERE ad.product_id = :product_id
-                AND ad.status = 'ALLOCATED'
-                AND (ad.allocated_qty - COALESCE(ac.cancelled_qty, 0) - COALESCE(adl.delivered_qty, 0)) > 0
+                  AND ad.status = 'ALLOCATED'
+                  AND ocpd.pending_standard_delivery_quantity > 0
+                  AND ocpd.undelivered_allocated_qty_standard > 0
                 GROUP BY ad.supply_source_type, ad.supply_source_id
             )
             SELECT 

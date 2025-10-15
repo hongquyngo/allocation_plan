@@ -1,6 +1,6 @@
 """
-Create Allocation Modal - Self-contained modal for creating new allocations
-Extracted from main page for better organization
+Create Allocation Modal - WITH UPDATED COMMITTED TOOLTIP
+Modal for creating new allocations with improved committed calculation explanation
 """
 import streamlit as st
 import time
@@ -77,7 +77,7 @@ def format_supply_info_with_real_time_availability(supply, source_type, oc, curr
 
 @st.dialog("Create Allocation", width="large")
 def show_allocation_modal():
-    """Allocation modal with user validation"""
+    """Allocation modal with user validation and improved committed tooltip"""
     oc = st.session_state.selections['oc_for_allocation']
     
     if not oc:
@@ -125,7 +125,7 @@ def show_allocation_modal():
     standard_uom = oc.get('standard_uom', 'pcs')
     supply_summary = supply_data.get_product_supply_summary(oc['product_id'])
     
-    # Show supply availability overview
+    # ===== SUPPLY OVERVIEW WITH IMPROVED COMMITTED TOOLTIP =====
     st.markdown("**📊 Supply Overview:**")
     col1, col2, col3, col4 = st.columns(4)
     
@@ -137,10 +137,17 @@ def show_allocation_modal():
         )
     
     with col2:
+        # IMPROVED TOOLTIP WITH FORMULA
+        committed_help = (
+            "Already allocated but not yet delivered\n\n"
+            "Formula:\n"
+            "Committed = Σ MIN(pending_delivery, undelivered_allocated)\n\n"
+            "This prevents over-blocking supply when delivery data is incomplete"
+        )
         st.metric(
             "Committed",
             f"{format_number(supply_summary['total_committed'])} {standard_uom}",
-            help="Already allocated but not yet delivered"
+            help=committed_help
         )
     
     with col3:
@@ -163,7 +170,7 @@ def show_allocation_modal():
     if supply_summary['available'] <= 0:
         st.error("❌ No supply available for allocation. All supply has been committed to other orders.")
     elif supply_summary['coverage_ratio'] < 20:
-        st.warning(f"⚠️ Low supply availability! Only {supply_summary['coverage_ratio']:.0f}% of total supply is available.")
+        st.warning(f"⚠️ Low supply availability! Only {supply_summary['coverage_ratio']:.0f}% available.")
     
     st.divider()
     

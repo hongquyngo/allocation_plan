@@ -1,6 +1,6 @@
 """
-Allocation Service for Business Logic - Complete Fixed Version
-Core business logic for allocation operations with proper user validation
+Allocation Service for Business Logic - REFACTORED
+Core business logic with improved committed quantity calculation using MIN logic
 """
 import logging
 from datetime import datetime
@@ -1045,26 +1045,31 @@ class AllocationService:
             return source_type or "Not specified"
     
     def _get_supply_commitment(self, conn, source_type: str, source_id: int) -> Decimal:
-        """Get total pending allocated quantity from a supply source"""
+        """
+        Get total committed quantity from a supply source
+        IMPROVED: Uses MIN logic from outbound_oc_pending_delivery_view
+        """
         query = text("""
-            SELECT CAST(COALESCE(SUM(
-                ad.allocated_qty - COALESCE(ac.cancelled_qty, 0) - COALESCE(adl.delivered_qty, 0)
-            ), 0) AS DECIMAL(15,2)) as committed_qty
+            SELECT 
+                COALESCE(
+                    SUM(
+                        GREATEST(0,
+                            LEAST(
+                                COALESCE(ocpd.pending_standard_delivery_quantity, 0),
+                                COALESCE(ocpd.undelivered_allocated_qty_standard, 0)
+                            )
+                        )
+                    ),
+                0) as committed_qty
             FROM allocation_details ad
-            LEFT JOIN (
-                SELECT allocation_detail_id, SUM(CASE WHEN status = 'ACTIVE' THEN cancelled_qty ELSE 0 END) as cancelled_qty
-                FROM allocation_cancellations
-                GROUP BY allocation_detail_id
-            ) ac ON ad.id = ac.allocation_detail_id
-            LEFT JOIN (
-                SELECT allocation_detail_id, SUM(delivered_qty) as delivered_qty
-                FROM allocation_delivery_links  
-                GROUP BY allocation_detail_id
-            ) adl ON ad.id = adl.allocation_detail_id
+            INNER JOIN outbound_oc_pending_delivery_view ocpd
+                ON ad.demand_reference_id = ocpd.ocd_id
+                AND ad.demand_type = 'OC'
             WHERE ad.supply_source_type = :source_type
-            AND ad.supply_source_id = :source_id
-            AND ad.status = 'ALLOCATED'
-            AND (ad.allocated_qty - COALESCE(ac.cancelled_qty, 0) - COALESCE(adl.delivered_qty, 0)) > 0
+              AND ad.supply_source_id = :source_id
+              AND ad.status = 'ALLOCATED'
+              AND ocpd.pending_standard_delivery_quantity > 0
+              AND ocpd.undelivered_allocated_qty_standard > 0
         """)
         
         result = conn.execute(query, {
@@ -1121,26 +1126,27 @@ class AllocationService:
         return self._to_decimal(result[0] if result else 0)
     
     def _get_total_product_commitment(self, conn, product_id: int) -> Decimal:
-        """Get total undelivered allocated quantity for a product"""
+        """
+        Get total committed quantity for a product
+        IMPROVED: Uses MIN logic from outbound_oc_pending_delivery_view
+        Formula: Committed = Σ MIN(pending_delivery, undelivered_allocated)
+        """
         query = text("""
-            SELECT CAST(COALESCE(SUM(
-                ad.allocated_qty - COALESCE(ac.cancelled_qty, 0) - COALESCE(adl.delivered_qty, 0)
-            ), 0) AS DECIMAL(15,2)) as total_committed
-            FROM allocation_details ad
-            LEFT JOIN (
-                SELECT allocation_detail_id, 
-                    SUM(CASE WHEN status = 'ACTIVE' THEN cancelled_qty ELSE 0 END) as cancelled_qty
-                FROM allocation_cancellations
-                GROUP BY allocation_detail_id
-            ) ac ON ad.id = ac.allocation_detail_id
-            LEFT JOIN (
-                SELECT allocation_detail_id, SUM(delivered_qty) as delivered_qty
-                FROM allocation_delivery_links  
-                GROUP BY allocation_detail_id
-            ) adl ON ad.id = adl.allocation_detail_id
-            WHERE ad.product_id = :product_id
-            AND ad.status = 'ALLOCATED'
-            AND (ad.allocated_qty - COALESCE(ac.cancelled_qty, 0) - COALESCE(adl.delivered_qty, 0)) > 0
+            SELECT 
+                COALESCE(
+                    SUM(
+                        GREATEST(0,
+                            LEAST(
+                                COALESCE(pending_standard_delivery_quantity, 0),
+                                COALESCE(undelivered_allocated_qty_standard, 0)
+                            )
+                        )
+                    ),
+                0) as total_committed
+            FROM outbound_oc_pending_delivery_view
+            WHERE product_id = :product_id
+              AND pending_standard_delivery_quantity > 0
+              AND undelivered_allocated_qty_standard > 0
         """)
         
         result = conn.execute(query, {'product_id': product_id}).fetchone()
