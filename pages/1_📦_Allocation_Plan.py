@@ -1,6 +1,7 @@
 """
 Allocation Planning System - Refactored Main Page
 Product-centric view with proper user session management
+UPDATED: Added tooltips and detailed over-allocation messages
 """
 import streamlit as st
 import pandas as pd
@@ -33,6 +34,13 @@ from utils.allocation.formatters import (
 )
 from utils.allocation.validators import AllocationValidator
 from utils.allocation.uom_converter import UOMConverter
+
+# Import tooltip helpers
+from utils.allocation.tooltip_helpers import (
+    create_oc_tooltip,
+    get_oc_allocation_status,
+    get_allocation_status_color
+)
 
 # Setup logging
 logger = logging.getLogger(__name__)
@@ -589,17 +597,56 @@ def show_product_demand_details(product_id):
         show_oc_row(oc)
 
 def show_oc_row(oc):
-    """Display a single OC row"""
-    # Check for over-allocation warnings
+    """Display a single OC row with DETAILED over-allocation warnings and TOOLTIP"""
+    # ===== DETAILED OVER-ALLOCATION WARNINGS =====
     over_allocation_type = oc.get('over_allocation_type', 'Normal')
     
     if over_allocation_type == 'Over-Committed':
         over_qty = oc.get('over_committed_qty_standard', 0)
-        st.error(f"❌ Over-committed by {format_number(over_qty)} {oc.get('standard_uom')}")
+        effective_qty = oc.get('standard_quantity', 0)
+        total_allocated = oc.get('total_allocated_qty_standard', 0)
+        cancelled_allocated = oc.get('total_allocation_cancelled_qty_standard', 0)
+        effective_allocated = total_allocated - cancelled_allocated
+        
+        if uom_converter.needs_conversion(oc.get('uom_conversion', '1')):
+            over_qty_selling = uom_converter.convert_quantity(
+                over_qty, 'standard', 'selling', oc.get('uom_conversion', '1')
+            )
+            effective_qty_selling = uom_converter.convert_quantity(
+                effective_qty, 'standard', 'selling', oc.get('uom_conversion', '1')
+            )
+            effective_allocated_selling = uom_converter.convert_quantity(
+                effective_allocated, 'standard', 'selling', oc.get('uom_conversion', '1')
+            )
+            st.error(
+                f"❌ Over-committed by {format_number(over_qty_selling)} {oc.get('selling_uom')} - "
+                f"Effective allocation ({format_number(effective_allocated_selling)} {oc.get('selling_uom')}) "
+                f"exceeds OC effective quantity ({format_number(effective_qty_selling)} {oc.get('selling_uom')})"
+            )
+        else:
+            st.error(
+                f"❌ Over-committed by {format_number(over_qty)} {oc.get('standard_uom')} - "
+                f"Effective allocation ({format_number(effective_allocated)} {oc.get('standard_uom')}) "
+                f"exceeds OC effective quantity ({format_number(effective_qty)} {oc.get('standard_uom')})"
+            )
+    
     elif over_allocation_type == 'Pending-Over-Allocated':
         over_qty = oc.get('pending_over_allocated_qty_standard', 0)
-        st.warning(f"⚠️ Pending over-allocated by {format_number(over_qty)} {oc.get('standard_uom')}")
+        if uom_converter.needs_conversion(oc.get('uom_conversion', '1')):
+            over_qty_selling = uom_converter.convert_quantity(
+                over_qty, 'standard', 'selling', oc.get('uom_conversion', '1')
+            )
+            st.warning(
+                f"⚠️ Pending over-allocated by {format_number(over_qty_selling)} {oc.get('selling_uom')} - "
+                f"Undelivered allocation exceeds pending delivery"
+            )
+        else:
+            st.warning(
+                f"⚠️ Pending over-allocated by {format_number(over_qty)} {oc.get('standard_uom')} - "
+                f"Undelivered allocation exceeds pending delivery"
+            )
     
+    # ===== OC ROW DISPLAY =====
     cols = st.columns([2, 2, 1, 1.5, 1.5, 1])
     
     with cols[0]:
@@ -611,42 +658,27 @@ def show_oc_row(oc):
     with cols[2]:
         show_etd_with_urgency(oc['etd'])
     
-    with cols[3]:
+    with cols[3]:  # Pending Delivery with TOOLTIP
         pending_std = float(oc.get('pending_standard_delivery_quantity', 0))
-        st.markdown(f"**{format_number(pending_std)} {oc.get('standard_uom')}**")
+        standard_uom = oc.get('standard_uom', '')
+        
+        # Create comprehensive tooltip
+        tooltip = create_oc_tooltip(oc)
+        
+        st.markdown(
+            f"**{format_number(pending_std)} {standard_uom}**",
+            help=tooltip  # ← TOOLTIP HERE
+        )
         
         if uom_converter.needs_conversion(oc.get('uom_conversion', '1')):
             pending_selling = float(oc.get('pending_quantity', pending_std))
             st.caption(f"= {format_number(pending_selling)} {oc.get('selling_uom')}")
     
-    with cols[4]:
+    with cols[4]:  # Undelivered Allocated with COLOR
         show_undelivered_allocated(oc)
     
     with cols[5]:
         show_allocation_action_button(oc)
-
-def show_etd_with_urgency(etd):
-    """Show ETD with urgency indicator"""
-    if etd is None or pd.isna(etd):
-        st.text("⚫ No ETD")
-        return
-        
-    try:
-        etd_date = pd.to_datetime(etd).date()
-        etd_days = (etd_date - datetime.now().date()).days
-        
-        etd_color = ""
-        if etd_days <= 0:
-            etd_color = "⚫"
-        elif etd_days <= 7:
-            etd_color = "🔴"
-        elif etd_days <= 14:
-            etd_color = "🟡"
-        
-        st.text(f"{etd_color} {format_date(etd)}")
-    except Exception as e:
-        logger.error(f"Error formatting ETD {etd}: {e}")
-        st.text(f"📅 {etd}")
 
 def show_undelivered_allocated(oc):
     """Show undelivered allocated quantity with color coding"""
@@ -654,15 +686,8 @@ def show_undelivered_allocated(oc):
     pending_std = float(oc.get('pending_standard_delivery_quantity', 0))
     standard_uom = oc.get('standard_uom', '')
     
-    # Get color indicator
-    if undelivered_std > pending_std:
-        color = "🔴"
-    elif undelivered_std == pending_std:
-        color = "🟢"
-    elif undelivered_std > 0:
-        color = "🟡"
-    else:
-        color = "⚪"
+    # Get color indicator using helper function
+    color = get_allocation_status_color(pending_std, undelivered_std)
     
     # Create clickable metric if there are allocations
     if oc.get('allocation_count', 0) > 0:
@@ -751,6 +776,29 @@ def show_allocation_action_button(oc):
         st.session_state.modals['allocation'] = True
         st.rerun()
 
+def show_etd_with_urgency(etd):
+    """Show ETD with urgency indicator"""
+    if etd is None or pd.isna(etd):
+        st.text("⚫ No ETD")
+        return
+        
+    try:
+        etd_date = pd.to_datetime(etd).date()
+        etd_days = (etd_date - datetime.now().date()).days
+        
+        etd_color = ""
+        if etd_days <= 0:
+            etd_color = "⚫"
+        elif etd_days <= 7:
+            etd_color = "🔴"
+        elif etd_days <= 14:
+            etd_color = "🟡"
+        
+        st.text(f"{etd_color} {format_date(etd)}")
+    except Exception as e:
+        logger.error(f"Error formatting ETD {etd}: {e}")
+        st.text(f"📅 {etd}")
+
 def show_product_supply_details(product_id):
     """Show supply sources for a product"""
     # Get product standard UOM
@@ -811,7 +859,7 @@ def show_product_supply_details(product_id):
         show_supply_type_summary(product_id, 'wht', standard_uom)
 
 def show_supply_type_summary(product_id, supply_type, standard_uom):
-    """Show individual supply type summary"""
+    """Show individual supply type summary with WAREHOUSE & LOCATION"""
     titles = {
         'inventory': '📦 Inventory',
         'can': '🚢 Pending CAN',
@@ -825,11 +873,20 @@ def show_supply_type_summary(product_id, supply_type, standard_uom):
         df = supply_data.get_inventory_summary(product_id)
         if not df.empty:
             for _, item in df.iterrows():
+                # ===== BUILD LABEL WITH WAREHOUSE =====
+                label = f"Batch {item['batch_number']}"
+                if item.get('warehouse_name'):
+                    label += f" | {item['warehouse_name']}"  # ← WAREHOUSE NAME
+                
                 st.metric(
-                    f"Batch {item['batch_number']}",
+                    label,
                     f"{format_number(item['available_quantity'])} {standard_uom}",
                     delta=f"Exp: {format_date(item['expiry_date'])}"
                 )
+                
+                # ===== SHOW LOCATION =====
+                if item.get('location'):
+                    st.caption(f"📍 Location: {item['location']}")  # ← LOCATION
         else:
             st.caption("No inventory")
     
@@ -849,10 +906,12 @@ def show_supply_type_summary(product_id, supply_type, standard_uom):
         df = supply_data.get_po_summary(product_id)
         if not df.empty:
             for _, item in df.iterrows():
+                etd_str = format_date(item['etd'])
+                eta_str = format_date(item.get('eta')) if item.get('eta') else 'N/A'
                 st.metric(
                     item['po_number'],
                     f"{format_number(item['pending_quantity'])} {standard_uom}",
-                    delta=f"ETD: {format_date(item['etd'])}"
+                    delta=f"ETD: {etd_str} | ETA: {eta_str}"
                 )
         else:
             st.caption("No pending PO")
