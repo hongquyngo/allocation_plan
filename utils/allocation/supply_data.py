@@ -327,7 +327,6 @@ class SupplyData:
                 FROM inventory_detailed_view
                 WHERE product_id = :product_id AND remaining_quantity > 0
                 ORDER BY expiry_date ASC
-                LIMIT 10
             """
             
             with _self.engine.connect() as conn:
@@ -360,7 +359,6 @@ class SupplyData:
                 FROM can_pending_stockin_view
                 WHERE product_id = :product_id AND pending_quantity > 0
                 ORDER BY arrival_date ASC
-                LIMIT 10
             """
             
             with _self.engine.connect() as conn:
@@ -393,7 +391,6 @@ class SupplyData:
                 FROM purchase_order_full_view
                 WHERE product_id = :product_id AND pending_standard_arrival_quantity > 0
                 ORDER BY etd ASC
-                LIMIT 10
             """
             
             with _self.engine.connect() as conn:
@@ -423,7 +420,6 @@ class SupplyData:
                 FROM warehouse_transfer_details_view
                 WHERE product_id = :product_id AND is_completed = 0 AND transfer_quantity > 0
                 ORDER BY transfer_date DESC
-                LIMIT 10
             """
             
             with _self.engine.connect() as conn:

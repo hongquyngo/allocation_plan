@@ -822,7 +822,13 @@ def show_product_supply_details(product_id):
         st.metric("Total Supply", f"{format_number(supply_summary['total_supply'])} {standard_uom}")
     
     with overview_cols[1]:
-        st.metric("Committed", f"{format_number(supply_summary['total_committed'])} {standard_uom}")
+        committed_help = (
+        "Already allocated but not yet delivered\n\n"
+        "Formula:\n" 
+        "Committed = Σ MIN(pending_delivery, undelivered_allocated)\n\n"
+        "This prevents over-blocking supply when delivery data is incomplete"
+    )
+        st.metric("Committed", f"{format_number(supply_summary['total_committed'])} {standard_uom}", help=committed_help)
     
     with overview_cols[2]:
         availability_color = "🟢" if supply_summary['coverage_ratio'] > 50 else "🟡" if supply_summary['coverage_ratio'] > 20 else "🔴"
