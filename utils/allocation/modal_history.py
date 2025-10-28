@@ -371,26 +371,160 @@ def show_cancellation_history_dual_uom(alloc, oc_info):
 
 
 def show_delivery_details(alloc):
-    """Show delivery details from allocation_delivery_links"""
-    with st.expander(f"📦 View Delivery History ({alloc['delivery_count']} deliveries)"):
+    """
+    Show delivery details from allocation_delivery_links
+    REFACTORED: Now displays both Original ETD and Latest ETD
+    """
+    delivery_count = alloc.get('delivery_count', 0)
+    
+    with st.expander(f"📦 View Delivery History ({delivery_count} deliveries)"):
         delivery_df = allocation_data.get_allocation_delivery_details(alloc['allocation_detail_id'])
         
-        if not delivery_df.empty:
-            for _, delivery in delivery_df.iterrows():
-                del_cols = st.columns([2, 1, 1, 1])
+        if delivery_df.empty:
+            st.info("No delivery records found")
+            return
+        
+        # Display each delivery
+        for idx, delivery in delivery_df.iterrows():
+            with st.container():
+                # ===== HEADER ROW =====
+                header_cols = st.columns([3, 2, 2, 2])
                 
-                with del_cols[0]:
-                    st.text(f"📄 {delivery['delivery_number']}")
-                    st.caption(f"Date: {format_date(delivery['delivery_date'])}")
+                with header_cols[0]:
+                    st.markdown(f"**📄 {delivery['delivery_number']}**")
+                    if delivery.get('customer_name'):
+                        st.caption(f"Customer: {delivery['customer_name']}")
                 
-                with del_cols[1]:
-                    st.text(f"{format_number(delivery['delivered_qty'])} pcs")
+                with header_cols[1]:
+                    st.metric(
+                        "Delivered Qty",
+                        f"{format_number(delivery['delivered_qty'])} pcs",
+                        help="Quantity linked to this allocation"
+                    )
+                
+                with header_cols[2]:
+                    status_emoji = {
+                        'DELIVERED': '✅',
+                        'ON_DELIVERY': '🚚',
+                        'DISPATCHED': '📦',
+                        'PENDING': '⏳',
+                        'RECEIVED': '✅'
+                    }.get(delivery['delivery_status'], '📋')
                     
-                with del_cols[2]:
-                    st.text(delivery['delivery_status'])
+                    st.metric(
+                        "Status",
+                        f"{status_emoji} {delivery['delivery_status']}"
+                    )
+                
+                with header_cols[3]:
+                    if delivery.get('from_warehouse'):
+                        st.metric("Warehouse", delivery['from_warehouse'])
+                
+                # ===== DATES ROW =====
+                st.markdown("**📅 Dates:**")
+                date_cols = st.columns(4)
+                
+                with date_cols[0]:
+                    # Original ETD
+                    original_etd = delivery.get('original_etd')
+                    if original_etd and not pd.isna(original_etd):
+                        st.metric(
+                            "Original ETD",
+                            format_date(original_etd),
+                            help="Initial Expected Time of Delivery (from stock_out_delivery.etd_date)"
+                        )
+                    else:
+                        st.caption("Original ETD: N/A")
+                
+                with date_cols[1]:
+                    # Latest ETD (Adjusted)
+                    latest_etd = delivery.get('latest_etd')
                     
-                with del_cols[3]:
-                    st.text(delivery['from_warehouse'])
+                    if latest_etd and not pd.isna(latest_etd):
+                        # Check if ETD was updated
+                        etd_update_count = delivery.get('etd_update_count', 0)
+                        
+                        if etd_update_count and etd_update_count > 0:
+                            st.metric(
+                                "Latest ETD",
+                                format_date(latest_etd),
+                                delta=f"Updated {etd_update_count}x",
+                                help="Adjusted Expected Time of Delivery (from stock_out_delivery.adjust_etd_date)"
+                            )
+                        else:
+                            st.metric(
+                                "Latest ETD",
+                                format_date(latest_etd),
+                                help="Adjusted Expected Time of Delivery (from stock_out_delivery.adjust_etd_date)"
+                            )
+                    else:
+                        # No adjustment, use original
+                        if original_etd and not pd.isna(original_etd):
+                            st.metric(
+                                "Latest ETD",
+                                format_date(original_etd),
+                                help="No adjustment made, using original ETD"
+                            )
+                        else:
+                            st.caption("Latest ETD: N/A")
+                
+                with date_cols[2]:
+                    # Dispatch Date
+                    dispatch_date = delivery.get('dispatch_date')
+                    if dispatch_date and not pd.isna(dispatch_date):
+                        st.metric(
+                            "Dispatched",
+                            format_date(dispatch_date),
+                            help="Date when goods were dispatched"
+                        )
+                    else:
+                        st.caption("Dispatched: N/A")
+                
+                with date_cols[3]:
+                    # Delivered Date
+                    delivered_date = delivery.get('date_delivered')
+                    if delivered_date and not pd.isna(delivered_date):
+                        st.metric(
+                            "Delivered",
+                            format_date(delivered_date),
+                            help="Date when goods were delivered"
+                        )
+                    else:
+                        st.caption("Delivered: N/A")
+                
+                # ===== ADDITIONAL INFO =====
+                if delivery.get('total_delivery_qty') or delivery.get('total_delivery_qty_selling'):
+                    info_cols = st.columns(2)
+                    
+                    with info_cols[0]:
+                        if delivery.get('total_delivery_qty'):
+                            st.caption(f"Total in DN: {format_number(delivery['total_delivery_qty'])} pcs (standard)")
+                    
+                    with info_cols[1]:
+                        if delivery.get('total_delivery_qty_selling'):
+                            st.caption(f"Total in DN: {format_number(delivery['total_delivery_qty_selling'])} pcs (selling)")
+                
+                # ===== ETD COMPARISON WARNING =====
+                    original_date = pd.to_datetime(original_etd).date()
+                    latest_date = pd.to_datetime(latest_etd).date()
+                    
+                    if original_date != latest_date:
+                        diff_days = (latest_date - original_date).days
+                        
+                        if diff_days > 0:
+                            st.warning(
+                                f"⚠️ ETD was delayed by {diff_days} days "
+                                f"(from {format_date(original_date)} to {format_date(latest_date)})"
+                            )
+                        else:
+                            st.info(
+                                f"ℹ️ ETD was advanced by {abs(diff_days)} days "
+                                f"(from {format_date(original_date)} to {format_date(latest_date)})"
+                            )
+                
+                # Separator between deliveries
+                if idx < len(delivery_df) - 1:
+                    st.markdown("---")
 
 
 def show_allocation_history_item(alloc, oc_info):

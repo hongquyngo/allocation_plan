@@ -1,6 +1,6 @@
 """
-Allocation Data Repository - Handles allocation history and metrics
-Extracted from data_service.py for better organization
+Allocation Data Repository - REFACTORED
+Added dual ETD date display (Original ETD + Latest ETD) in delivery history
 """
 import pandas as pd
 import logging
@@ -97,7 +97,10 @@ class AllocationData:
             return pd.DataFrame()
 
     def get_allocation_delivery_details(_self, allocation_detail_id: int) -> pd.DataFrame:
-        """Get delivery details for a specific allocation"""
+        """
+        Get delivery details for a specific allocation
+        REFACTORED: Now returns both Original ETD and Latest ETD
+        """
         try:
             query = """
                 SELECT 
@@ -106,12 +109,27 @@ class AllocationData:
                     adl.created_at as delivery_linked_date,
                     sodrd.id as delivery_detail_id,
                     sod.dn_number as delivery_number,
-                    DATE(COALESCE(sod.etd_date, sodrd.etd, sodrd.adjust_etd)) as delivery_date,
+                    
+                    -- ===== DUAL ETD DATES =====
+                    sod.etd_date as original_etd,
+                    sod.adjust_etd_date as latest_etd,
+                    
+                    -- Current delivery_date (for backwards compatibility)
+                    DATE(COALESCE(sod.adjust_etd_date, sod.etd_date, sodrd.etd, sodrd.adjust_etd)) as delivery_date,
+                    
+                    -- ETD update tracking
+                    sod.etd_update_count,
+                    
                     sodrd.stock_out_quantity as total_delivery_qty,
                     sodrd.selling_stock_out_quantity as total_delivery_qty_selling,
                     sod.shipment_status as delivery_status,
                     w.name as from_warehouse,
-                    c.english_name as customer_name
+                    c.english_name as customer_name,
+                    
+                    -- Additional useful fields
+                    sod.dispatch_date,
+                    sod.date_delivered
+                    
                 FROM allocation_delivery_links adl
                 INNER JOIN stock_out_delivery_request_details sodrd ON adl.delivery_detail_id = sodrd.id
                 INNER JOIN stock_out_delivery sod ON sodrd.delivery_id = sod.id
