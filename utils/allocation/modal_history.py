@@ -370,6 +370,29 @@ def show_cancellation_history_dual_uom(alloc, oc_info):
                 st.info(f"✅ Reversed on {format_date(cancel['reversed_date'])} by {cancel['reversed_by']}")
 
 
+def render_compact_metric(label: str, value: str, help_text: str = None, color: str = None, delta: str = None):
+    """Render a compact metric with smaller font size for professional look"""
+    color_style = f"color: {color};" if color else ""
+    
+    help_icon = ""
+    if help_text:
+        # Simple tooltip using title attribute
+        help_icon = f'<span title="{help_text}" style="cursor: help; color: #999; margin-left: 4px; font-size: 0.7rem;">ⓘ</span>'
+    
+    delta_html = ""
+    if delta:
+        delta_html = f'<div style="font-size: 0.7rem; color: #666; margin-top: 2px;">{delta}</div>'
+    
+    html = f"""
+    <div style='margin-bottom: 8px;'>
+        <div style='font-size: 0.75rem; color: #666; margin-bottom: 2px;'>{label}{help_icon}</div>
+        <div style='font-size: 1rem; font-weight: 600; {color_style}'>{value}</div>
+        {delta_html}
+    </div>
+    """
+    return html
+
+
 def show_delivery_details(alloc):
     """
     Show delivery details from allocation_delivery_links
@@ -396,10 +419,13 @@ def show_delivery_details(alloc):
                         st.caption(f"Customer: {delivery['customer_name']}")
                 
                 with header_cols[1]:
-                    st.metric(
-                        "Delivered Qty",
-                        f"{format_number(delivery['delivered_qty'])} pcs",
-                        help="Quantity linked to this allocation"
+                    st.markdown(
+                        render_compact_metric(
+                            "Delivered Qty",
+                            f"{format_number(delivery['delivered_qty'])} pcs",
+                            help_text="Quantity linked to this allocation"
+                        ),
+                        unsafe_allow_html=True
                     )
                 
                 with header_cols[2]:
@@ -411,14 +437,32 @@ def show_delivery_details(alloc):
                         'RECEIVED': '✅'
                     }.get(delivery['delivery_status'], '📋')
                     
-                    st.metric(
-                        "Status",
-                        f"{status_emoji} {delivery['delivery_status']}"
+                    status_color = {
+                        'DELIVERED': '#10b981',
+                        'ON_DELIVERY': '#3b82f6',
+                        'DISPATCHED': '#8b5cf6',
+                        'PENDING': '#f59e0b',
+                        'RECEIVED': '#10b981'
+                    }.get(delivery['delivery_status'], '#6b7280')
+                    
+                    st.markdown(
+                        render_compact_metric(
+                            "Status",
+                            f"{status_emoji} {delivery['delivery_status']}",
+                            color=status_color
+                        ),
+                        unsafe_allow_html=True
                     )
                 
                 with header_cols[3]:
                     if delivery.get('from_warehouse'):
-                        st.metric("Warehouse", delivery['from_warehouse'])
+                        st.markdown(
+                            render_compact_metric(
+                                "Warehouse",
+                                delivery['from_warehouse']
+                            ),
+                            unsafe_allow_html=True
+                        )
                 
                 # ===== DATES ROW =====
                 st.markdown("**📅 Dates:**")
@@ -428,10 +472,13 @@ def show_delivery_details(alloc):
                     # Original ETD
                     original_etd = delivery.get('original_etd')
                     if original_etd and not pd.isna(original_etd):
-                        st.metric(
-                            "Original ETD",
-                            format_date(original_etd),
-                            help="Initial Expected Time of Delivery (from stock_out_delivery.etd_date)"
+                        st.markdown(
+                            render_compact_metric(
+                                "Original ETD",
+                                format_date(original_etd),
+                                help_text="Initial Expected Time of Delivery (from stock_out_delivery.etd_date)"
+                            ),
+                            unsafe_allow_html=True
                         )
                     else:
                         st.caption("Original ETD: N/A")
@@ -445,25 +492,34 @@ def show_delivery_details(alloc):
                         etd_update_count = delivery.get('etd_update_count', 0)
                         
                         if etd_update_count and etd_update_count > 0:
-                            st.metric(
-                                "Latest ETD",
-                                format_date(latest_etd),
-                                delta=f"Updated {etd_update_count}x",
-                                help="Adjusted Expected Time of Delivery (from stock_out_delivery.adjust_etd_date)"
+                            st.markdown(
+                                render_compact_metric(
+                                    "Latest ETD",
+                                    format_date(latest_etd),
+                                    delta=f"Updated {etd_update_count}x",
+                                    help_text="Adjusted Expected Time of Delivery (from stock_out_delivery.adjust_etd_date)"
+                                ),
+                                unsafe_allow_html=True
                             )
                         else:
-                            st.metric(
-                                "Latest ETD",
-                                format_date(latest_etd),
-                                help="Adjusted Expected Time of Delivery (from stock_out_delivery.adjust_etd_date)"
+                            st.markdown(
+                                render_compact_metric(
+                                    "Latest ETD",
+                                    format_date(latest_etd),
+                                    help_text="Adjusted Expected Time of Delivery (from stock_out_delivery.adjust_etd_date)"
+                                ),
+                                unsafe_allow_html=True
                             )
                     else:
                         # No adjustment, use original
                         if original_etd and not pd.isna(original_etd):
-                            st.metric(
-                                "Latest ETD",
-                                format_date(original_etd),
-                                help="No adjustment made, using original ETD"
+                            st.markdown(
+                                render_compact_metric(
+                                    "Latest ETD",
+                                    format_date(original_etd),
+                                    help_text="No adjustment made, using original ETD"
+                                ),
+                                unsafe_allow_html=True
                             )
                         else:
                             st.caption("Latest ETD: N/A")
@@ -472,10 +528,13 @@ def show_delivery_details(alloc):
                     # Dispatch Date
                     dispatch_date = delivery.get('dispatch_date')
                     if dispatch_date and not pd.isna(dispatch_date):
-                        st.metric(
-                            "Dispatched",
-                            format_date(dispatch_date),
-                            help="Date when goods were dispatched"
+                        st.markdown(
+                            render_compact_metric(
+                                "Dispatched",
+                                format_date(dispatch_date),
+                                help_text="Date when goods were dispatched"
+                            ),
+                            unsafe_allow_html=True
                         )
                     else:
                         st.caption("Dispatched: N/A")
@@ -484,10 +543,13 @@ def show_delivery_details(alloc):
                     # Delivered Date
                     delivered_date = delivery.get('date_delivered')
                     if delivered_date and not pd.isna(delivered_date):
-                        st.metric(
-                            "Delivered",
-                            format_date(delivered_date),
-                            help="Date when goods were delivered"
+                        st.markdown(
+                            render_compact_metric(
+                                "Delivered",
+                                format_date(delivered_date),
+                                help_text="Date when goods were delivered"
+                            ),
+                            unsafe_allow_html=True
                         )
                     else:
                         st.caption("Delivered: N/A")
