@@ -194,98 +194,103 @@ def show_allocation_modal():
     selected_supplies = []
     total_selected_standard = 0
     
-    # Group by source type
-    for source_type in ['INVENTORY', 'PENDING_CAN', 'PENDING_PO', 'PENDING_WHT']:
-        type_supplies = supply_details[supply_details['source_type'] == source_type]
-        
-        if not type_supplies.empty:
-            source_label = {
-                'INVENTORY': '📦 Inventory',
-                'PENDING_CAN': '🚢 Pending CAN',
-                'PENDING_PO': '📋 Pending PO',
-                'PENDING_WHT': '🚚 WH Transfer'
-            }.get(source_type, source_type)
+        # Check if supply_details has data before processing
+    if supply_details.empty or 'source_type' not in supply_details.columns:
+        st.warning("⚠️ No supply sources available for this product")
+    else:
+
+        # Group by source type
+        for source_type in ['INVENTORY', 'PENDING_CAN', 'PENDING_PO', 'PENDING_WHT']:
+            type_supplies = supply_details[supply_details['source_type'] == source_type]
             
-            st.markdown(f"**{source_label}**")
-            
-            for idx, supply in type_supplies.iterrows():
-                col1, col2 = st.columns([3, 1])
+            if not type_supplies.empty:
+                source_label = {
+                    'INVENTORY': '📦 Inventory',
+                    'PENDING_CAN': '🚢 Pending CAN',
+                    'PENDING_PO': '📋 Pending PO',
+                    'PENDING_WHT': '🚚 WH Transfer'
+                }.get(source_type, source_type)
                 
-                with col1:
-                    # Format supply info with real-time availability
-                    info = format_supply_info_with_real_time_availability(
-                        supply, source_type, oc, total_selected_standard
-                    )
-                    
-                    # Check availability
-                    is_available = supply.get('available_quantity', 0) > 0
-                    
-                    # Check if selecting this would exceed total available
-                    would_exceed_supply = False
-                    if is_available:
-                        max_selectable = min(
-                            supply.get('available_quantity', 0),
-                            supply_summary['available'] - total_selected_standard
-                        )
-                        would_exceed_supply = max_selectable <= 0
-                    
-                    # Set appropriate help text
-                    if not is_available:
-                        help_text = "No quantity available - fully committed"
-                    elif would_exceed_supply:
-                        help_text = "⚠️ Cannot select - would exceed total available supply"
-                    else:
-                        help_text = None
-                    
-                    selected = st.checkbox(
-                        info,
-                        key=f"supply_{supply['source_id']}_{source_type}",
-                        disabled=(not is_available or would_exceed_supply),
-                        help=help_text
-                    )
+                st.markdown(f"**{source_label}**")
                 
-                with col2:
-                    if selected and is_available and not would_exceed_supply:
-                        # Calculate remaining requirement
-                        pending_standard = oc.get('pending_standard_delivery_quantity', oc['pending_quantity'])
-                        available_qty = supply.get('available_quantity', 0)
-                        remaining_supply_cap = supply_summary['available'] - total_selected_standard
-                        max_qty_standard = min(
-                            available_qty, 
-                            pending_standard - total_selected_standard,
-                            remaining_supply_cap
+                for idx, supply in type_supplies.iterrows():
+                    col1, col2 = st.columns([3, 1])
+                    
+                    with col1:
+                        # Format supply info with real-time availability
+                        info = format_supply_info_with_real_time_availability(
+                            supply, source_type, oc, total_selected_standard
                         )
                         
-                        # Show equivalent selling quantity
-                        if uom_converter.needs_conversion(oc.get('uom_conversion', '1')):
-                            max_qty_selling = uom_converter.convert_quantity(
-                                max_qty_standard,
-                                'standard',
-                                'selling',
-                                oc.get('uom_conversion', '1')
+                        # Check availability
+                        is_available = supply.get('available_quantity', 0) > 0
+                        
+                        # Check if selecting this would exceed total available
+                        would_exceed_supply = False
+                        if is_available:
+                            max_selectable = min(
+                                supply.get('available_quantity', 0),
+                                supply_summary['available'] - total_selected_standard
                             )
-                            help_text = f"Max: {format_number(max_qty_standard)} {standard_uom} (= {format_number(max_qty_selling)} {oc.get('selling_uom', 'pcs')})"
-                        else:
-                            help_text = f"Max: {format_number(max_qty_standard)} {standard_uom}"
+                            would_exceed_supply = max_selectable <= 0
                         
-                        qty_standard = st.number_input(
-                            f"Qty ({standard_uom})",
-                            min_value=0.0,
-                            max_value=float(max_qty_standard),
-                            value=float(max_qty_standard),
-                            step=1.0,
-                            key=f"qty_{supply['source_id']}_{source_type}",
+                        # Set appropriate help text
+                        if not is_available:
+                            help_text = "No quantity available - fully committed"
+                        elif would_exceed_supply:
+                            help_text = "⚠️ Cannot select - would exceed total available supply"
+                        else:
+                            help_text = None
+                        
+                        selected = st.checkbox(
+                            info,
+                            key=f"supply_{supply['source_id']}_{source_type}",
+                            disabled=(not is_available or would_exceed_supply),
                             help=help_text
                         )
-                        
-                        if qty_standard > 0:
-                            selected_supplies.append({
-                                'source_type': source_type,
-                                'source_id': supply['source_id'],
-                                'quantity': qty_standard,
-                                'supply_info': supply.to_dict()
-                            })
-                            total_selected_standard += qty_standard
+                    
+                    with col2:
+                        if selected and is_available and not would_exceed_supply:
+                            # Calculate remaining requirement
+                            pending_standard = oc.get('pending_standard_delivery_quantity', oc['pending_quantity'])
+                            available_qty = supply.get('available_quantity', 0)
+                            remaining_supply_cap = supply_summary['available'] - total_selected_standard
+                            max_qty_standard = min(
+                                available_qty, 
+                                pending_standard - total_selected_standard,
+                                remaining_supply_cap
+                            )
+                            
+                            # Show equivalent selling quantity
+                            if uom_converter.needs_conversion(oc.get('uom_conversion', '1')):
+                                max_qty_selling = uom_converter.convert_quantity(
+                                    max_qty_standard,
+                                    'standard',
+                                    'selling',
+                                    oc.get('uom_conversion', '1')
+                                )
+                                help_text = f"Max: {format_number(max_qty_standard)} {standard_uom} (= {format_number(max_qty_selling)} {oc.get('selling_uom', 'pcs')})"
+                            else:
+                                help_text = f"Max: {format_number(max_qty_standard)} {standard_uom}"
+                            
+                            qty_standard = st.number_input(
+                                f"Qty ({standard_uom})",
+                                min_value=0.0,
+                                max_value=float(max_qty_standard),
+                                value=float(max_qty_standard),
+                                step=1.0,
+                                key=f"qty_{supply['source_id']}_{source_type}",
+                                help=help_text
+                            )
+                            
+                            if qty_standard > 0:
+                                selected_supplies.append({
+                                    'source_type': source_type,
+                                    'source_id': supply['source_id'],
+                                    'quantity': qty_standard,
+                                    'supply_info': supply.to_dict()
+                                })
+                                total_selected_standard += qty_standard
     
     st.divider()
     
