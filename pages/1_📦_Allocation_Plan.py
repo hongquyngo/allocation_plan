@@ -1,7 +1,7 @@
 """
-Allocation Planning System - Refactored Main Page
-Product-centric view with proper user session management
-UPDATED: Added tooltips and detailed over-allocation messages
+Allocation Planning System - REFACTORED Main Page
+Product-centric view with Dropdown Filter Support
+UPDATED: New filter UI with multiselect dropdowns
 """
 import streamlit as st
 import pandas as pd
@@ -86,7 +86,16 @@ DEFAULT_SESSION_STATE = {
         'allocation_for_update': None,
         'cancellation_for_reverse': None
     },
-    'filters': {},
+    'filters': {
+        'product_ids': [],
+        'brand_ids': [],
+        'customer_codes': [],
+        'legal_entities': [],
+        'supply_status': None,
+        'etd_urgency': None,
+        'allocation_status': None,
+        'search': ''
+    },
     'ui': {
         'page_number': 1,
         'expanded_products': set()
@@ -107,6 +116,10 @@ def init_session_state():
     # Ensure modal states are properly initialized
     if 'modals' not in st.session_state:
         st.session_state.modals = DEFAULT_SESSION_STATE['modals'].copy()
+    
+    # Ensure filters are properly initialized
+    if 'filters' not in st.session_state:
+        st.session_state.filters = DEFAULT_SESSION_STATE['filters'].copy()
     
     # Handle user session with validation
     if 'user' not in st.session_state:
@@ -147,6 +160,33 @@ init_session_state()
 
 # Constants
 ITEMS_PER_PAGE = config.get_app_setting('ITEMS_PER_PAGE', 50)
+
+# ==================== FILTER OPTIONS ====================
+# Supply Status Options
+SUPPLY_STATUS_OPTIONS = {
+    None: "All",
+    'sufficient': "🟢 Sufficient",
+    'partial': "🟡 Partial",
+    'low': "🔴 Low",
+    'no_supply': "⚫ No Supply"
+}
+
+# ETD Urgency Options
+ETD_URGENCY_OPTIONS = {
+    None: "All",
+    'urgent': "🔴 Urgent (≤7 days)",
+    'soon': "🟡 Soon (8-14 days)",
+    'normal': "🟢 Normal (>14 days)"
+}
+
+# Allocation Status Options
+ALLOCATION_STATUS_OPTIONS = {
+    None: "All",
+    'not_allocated': "⏳ Not Allocated",
+    'partial': "🟡 Partially Allocated",
+    'fully_allocated': "✅ Fully Allocated",
+    'over_allocated': "⚡ Over Allocated"
+}
 
 # ==================== HEADER ====================
 def show_header():
@@ -234,169 +274,235 @@ def show_metrics_row():
         logger.error(f"Error loading metrics: {e}")
         st.error(f"Error loading metrics: {str(e)}")
 
-# ==================== SEARCH AND FILTERS ====================
-def show_search_bar():
-    """Display search bar with autocomplete"""
-    col1, col2 = st.columns([3, 1])
-    
-    with col1:
-        search_container = st.container()
-        with search_container:
-            search_col, clear_col = st.columns([10, 1])
-            
-            # Check if we need to clear the search
-            if 'clear_search_flag' in st.session_state and st.session_state.clear_search_flag:
-                search_value = ""
-                del st.session_state.clear_search_flag
-            else:
-                search_value = st.session_state.get('search_input', '')
-            
-            with search_col:
-                search_query = st.text_input(
-                    "🔍 Search",
-                    placeholder="Search by product name, PT code, brand, customer, OC number, or package size...",
-                    key="search_input",
-                    value=search_value,
-                    help="Type at least 2 characters to see suggestions",
-                    label_visibility="collapsed"
-                )
-            
-            with clear_col:
-                if search_query:
-                    if st.button("✖", key="clear_search", help="Clear search"):
-                        st.session_state.clear_search_flag = True
-                        st.session_state.filters.pop('search', None)
-                        st.rerun()
-            
-            # Show suggestions
-            if search_query and len(search_query) >= 2:
-                show_search_suggestions(search_query)
-            
-            if search_query:
-                st.session_state.filters['search'] = search_query
-            else:
-                st.session_state.filters.pop('search', None)
+# ==================== NEW DROPDOWN FILTERS ====================
 
-def show_search_suggestions(search_query):
-    """Display search suggestions"""
-    suggestions = product_data.get_search_suggestions(search_query)
+def show_filters():
+    """Display new dropdown-based filters"""
     
-    has_suggestions = any(suggestions.values())
+    # Load filter options
+    product_options = product_data.get_product_filter_options()
+    brand_options = product_data.get_brand_filter_options()
+    customer_options = product_data.get_customer_filter_options()
+    legal_entity_options = product_data.get_legal_entity_filter_options()
     
-    if has_suggestions:
-        with st.container():
-            if suggestions['products']:
-                st.markdown("**📦 Products**")
-                for idx, product in enumerate(suggestions['products'][:5]):
-                    if st.button(product, key=f"prod_suggest_{idx}", use_container_width=True):
-                        product_name = product.split(" | ")[0]
-                        st.session_state.search_input = product_name
-                        reset_all_modals()
-                        st.rerun()
-            
-            if suggestions['brands']:
-                st.markdown("**🏷️ Brands**")
-                for idx, brand in enumerate(suggestions['brands'][:5]):
-                    if st.button(brand, key=f"brand_suggest_{idx}", use_container_width=True):
-                        st.session_state.search_input = brand
-                        reset_all_modals()
-                        st.rerun()
-            
-            if suggestions['customers']:
-                st.markdown("**🏢 Customers**")
-                for idx, customer in enumerate(suggestions['customers'][:5]):
-                    if st.button(customer, key=f"cust_suggest_{idx}", use_container_width=True):
-                        st.session_state.search_input = customer
-                        reset_all_modals()
-                        st.rerun()
-            
-            if suggestions['oc_numbers']:
-                st.markdown("**📄 OC Numbers**")
-                for idx, oc in enumerate(suggestions['oc_numbers'][:5]):
-                    if st.button(oc, key=f"oc_suggest_{idx}", use_container_width=True):
-                        st.session_state.search_input = oc
-                        reset_all_modals()
-                        st.rerun()
+    # ==================== ROW 1: Entity Filters (Multiselect) ====================
+    st.markdown("**🔍 Filters**")
+    
+    # Adjusted widths: Product(3), Brand(1.5), Customer(3), Legal Entity(1.5)
+    row1_cols = st.columns([3, 1.5, 3, 1.5])
+    
+    with row1_cols[0]:
+        # Products Multiselect
+        product_choices = {p['id']: p['display_text'] for p in product_options}
+        selected_products = st.multiselect(
+            f"Products ({len(product_options)} available)",
+            options=list(product_choices.keys()),
+            default=st.session_state.filters.get('product_ids', []),
+            format_func=lambda x: product_choices.get(x, str(x)),
+            placeholder="All Products",
+            key="filter_products"
+        )
+        st.session_state.filters['product_ids'] = selected_products
+    
+    with row1_cols[1]:
+        # Brands Multiselect
+        brand_choices = {b['id']: b['brand_name'] for b in brand_options}
+        selected_brands = st.multiselect(
+            f"Brands ({len(brand_options)} available)",
+            options=list(brand_choices.keys()),
+            default=st.session_state.filters.get('brand_ids', []),
+            format_func=lambda x: brand_choices.get(x, str(x)),
+            placeholder="All Brands",
+            key="filter_brands"
+        )
+        st.session_state.filters['brand_ids'] = selected_brands
+    
+    with row1_cols[2]:
+        # Customers Multiselect
+        customer_choices = {c['customer_code']: c['customer'] for c in customer_options}
+        selected_customers = st.multiselect(
+            f"Customers ({len(customer_options)} available)",
+            options=list(customer_choices.keys()),
+            default=st.session_state.filters.get('customer_codes', []),
+            format_func=lambda x: customer_choices.get(x, str(x)),
+            placeholder="All Customers",
+            key="filter_customers"
+        )
+        st.session_state.filters['customer_codes'] = selected_customers
+    
+    with row1_cols[3]:
+        # Legal Entity Multiselect
+        le_choices = [le['legal_entity'] for le in legal_entity_options]
+        selected_le = st.multiselect(
+            f"Legal Entity ({len(legal_entity_options)} available)",
+            options=le_choices,
+            default=st.session_state.filters.get('legal_entities', []),
+            placeholder="All Entities",
+            key="filter_legal_entities"
+        )
+        st.session_state.filters['legal_entities'] = selected_le
+    
+    # ==================== ROW 2: Status Filters + Search ====================
+    row2_cols = st.columns(4)
+    
+    with row2_cols[0]:
+        # Supply Status
+        supply_status_keys = list(SUPPLY_STATUS_OPTIONS.keys())
+        supply_status_labels = list(SUPPLY_STATUS_OPTIONS.values())
+        current_supply_idx = supply_status_keys.index(st.session_state.filters.get('supply_status'))
+        
+        selected_supply_status = st.selectbox(
+            "Supply Status",
+            options=supply_status_keys,
+            index=current_supply_idx,
+            format_func=lambda x: SUPPLY_STATUS_OPTIONS.get(x, "All"),
+            key="filter_supply_status"
+        )
+        st.session_state.filters['supply_status'] = selected_supply_status
+    
+    with row2_cols[1]:
+        # ETD Urgency
+        etd_urgency_keys = list(ETD_URGENCY_OPTIONS.keys())
+        current_etd_idx = etd_urgency_keys.index(st.session_state.filters.get('etd_urgency'))
+        
+        selected_etd_urgency = st.selectbox(
+            "ETD Urgency",
+            options=etd_urgency_keys,
+            index=current_etd_idx,
+            format_func=lambda x: ETD_URGENCY_OPTIONS.get(x, "All"),
+            key="filter_etd_urgency"
+        )
+        st.session_state.filters['etd_urgency'] = selected_etd_urgency
+    
+    with row2_cols[2]:
+        # Allocation Status
+        alloc_status_keys = list(ALLOCATION_STATUS_OPTIONS.keys())
+        current_alloc_idx = alloc_status_keys.index(st.session_state.filters.get('allocation_status'))
+        
+        selected_alloc_status = st.selectbox(
+            "Allocation Status",
+            options=alloc_status_keys,
+            index=current_alloc_idx,
+            format_func=lambda x: ALLOCATION_STATUS_OPTIONS.get(x, "All"),
+            key="filter_allocation_status"
+        )
+        st.session_state.filters['allocation_status'] = selected_alloc_status
+    
+    with row2_cols[3]:
+        # Text Search (OC Number, Customer PO)
+        search_value = st.text_input(
+            "🔍 Search (OC#, Customer PO)",
+            value=st.session_state.filters.get('search', ''),
+            placeholder="Enter OC or Customer PO number...",
+            key="filter_search"
+        )
+        st.session_state.filters['search'] = search_value
+    
+    # ==================== ROW 3: Active Filters & Clear Button ====================
+    show_active_filters()
 
-def show_quick_filters():
-    """Display quick filter buttons"""
-    st.markdown("**Quick Filters:**")
-    filter_cols = st.columns(6)
-    
-    quick_filter_buttons = [
-        ("All", "all", None),
-        ("⚠️ Low Supply", "low_supply", {'supply_status': 'low'}),
-        ("🔴 Urgent ETD", "urgent", {'etd_urgency': 'urgent'}),
-        ("⏳ Not Allocated", "not_allocated", {'allocation_status': 'none'}),
-        ("📦 Has Inventory", "has_inventory", {'has_inventory': True}),
-        ("⚡ Over Allocated", "over_allocated", {'over_allocated': True})
-    ]
-    
-    for idx, (label, filter_type, filter_value) in enumerate(quick_filter_buttons):
-        with filter_cols[idx]:
-            is_active = is_filter_active(filter_type)
-            button_type = "primary" if is_active else "secondary"
-            
-            if st.button(label, use_container_width=True, type=button_type):
-                if filter_type == "all":
-                    search_filter = st.session_state.filters.get('search')
-                    st.session_state.filters = {}
-                    if search_filter:
-                        st.session_state.filters['search'] = search_filter
-                else:
-                    st.session_state.filters.update(filter_value)
-                
-                st.session_state.ui['page_number'] = 1
-                reset_all_modals()
-                st.rerun()
-
-def is_filter_active(filter_type):
-    """Check if a filter is active"""
-    if filter_type == 'all':
-        return len([k for k in st.session_state.filters.keys() if k != 'search']) == 0
-    elif filter_type == 'low_supply':
-        return st.session_state.filters.get('supply_status') == 'low'
-    elif filter_type == 'urgent':
-        return st.session_state.filters.get('etd_urgency') == 'urgent'
-    elif filter_type == 'not_allocated':
-        return st.session_state.filters.get('allocation_status') == 'none'
-    elif filter_type == 'has_inventory':
-        return st.session_state.filters.get('has_inventory') == True
-    elif filter_type == 'over_allocated':
-        return st.session_state.filters.get('over_allocated') == True
-    return False
 
 def show_active_filters():
-    """Show active filters with clear buttons"""
-    active_filters = [(k, v) for k, v in st.session_state.filters.items() if k != 'search']
-    if not active_filters:
-        return
+    """Show active filters as chips with clear buttons"""
+    active_filters = []
     
-    st.markdown("**Active Filters:**")
-    filter_container = st.container()
-    with filter_container:
-        display_filters = []
+    # Check each filter
+    if st.session_state.filters.get('product_ids'):
+        count = len(st.session_state.filters['product_ids'])
+        active_filters.append(('product_ids', f"📦 {count} Product(s)"))
+    
+    if st.session_state.filters.get('brand_ids'):
+        count = len(st.session_state.filters['brand_ids'])
+        active_filters.append(('brand_ids', f"🏷️ {count} Brand(s)"))
+    
+    if st.session_state.filters.get('customer_codes'):
+        count = len(st.session_state.filters['customer_codes'])
+        active_filters.append(('customer_codes', f"🏢 {count} Customer(s)"))
+    
+    if st.session_state.filters.get('legal_entities'):
+        count = len(st.session_state.filters['legal_entities'])
+        active_filters.append(('legal_entities', f"🏛️ {count} Entity(ies)"))
+    
+    if st.session_state.filters.get('supply_status'):
+        label = SUPPLY_STATUS_OPTIONS.get(st.session_state.filters['supply_status'], '')
+        active_filters.append(('supply_status', label))
+    
+    if st.session_state.filters.get('etd_urgency'):
+        label = ETD_URGENCY_OPTIONS.get(st.session_state.filters['etd_urgency'], '')
+        active_filters.append(('etd_urgency', label))
+    
+    if st.session_state.filters.get('allocation_status'):
+        label = ALLOCATION_STATUS_OPTIONS.get(st.session_state.filters['allocation_status'], '')
+        active_filters.append(('allocation_status', label))
+    
+    if st.session_state.filters.get('search'):
+        active_filters.append(('search', f"🔍 \"{st.session_state.filters['search']}\""))
+    
+    # Display active filters
+    if active_filters:
+        st.markdown("**Active Filters:**")
         
-        filter_labels = {
-            'supply_status': '⚠️ Low Supply',
-            'etd_urgency': '🔴 Urgent ETD',
-            'allocation_status': '⏳ Not Allocated',
-            'has_inventory': '📦 Has Inventory',
-            'over_allocated': '⚡ Over Allocated'
-        }
+        # Calculate columns needed (max 6 per row + clear all button)
+        num_filters = len(active_filters)
+        cols = st.columns(min(num_filters + 1, 7))
         
-        for key, value in active_filters:
-            filter_label = filter_labels.get(key, f"{key}: {value}")
-            if filter_label:
-                display_filters.append((filter_label, key))
-        
-        cols = st.columns(5)
-        for idx, (label, key) in enumerate(display_filters[:5]):
-            with cols[idx % 5]:
-                if st.button(f"{label} ✕", key=f"clear_{key}"):
-                    st.session_state.filters.pop(key, None)
+        for idx, (key, label) in enumerate(active_filters[:6]):
+            with cols[idx]:
+                if st.button(f"{label} ✕", key=f"clear_{key}", use_container_width=True):
+                    # Clear the specific filter
+                    if key in ['product_ids', 'brand_ids', 'customer_codes', 'legal_entities']:
+                        st.session_state.filters[key] = []
+                    elif key == 'search':
+                        st.session_state.filters[key] = ''
+                    else:
+                        st.session_state.filters[key] = None
                     st.session_state.ui['page_number'] = 1
                     st.rerun()
+        
+        # Clear All button
+        with cols[min(num_filters, 6)]:
+            if st.button("🗑️ Clear All", key="clear_all_filters", use_container_width=True, type="secondary"):
+                st.session_state.filters = DEFAULT_SESSION_STATE['filters'].copy()
+                st.session_state.ui['page_number'] = 1
+                st.rerun()
+    
+    # ==================== FILTER RESULTS COUNT ====================
+    show_filter_results_count()
+
+
+def show_filter_results_count():
+    """Show the count of products matching current filters"""
+    # Get total count with current filters
+    total_count = product_data.get_filtered_product_count(st.session_state.filters)
+    
+    # Check if any filter is active
+    has_filters = has_active_filters()
+    
+    # Display results count
+    if has_filters:
+        if total_count == 0:
+            st.warning(f"⚠️ **No products found** matching your filters. Try adjusting or clearing some filters.")
+        elif total_count == 1:
+            st.success(f"✅ **1 product** found matching your filters")
+        else:
+            st.success(f"✅ **{total_count:,} products** found matching your filters")
+    else:
+        st.info(f"📊 Showing all **{total_count:,} products** with pending demand")
+
+
+def has_active_filters() -> bool:
+    """Check if any filters are active"""
+    filters = st.session_state.filters
+    return (
+        len(filters.get('product_ids', [])) > 0 or
+        len(filters.get('brand_ids', [])) > 0 or
+        len(filters.get('customer_codes', [])) > 0 or
+        len(filters.get('legal_entities', [])) > 0 or
+        filters.get('supply_status') is not None or
+        filters.get('etd_urgency') is not None or
+        filters.get('allocation_status') is not None or
+        (filters.get('search') and len(filters.get('search', '')) > 0)
+    )
 
 # ==================== PRODUCT LIST ====================
 def show_product_list():
@@ -407,9 +513,6 @@ def show_product_list():
             page=st.session_state.ui['page_number'],
             page_size=ITEMS_PER_PAGE
         )
-        
-        if products_df is not None and not products_df.empty:
-            st.caption(f"Found {len(products_df)} products (Page {st.session_state.ui['page_number']})")
     except Exception as e:
         st.error(f"Error loading products: {str(e)}")
         logger.error(f"Error in show_product_list: {e}")
@@ -418,6 +521,10 @@ def show_product_list():
     if products_df.empty:
         show_empty_state()
         return
+    
+    # Show page info only (count is shown in filter results widget)
+    if st.session_state.ui['page_number'] > 1:
+        st.caption(f"Page {st.session_state.ui['page_number']}")
     
     show_product_header()
     
@@ -433,13 +540,13 @@ def show_empty_state():
     with col2:
         st.info("No products found with current filters")
         
-        if st.session_state.filters:
+        if has_active_filters():
             st.write("**Try:**")
             st.write("• Clearing some filters")
             st.write("• Using different search terms")
             
             if st.button("🔄 Clear All Filters and Retry", use_container_width=True):
-                st.session_state.filters = {}
+                st.session_state.filters = DEFAULT_SESSION_STATE['filters'].copy()
                 st.session_state.ui['page_number'] = 1
                 reset_all_modals()
                 st.rerun()
@@ -935,25 +1042,35 @@ def show_supply_type_summary(product_id, supply_type, standard_uom):
             st.caption("No transfers")
 
 def show_pagination(df):
-    """Show pagination controls"""
-    if len(df) == ITEMS_PER_PAGE:
+    """Show pagination controls with page count"""
+    # Get total count to calculate total pages
+    total_count = product_data.get_filtered_product_count(st.session_state.filters)
+    total_pages = max(1, (total_count + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
+    current_page = st.session_state.ui['page_number']
+    
+    # Only show pagination if there are multiple pages
+    if total_pages > 1:
         col1, col2, col3 = st.columns([1, 2, 1])
         
         with col1:
-            if st.session_state.ui['page_number'] > 1:
+            if current_page > 1:
                 if st.button("← Previous", use_container_width=True):
                     st.session_state.ui['page_number'] -= 1
                     reset_all_modals()
                     st.rerun()
         
         with col2:
-            st.markdown(f"<center>Page {st.session_state.ui['page_number']}</center>", unsafe_allow_html=True)
+            st.markdown(
+                f"<center>Page <b>{current_page}</b> of <b>{total_pages}</b> ({total_count:,} products)</center>", 
+                unsafe_allow_html=True
+            )
         
         with col3:
-            if st.button("Next →", use_container_width=True):
-                st.session_state.ui['page_number'] += 1
-                reset_all_modals()
-                st.rerun()
+            if current_page < total_pages:
+                if st.button("Next →", use_container_width=True):
+                    st.session_state.ui['page_number'] += 1
+                    reset_all_modals()
+                    st.rerun()
 
 def reset_all_modals():
     """Reset all modal states and selections"""
@@ -1004,9 +1121,8 @@ def main():
     show_metrics_row()
     st.divider()
     
-    show_search_bar()
-    show_quick_filters()
-    show_active_filters()
+    # NEW: Show dropdown filters instead of quick filter buttons
+    show_filters()
     
     st.divider()
     
