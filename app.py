@@ -77,7 +77,7 @@ def show_login_form():
                         st.balloons()
                         
                         # Redirect to main page
-                        st.switch_page("pages/1_📦_Allocation_Plan.py")
+                        st.switch_page("pages/1_🎯_Allocation_Plan.py")
                     else:
                         # Show error
                         error_msg = result.get("error", "Authentication failed")
@@ -98,7 +98,7 @@ def main():
     # Check if already logged in
     if auth.check_session():
         # Already logged in, redirect to main page
-        st.switch_page("pages/1_📦_Allocation_Plan.py")
+        st.switch_page("pages/1_🎯_Allocation_Plan.py")
     else:
         # Show login form
         show_login_form()

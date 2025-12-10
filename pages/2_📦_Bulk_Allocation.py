@@ -28,7 +28,7 @@ from utils.bulk_allocation.bulk_formatters import (
     format_coverage_badge, format_strategy_name, format_allocation_mode,
     format_etd_urgency, format_scope_summary, format_quantity_with_uom
 )
-from utils.auth import require_auth, get_current_user
+from utils.auth import AuthManager
 
 # Page configuration
 st.set_page_config(
@@ -39,9 +39,14 @@ st.set_page_config(
 )
 
 # Authentication
-require_auth()
-user = get_current_user()
-if not user:
+auth = AuthManager()
+if not auth.check_session():
+    st.warning("⚠️ Please login to access this page")
+    st.stop()
+
+# Get current user from session state
+user = st.session_state.get('user', {})
+if not user or not user.get('id'):
     st.error("Please login to access this page")
     st.stop()
 
