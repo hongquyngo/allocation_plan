@@ -14,8 +14,8 @@ from decimal import Decimal
 import streamlit as st
 from sqlalchemy import text
 
-from ..db import get_db_engine
-from ..config import config
+from utils.db import get_db_engine
+from utils.config import config
 
 logger = logging.getLogger(__name__)
 
@@ -261,7 +261,6 @@ class BulkAllocationData:
             query = f"""
                 SELECT 
                     ocpd.ocd_id,
-                    ocpd.oc_id,
                     ocpd.oc_number,
                     ocpd.oc_date,
                     ocpd.customer_code,
@@ -275,12 +274,12 @@ class BulkAllocationData:
                     ocpd.etd,
                     ocpd.pending_standard_delivery_quantity as pending_qty,
                     ocpd.standard_quantity as effective_qty,
-                    ocpd.total_effective_allocated_qty_standard as allocated_qty,
-                    ocpd.undelivered_allocated_qty_standard as undelivered_allocated,
+                    COALESCE(ocpd.total_effective_allocated_qty_standard, 0) as allocated_qty,
+                    COALESCE(ocpd.undelivered_allocated_qty_standard, 0) as undelivered_allocated,
                     ocpd.standard_uom,
                     ocpd.selling_uom,
-                    ocpd.uom_conversion,
-                    ocpd.outstanding_amount_usd,
+                    COALESCE(ocpd.uom_conversion, 1) as uom_conversion,
+                    COALESCE(ocpd.outstanding_amount_usd, 0) as outstanding_amount_usd,
                     ocpd.over_allocation_type,
                     -- Calculate remaining allocatable
                     GREATEST(0, 
