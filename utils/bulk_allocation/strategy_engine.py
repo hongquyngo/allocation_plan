@@ -454,8 +454,17 @@ class HybridStrategy(AllocationStrategy):
                     for ocd_id, need in needs:
                         if need > 0:
                             share = (need / total_need) * available
+                            # IMPORTANT: Cap share to remaining need to avoid over-allocation
+                            share = min(share, need)
                             if share >= config.min_allocation_qty:
                                 accumulated[ocd_id] = accumulated.get(ocd_id, 0) + share
+        
+        # FINAL CAP: Ensure no allocation exceeds max_alloc
+        for _, row in demands.iterrows():
+            ocd_id = int(row['ocd_id'])
+            max_alloc = self._calculate_max_allocatable(row, config)
+            if accumulated.get(ocd_id, 0) > max_alloc:
+                accumulated[ocd_id] = max_alloc
         
         # Build final results
         for _, row in demands.iterrows():
