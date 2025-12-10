@@ -97,10 +97,34 @@ def show_update_etd_modal():
         else:
             st.success(f"✅ Advancing by {abs(diff_days)} days")
     
+    # Initialize processing state for this modal
+    if 'etd_update_processing' not in st.session_state:
+        st.session_state.etd_update_processing = False
+    
     # Action buttons
     col1, col2 = st.columns(2)
     with col1:
-        if st.button("Update ETD", type="primary", disabled=(new_etd == current_etd)):
+        # Disable button if: same ETD, or currently processing
+        button_disabled = (new_etd == current_etd) or st.session_state.etd_update_processing
+        
+        if st.button("Update ETD", type="primary", disabled=button_disabled, use_container_width=True):
+            # Set processing flag immediately
+            st.session_state.etd_update_processing = True
+            st.rerun()
+    
+    with col2:
+        if st.button("Close", use_container_width=True, disabled=st.session_state.etd_update_processing):
+            st.session_state.modals['update_etd'] = False
+            st.session_state.etd_update_processing = False
+            return_to_history_if_context()
+            st.rerun()
+    
+    # Process update when flag is set
+    if st.session_state.etd_update_processing:
+        with st.status("Processing...", expanded=True) as status:
+            # Step 1: Save to database
+            status.update(label="💾 Saving ETD changes...", state="running")
+            
             result = allocation_service.update_allocation_etd(
                 allocation['allocation_detail_id'],
                 new_etd,
@@ -108,11 +132,13 @@ def show_update_etd_modal():
             )
             
             if result['success']:
-                st.success("✅ ETD updated successfully")
+                st.write(f"✅ ETD updated: {format_date(current_etd)} → {format_date(new_etd)}")
                 if result.get('update_count'):
-                    st.caption(f"This is update #{result['update_count']} for this allocation")
+                    st.write(f"📝 This is update #{result['update_count']} for this allocation")
                 
-                # Send email notification
+                # Step 2: Send email notification
+                status.update(label="📧 Sending email notification...", state="running")
+                
                 try:
                     pending_qty = allocation.get('pending_allocated_qty', 0)
                     # Get ocd_id from context (stored when opening from history)
@@ -121,10 +147,6 @@ def show_update_etd_modal():
                         ocd_id = st.session_state.context['return_to_history'].get('oc_detail_id')
                     if not ocd_id:
                         ocd_id = st.session_state.selections.get('oc_for_history')
-                    
-                    # Debug logging
-                    import logging
-                    logging.info(f"[ETD Email] ocd_id={ocd_id}, context={st.session_state.context.get('return_to_history')}, oc_for_history={st.session_state.selections.get('oc_for_history')}")
                     
                     if ocd_id:
                         email_success, email_msg = email_service.send_allocation_etd_updated_email(
@@ -137,17 +159,20 @@ def show_update_etd_modal():
                             user_id=user_id
                         )
                         if email_success:
-                            st.caption("📧 Email notification sent")
+                            st.write("✅ Email notification sent")
                         else:
-                            st.caption(f"⚠️ Email not sent: {email_msg}")
+                            st.write(f"⚠️ Email not sent: {email_msg}")
                     else:
-                        st.caption("⚠️ Email not sent: Missing OC reference")
+                        st.write("⚠️ Email not sent: Missing OC reference")
                 except Exception as email_error:
-                    st.caption(f"⚠️ Email error: {str(email_error)}")
+                    st.write(f"⚠️ Email error: {str(email_error)}")
                 
-                time.sleep(1)
+                # Step 3: Complete
+                status.update(label="✅ Update complete!", state="complete", expanded=False)
+                time.sleep(1.5)
                 
-                # Close this modal before opening history
+                # Cleanup and close
+                st.session_state.etd_update_processing = False
                 st.session_state.modals['update_etd'] = False
                 st.session_state.selections['allocation_for_update'] = None
                 
@@ -156,18 +181,16 @@ def show_update_etd_modal():
                 st.cache_data.clear()
                 st.rerun()
             else:
+                # Handle error
                 error_msg = result.get('error', 'Unknown error')
+                status.update(label="❌ Update failed", state="error")
+                st.error(f"❌ {error_msg}")
+                
+                # Reset processing flag to allow retry
+                st.session_state.etd_update_processing = False
+                
                 if 'session' in error_msg.lower() or 'user' in error_msg.lower():
-                    st.error(f"⚠️ {error_msg}")
                     time.sleep(2)
                     auth.logout()
                     st.switch_page("app.py")
                     st.stop()
-                else:
-                    st.error(f"❌ {error_msg}")
-    
-    with col2:
-        if st.button("Close"):
-            st.session_state.modals['update_etd'] = False
-            return_to_history_if_context()
-            st.rerun()

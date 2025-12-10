@@ -94,22 +94,49 @@ def show_reverse_cancellation_modal():
     if not valid:
         st.error(f"❌ {error}")
     
+    # Initialize processing state for this modal
+    if 'reverse_processing' not in st.session_state:
+        st.session_state.reverse_processing = False
+    
     # Action buttons
     col1, col2 = st.columns(2)
     with col1:
-        if st.button("Reverse Cancellation", type="primary", disabled=not valid):
+        button_disabled = (not valid) or st.session_state.reverse_processing
+        
+        if st.button("Reverse Cancellation", type="primary", use_container_width=True, disabled=button_disabled):
+            st.session_state.reverse_processing = True
+            st.session_state._reverse_data = {'reversal_reason': reversal_reason}
+            st.rerun()
+    
+    with col2:
+        if st.button("Close", use_container_width=True, disabled=st.session_state.reverse_processing):
+            st.session_state.modals['reverse'] = False
+            st.session_state.reverse_processing = False
+            return_to_history_if_context()
+            st.rerun()
+    
+    # Process reversal when flag is set
+    if st.session_state.reverse_processing:
+        saved_reason = st.session_state.get('_reverse_data', {}).get('reversal_reason', reversal_reason)
+        
+        with st.status("Processing reversal...", expanded=True) as status:
+            # Step 1: Execute reversal
+            status.update(label="💾 Reversing cancellation...", state="running")
+            
             result = allocation_service.reverse_cancellation(
                 cancellation['cancellation_id'],
-                reversal_reason,
+                saved_reason,
                 user_id
             )
             
             if result['success']:
-                st.success("✅ Cancellation reversed successfully")
+                cancelled_qty = cancellation.get('cancelled_qty', 0)
+                st.write(f"✅ Restored {format_number(cancelled_qty)} {oc_info.get('standard_uom', '')} to allocation")
                 
-                # Send email notification
+                # Step 2: Send email notification
+                status.update(label="📧 Sending email notification...", state="running")
+                
                 try:
-                    # Get ocd_id from context (stored when opening from history)
                     ocd_id = None
                     if st.session_state.context.get('return_to_history'):
                         ocd_id = st.session_state.context['return_to_history'].get('oc_detail_id')
@@ -120,22 +147,26 @@ def show_reverse_cancellation_modal():
                         email_success, email_msg = email_service.send_cancellation_reversed_email(
                             ocd_id=ocd_id,
                             allocation_number=cancellation.get('allocation_number', ''),
-                            restored_qty=cancellation.get('cancelled_qty', 0),
-                            reversal_reason=reversal_reason,
+                            restored_qty=cancelled_qty,
+                            reversal_reason=saved_reason,
                             user_id=user_id
                         )
                         if email_success:
-                            st.caption("📧 Email notification sent")
+                            st.write("✅ Email notification sent")
                         else:
-                            st.caption(f"⚠️ Email not sent: {email_msg}")
+                            st.write(f"⚠️ Email not sent: {email_msg}")
                     else:
-                        st.caption("⚠️ Email not sent: Missing OC reference")
+                        st.write("⚠️ Email not sent: Missing OC reference")
                 except Exception as email_error:
-                    st.caption(f"⚠️ Email error: {str(email_error)}")
+                    st.write(f"⚠️ Email error: {str(email_error)}")
                 
-                time.sleep(1)
+                # Step 3: Complete
+                status.update(label="✅ Reversal complete!", state="complete", expanded=False)
+                time.sleep(1.5)
                 
-                # Close this modal before opening history
+                # Cleanup
+                st.session_state.reverse_processing = False
+                st.session_state._reverse_data = None
                 st.session_state.modals['reverse'] = False
                 st.session_state.selections['cancellation_for_reverse'] = None
                 
@@ -143,18 +174,16 @@ def show_reverse_cancellation_modal():
                 st.cache_data.clear()
                 st.rerun()
             else:
+                # Handle error
                 error_msg = result.get('error', 'Unknown error')
+                status.update(label="❌ Reversal failed", state="error")
+                st.error(f"❌ {error_msg}")
+                
+                st.session_state.reverse_processing = False
+                st.session_state._reverse_data = None
+                
                 if 'session' in error_msg.lower() or 'user' in error_msg.lower():
-                    st.error(f"⚠️ {error_msg}")
                     time.sleep(2)
                     auth.logout()
                     st.switch_page("app.py")
                     st.stop()
-                else:
-                    st.error(f"❌ {error_msg}")
-    
-    with col2:
-        if st.button("Close"):
-            st.session_state.modals['reverse'] = False
-            return_to_history_if_context()
-            st.rerun()

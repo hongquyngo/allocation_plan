@@ -31,10 +31,8 @@ class AllocationEmailService:
     def get_oc_creator_info(self, ocd_id: int) -> Optional[Dict]:
         """Get OC creator information from order_confirmations"""
         try:
-            logger.info(f"get_oc_creator_info called with ocd_id={ocd_id}, type={type(ocd_id)}")
-            
             if not ocd_id:
-                logger.warning("ocd_id is None or empty")
+                logger.warning("get_oc_creator_info: ocd_id is None or empty")
                 return None
                 
             engine = get_db_engine()
@@ -69,8 +67,6 @@ class AllocationEmailService:
                 result = conn.execute(query, {'ocd_id': ocd_id}).fetchone()
                 if result:
                     row = dict(result._mapping)
-                    logger.info(f"Found OC: {row.get('oc_number')}, creator_email: {row.get('creator_email')}, created_by: {row.get('oc_created_by')}")
-                    # Log if email not found
                     if not row.get('creator_email'):
                         logger.warning(f"OC creator email not found for ocd_id={ocd_id}, created_by={row.get('oc_created_by')}")
                     return row

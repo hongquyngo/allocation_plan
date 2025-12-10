@@ -176,12 +176,16 @@ def show_cancel_allocation_modal():
     
     st.divider()
     
+    # Initialize processing state for this modal
+    if 'cancel_processing' not in st.session_state:
+        st.session_state.cancel_processing = False
+    
     # Action buttons
     col1, col2 = st.columns(2)
     
     with col1:
         # Determine if button should be disabled
-        button_disabled = len(errors) > 0 or cancel_qty <= 0
+        button_disabled = len(errors) > 0 or cancel_qty <= 0 or st.session_state.cancel_processing
         
         if st.button(
             "Cancel Allocation", 
@@ -189,55 +193,75 @@ def show_cancel_allocation_modal():
             use_container_width=True,
             disabled=button_disabled
         ):
-            # Store UOM info before any state changes
-            saved_standard_uom = standard_uom
-            saved_selling_uom = selling_uom
-            saved_conversion = conversion
-            saved_cancel_qty = cancel_qty
-            
+            # Store values and set processing flag
+            st.session_state.cancel_processing = True
+            st.session_state._cancel_data = {
+                'standard_uom': standard_uom,
+                'selling_uom': selling_uom,
+                'conversion': conversion,
+                'cancel_qty': cancel_qty,
+                'reason': reason,
+                'reason_category': reason_category
+            }
+            st.rerun()
+    
+    with col2:
+        if st.button("Close", use_container_width=True, disabled=st.session_state.cancel_processing):
+            st.session_state.modals['cancel'] = False
+            st.session_state.selections['allocation_for_cancel'] = None
+            st.session_state.cancel_processing = False
+            return_to_history_if_context()
+            st.rerun()
+    
+    # Process cancellation when flag is set
+    if st.session_state.cancel_processing:
+        # Retrieve saved data
+        saved_data = st.session_state.get('_cancel_data', {})
+        saved_standard_uom = saved_data.get('standard_uom', standard_uom)
+        saved_selling_uom = saved_data.get('selling_uom', selling_uom)
+        saved_conversion = saved_data.get('conversion', conversion)
+        saved_cancel_qty = saved_data.get('cancel_qty', cancel_qty)
+        saved_reason = saved_data.get('reason', reason)
+        saved_reason_category = saved_data.get('reason_category', reason_category)
+        
+        with st.status("Processing cancellation...", expanded=True) as status:
             try:
-                # Execute cancellation with validated user_id
+                # Step 1: Execute cancellation
+                status.update(label="💾 Cancelling allocation...", state="running")
+                
                 result = allocation_service.cancel_allocation(
                     allocation_detail_id=allocation.get('allocation_detail_id'),
-                    cancelled_qty=cancel_qty,
-                    reason=reason,
-                    reason_category=reason_category,
+                    cancelled_qty=saved_cancel_qty,
+                    reason=saved_reason,
+                    reason_category=saved_reason_category,
                     user_id=user_id
                 )
                 
                 if result['success']:
-                    # Prepare success message using saved values
+                    # Show success message
                     if uom_converter.needs_conversion(saved_conversion):
                         cancel_qty_sell = uom_converter.convert_quantity(
                             saved_cancel_qty, 'standard', 'selling', saved_conversion
                         )
-                        success_msg = (
-                            f"✅ Successfully cancelled {format_number(saved_cancel_qty)} {saved_standard_uom} "
-                            f"(= {format_number(cancel_qty_sell)} {saved_selling_uom})"
-                        )
+                        st.write(f"✅ Cancelled {format_number(saved_cancel_qty)} {saved_standard_uom} (= {format_number(cancel_qty_sell)} {saved_selling_uom})")
                     else:
-                        success_msg = f"✅ Successfully cancelled {format_number(saved_cancel_qty)} {saved_standard_uom}"
+                        st.write(f"✅ Cancelled {format_number(saved_cancel_qty)} {saved_standard_uom}")
                     
-                    # Display success message
-                    st.success(success_msg)
-                    
-                    # Display remaining quantity if any
+                    # Show remaining quantity
                     remaining_qty = result.get('remaining_pending_qty', 0)
                     if remaining_qty > 0:
                         if uom_converter.needs_conversion(saved_conversion):
                             remaining_sell = uom_converter.convert_quantity(
                                 remaining_qty, 'standard', 'selling', saved_conversion
                             )
-                            st.info(
-                                f"Remaining pending: {format_number(remaining_qty)} {saved_standard_uom} "
-                                f"(= {format_number(remaining_sell)} {saved_selling_uom})"
-                            )
+                            st.write(f"📦 Remaining: {format_number(remaining_qty)} {saved_standard_uom} (= {format_number(remaining_sell)} {saved_selling_uom})")
                         else:
-                            st.info(f"Remaining pending: {format_number(remaining_qty)} {saved_standard_uom}")
+                            st.write(f"📦 Remaining: {format_number(remaining_qty)} {saved_standard_uom}")
                     
-                    # Send email notification
+                    # Step 2: Send email notification
+                    status.update(label="📧 Sending email notification...", state="running")
+                    
                     try:
-                        # Get ocd_id from context (stored when opening from history)
                         ocd_id = None
                         if st.session_state.context.get('return_to_history'):
                             ocd_id = st.session_state.context['return_to_history'].get('oc_detail_id')
@@ -249,56 +273,50 @@ def show_cancel_allocation_modal():
                                 ocd_id=ocd_id,
                                 allocation_number=allocation.get('allocation_number', ''),
                                 cancelled_qty=saved_cancel_qty,
-                                reason=reason,
-                                reason_category=reason_category,
+                                reason=saved_reason,
+                                reason_category=saved_reason_category,
                                 user_id=user_id
                             )
                             if email_success:
-                                st.caption("📧 Email notification sent")
+                                st.write("✅ Email notification sent")
                             else:
-                                st.caption(f"⚠️ Email not sent: {email_msg}")
+                                st.write(f"⚠️ Email not sent: {email_msg}")
                         else:
-                            st.caption("⚠️ Email not sent: Missing OC reference")
+                            st.write("⚠️ Email not sent: Missing OC reference")
                     except Exception as email_error:
-                        st.caption(f"⚠️ Email error: {str(email_error)}")
+                        st.write(f"⚠️ Email error: {str(email_error)}")
                     
-                    # Wait briefly for user to see the message
+                    # Step 3: Complete
+                    status.update(label="✅ Cancellation complete!", state="complete", expanded=False)
                     time.sleep(1.5)
                     
-                    # Clear modal state
+                    # Cleanup
+                    st.session_state.cancel_processing = False
+                    st.session_state._cancel_data = None
                     st.session_state.modals['cancel'] = False
                     st.session_state.selections['allocation_for_cancel'] = None
                     
-                    # Return to history if context exists
                     return_to_history_if_context()
-                    
-                    # Clear cache and refresh
                     st.cache_data.clear()
                     st.rerun()
                     
                 else:
-                    # Display error message
+                    # Handle error
                     error_msg = result.get('error', 'Unknown error occurred')
+                    status.update(label="❌ Cancellation failed", state="error")
+                    st.error(f"❌ {error_msg}")
+                    
+                    st.session_state.cancel_processing = False
+                    st.session_state._cancel_data = None
+                    
                     if 'session' in error_msg.lower() or 'user' in error_msg.lower():
-                        st.error(f"⚠️ {error_msg}")
                         time.sleep(2)
                         auth.logout()
                         st.switch_page("app.py")
                         st.stop()
-                    else:
-                        st.error(f"❌ {error_msg}")
-                    
+                        
             except Exception as e:
-                # Handle unexpected errors
+                status.update(label="❌ Error", state="error")
                 st.error("❌ An unexpected error occurred. Please try again or contact support.")
-    
-    with col2:
-        if st.button("Close", use_container_width=True):
-            # Clear modal state
-            st.session_state.modals['cancel'] = False
-            st.session_state.selections['allocation_for_cancel'] = None
-            
-            # Return to history if context exists
-            return_to_history_if_context()
-            
-            st.rerun()
+                st.session_state.cancel_processing = False
+                st.session_state._cancel_data = None
