@@ -115,21 +115,33 @@ def show_update_etd_modal():
                 # Send email notification
                 try:
                     pending_qty = allocation.get('pending_allocated_qty', 0)
-                    # Get ocd_id from demand_reference_id field
-                    ocd_id = allocation.get('demand_reference_id') or allocation.get('ocd_id')
-                    email_success, email_msg = email_service.send_allocation_etd_updated_email(
-                        ocd_id=ocd_id,
-                        allocation_number=allocation.get('allocation_number', ''),
-                        previous_etd=current_etd,
-                        new_etd=new_etd,
-                        pending_qty=pending_qty,
-                        update_count=result.get('update_count', 1),
-                        user_id=user_id
-                    )
-                    if email_success:
-                        st.caption("📧 Email notification sent")
+                    # Get ocd_id from context (stored when opening from history)
+                    ocd_id = None
+                    if st.session_state.context.get('return_to_history'):
+                        ocd_id = st.session_state.context['return_to_history'].get('oc_detail_id')
+                    if not ocd_id:
+                        ocd_id = st.session_state.selections.get('oc_for_history')
+                    
+                    # Debug logging
+                    import logging
+                    logging.info(f"[ETD Email] ocd_id={ocd_id}, context={st.session_state.context.get('return_to_history')}, oc_for_history={st.session_state.selections.get('oc_for_history')}")
+                    
+                    if ocd_id:
+                        email_success, email_msg = email_service.send_allocation_etd_updated_email(
+                            ocd_id=ocd_id,
+                            allocation_number=allocation.get('allocation_number', ''),
+                            previous_etd=current_etd,
+                            new_etd=new_etd,
+                            pending_qty=pending_qty,
+                            update_count=result.get('update_count', 1),
+                            user_id=user_id
+                        )
+                        if email_success:
+                            st.caption("📧 Email notification sent")
+                        else:
+                            st.caption(f"⚠️ Email not sent: {email_msg}")
                     else:
-                        st.caption(f"⚠️ Email not sent: {email_msg}")
+                        st.caption("⚠️ Email not sent: Missing OC reference")
                 except Exception as email_error:
                     st.caption(f"⚠️ Email error: {str(email_error)}")
                 

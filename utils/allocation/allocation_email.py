@@ -31,11 +31,18 @@ class AllocationEmailService:
     def get_oc_creator_info(self, ocd_id: int) -> Optional[Dict]:
         """Get OC creator information from order_confirmations"""
         try:
+            logger.info(f"get_oc_creator_info called with ocd_id={ocd_id}, type={type(ocd_id)}")
+            
+            if not ocd_id:
+                logger.warning("ocd_id is None or empty")
+                return None
+                
             engine = get_db_engine()
             query = text("""
                 SELECT 
                     oc.oc_number,
                     oc.customerponumber AS customer_po,
+                    oc.created_by AS oc_created_by,
                     buyer.english_name AS customer_name,
                     seller.english_name AS legal_entity,
                     ocd.etd AS oc_etd,
@@ -61,9 +68,16 @@ class AllocationEmailService:
             with engine.connect() as conn:
                 result = conn.execute(query, {'ocd_id': ocd_id}).fetchone()
                 if result:
-                    return dict(result._mapping)
+                    row = dict(result._mapping)
+                    logger.info(f"Found OC: {row.get('oc_number')}, creator_email: {row.get('creator_email')}, created_by: {row.get('oc_created_by')}")
+                    # Log if email not found
+                    if not row.get('creator_email'):
+                        logger.warning(f"OC creator email not found for ocd_id={ocd_id}, created_by={row.get('oc_created_by')}")
+                    return row
+                else:
+                    logger.warning(f"No OC found for ocd_id={ocd_id}")
         except Exception as e:
-            logger.error(f"Error fetching OC creator info: {e}")
+            logger.error(f"Error fetching OC creator info: {e}", exc_info=True)
         return None
     
     def get_user_info(self, user_id: int) -> Optional[Dict]:
@@ -215,13 +229,18 @@ class AllocationEmailService:
         try:
             # Get OC info
             oc_info = self.get_oc_creator_info(ocd_id)
-            if not oc_info or not oc_info.get('creator_email'):
-                return False, "Could not find OC creator email"
+            if not oc_info:
+                return False, "Could not find OC information"
             
             # Get allocator info
             allocator = self.get_user_info(user_id)
             allocator_email = allocator.get('email', '') if allocator else ''
             allocator_name = allocator.get('full_name', 'Unknown') if allocator else 'Unknown'
+            
+            # Use creator email, fallback to allocator email, then to allocation CC
+            to_email = oc_info.get('creator_email') or allocator_email or self.allocation_cc
+            if not to_email:
+                return False, "No recipient email available"
             
             # Get allocation summary
             summary = self.get_allocation_summary(ocd_id)
@@ -322,11 +341,11 @@ class AllocationEmailService:
             
             # Send email
             cc_emails = [self.allocation_cc]
-            if allocator_email and allocator_email != oc_info['creator_email']:
+            if allocator_email and allocator_email != to_email:
                 cc_emails.append(allocator_email)
             
             return self._send_email(
-                to_email=oc_info['creator_email'],
+                to_email=to_email,
                 cc_emails=cc_emails,
                 reply_to=allocator_email or self.sender_email,
                 subject=subject,
@@ -343,12 +362,17 @@ class AllocationEmailService:
         """Send email when allocation is cancelled"""
         try:
             oc_info = self.get_oc_creator_info(ocd_id)
-            if not oc_info or not oc_info.get('creator_email'):
-                return False, "Could not find OC creator email"
+            if not oc_info:
+                return False, "Could not find OC information"
             
             canceller = self.get_user_info(user_id)
             canceller_email = canceller.get('email', '') if canceller else ''
             canceller_name = canceller.get('full_name', 'Unknown') if canceller else 'Unknown'
+            
+            # Use creator email, fallback to canceller email, then to allocation CC
+            to_email = oc_info.get('creator_email') or canceller_email or self.allocation_cc
+            if not to_email:
+                return False, "No recipient email available"
             
             subject = f"❌ [Allocation Cancelled] {oc_info['oc_number']} - {self._format_number(cancelled_qty)} {oc_info.get('standard_uom', '')} released"
             
@@ -410,11 +434,11 @@ class AllocationEmailService:
             """
             
             cc_emails = [self.allocation_cc]
-            if canceller_email and canceller_email != oc_info['creator_email']:
+            if canceller_email and canceller_email != to_email:
                 cc_emails.append(canceller_email)
             
             return self._send_email(
-                to_email=oc_info['creator_email'],
+                to_email=to_email,
                 cc_emails=cc_emails,
                 reply_to=canceller_email or self.sender_email,
                 subject=subject,
@@ -431,12 +455,17 @@ class AllocationEmailService:
         """Send email when allocation ETD is updated"""
         try:
             oc_info = self.get_oc_creator_info(ocd_id)
-            if not oc_info or not oc_info.get('creator_email'):
-                return False, "Could not find OC creator email"
+            if not oc_info:
+                return False, "Could not find OC information"
             
             updater = self.get_user_info(user_id)
             updater_email = updater.get('email', '') if updater else ''
             updater_name = updater.get('full_name', 'Unknown') if updater else 'Unknown'
+            
+            # Use creator email, fallback to updater email, then to allocation CC
+            to_email = oc_info.get('creator_email') or updater_email or self.allocation_cc
+            if not to_email:
+                return False, "No recipient email available"
             
             # Calculate days difference
             try:
@@ -515,11 +544,11 @@ class AllocationEmailService:
             """
             
             cc_emails = [self.allocation_cc]
-            if updater_email and updater_email != oc_info['creator_email']:
+            if updater_email and updater_email != to_email:
                 cc_emails.append(updater_email)
             
             return self._send_email(
-                to_email=oc_info['creator_email'],
+                to_email=to_email,
                 cc_emails=cc_emails,
                 reply_to=updater_email or self.sender_email,
                 subject=subject,
@@ -536,12 +565,17 @@ class AllocationEmailService:
         """Send email when cancellation is reversed"""
         try:
             oc_info = self.get_oc_creator_info(ocd_id)
-            if not oc_info or not oc_info.get('creator_email'):
-                return False, "Could not find OC creator email"
+            if not oc_info:
+                return False, "Could not find OC information"
             
             reverser = self.get_user_info(user_id)
             reverser_email = reverser.get('email', '') if reverser else ''
             reverser_name = reverser.get('full_name', 'Unknown') if reverser else 'Unknown'
+            
+            # Use creator email, fallback to reverser email, then to allocation CC
+            to_email = oc_info.get('creator_email') or reverser_email or self.allocation_cc
+            if not to_email:
+                return False, "No recipient email available"
             
             subject = f"🔄 [Allocation Restored] {oc_info['oc_number']} - {self._format_number(restored_qty)} {oc_info.get('standard_uom', '')} re-allocated"
             
@@ -601,11 +635,11 @@ class AllocationEmailService:
             """
             
             cc_emails = [self.allocation_cc]
-            if reverser_email and reverser_email != oc_info['creator_email']:
+            if reverser_email and reverser_email != to_email:
                 cc_emails.append(reverser_email)
             
             return self._send_email(
-                to_email=oc_info['creator_email'],
+                to_email=to_email,
                 cc_emails=cc_emails,
                 reply_to=reverser_email or self.sender_email,
                 subject=subject,

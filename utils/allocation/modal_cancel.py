@@ -237,20 +237,28 @@ def show_cancel_allocation_modal():
                     
                     # Send email notification
                     try:
-                        # Get ocd_id from demand_reference_id field
-                        ocd_id = allocation.get('demand_reference_id') or allocation.get('ocd_id')
-                        email_success, email_msg = email_service.send_allocation_cancelled_email(
-                            ocd_id=ocd_id,
-                            allocation_number=allocation.get('allocation_number', ''),
-                            cancelled_qty=saved_cancel_qty,
-                            reason=reason,
-                            reason_category=reason_category,
-                            user_id=user_id
-                        )
-                        if email_success:
-                            st.caption("📧 Email notification sent")
+                        # Get ocd_id from context (stored when opening from history)
+                        ocd_id = None
+                        if st.session_state.context.get('return_to_history'):
+                            ocd_id = st.session_state.context['return_to_history'].get('oc_detail_id')
+                        if not ocd_id:
+                            ocd_id = st.session_state.selections.get('oc_for_history')
+                        
+                        if ocd_id:
+                            email_success, email_msg = email_service.send_allocation_cancelled_email(
+                                ocd_id=ocd_id,
+                                allocation_number=allocation.get('allocation_number', ''),
+                                cancelled_qty=saved_cancel_qty,
+                                reason=reason,
+                                reason_category=reason_category,
+                                user_id=user_id
+                            )
+                            if email_success:
+                                st.caption("📧 Email notification sent")
+                            else:
+                                st.caption(f"⚠️ Email not sent: {email_msg}")
                         else:
-                            st.caption(f"⚠️ Email not sent: {email_msg}")
+                            st.caption("⚠️ Email not sent: Missing OC reference")
                     except Exception as email_error:
                         st.caption(f"⚠️ Email error: {str(email_error)}")
                     
