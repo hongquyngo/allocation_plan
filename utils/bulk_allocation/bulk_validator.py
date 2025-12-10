@@ -187,11 +187,12 @@ class BulkAllocationValidator:
                 f"but only {pending_qty:.0f} {standard_uom} pending delivery"
             )
         
-        # Check 3: Supply availability
-        if final_qty > supply_available:
+        # Check 3: Supply availability (WARNING only - checked at product level)
+        # Individual OC can request up to full supply; total is checked elsewhere
+        if final_qty > supply_available * 1.5:  # Only warn if requesting > 150% of total supply
             errors.append(
-                f"Insufficient supply: requesting {final_qty:.0f} {standard_uom} "
-                f"but only {supply_available:.0f} {standard_uom} available"
+                f"Large allocation: requesting {final_qty:.0f} {standard_uom} "
+                f"(total product supply: {supply_available:.0f} {standard_uom})"
             )
         
         return len(errors) == 0, errors
@@ -254,7 +255,22 @@ class BulkAllocationValidator:
         # Track supply consumption per product
         supply_consumed = {}
         
-        # Validate each row
+        # First pass: Calculate total consumption per product
+        for alloc in allocation_results:
+            product_id = int(alloc.get('product_id', 0))
+            final_qty = float(alloc.get('final_qty', 0))
+            if final_qty > 0:
+                supply_consumed[product_id] = supply_consumed.get(product_id, 0) + final_qty
+        
+        # Check total consumption vs supply (as warning, not blocking error)
+        for product_id, consumed in supply_consumed.items():
+            available = supply_dict.get(product_id, 0)
+            if consumed > available + 0.01:  # Small tolerance for floating point
+                result['warnings'].append(
+                    f"Product {product_id}: Total allocation ({consumed:.0f}) exceeds available supply ({available:.0f})"
+                )
+        
+        # Second pass: Validate each row (OC-level rules only, not supply)
         for alloc in allocation_results:
             ocd_id = int(alloc.get('ocd_id', 0))
             product_id = int(alloc.get('product_id', 0))
@@ -269,35 +285,21 @@ class BulkAllocationValidator:
                 result['row_errors'][ocd_id] = [f"OC not found in scope"]
                 continue
             
-            # Calculate remaining supply after previous allocations
-            consumed = supply_consumed.get(product_id, 0)
-            remaining_supply = supply_dict.get(product_id, 0) - consumed
-            
-            # Validate row
+            # Validate row (pass full supply - supply check is at product level, not row level)
+            available_for_product = supply_dict.get(product_id, 0)
             is_valid, errors = self.validate_allocation_row(
                 {'ocd_id': ocd_id, 'product_id': product_id, 'final_qty': final_qty},
                 oc_info,
-                remaining_supply
+                available_for_product  # Full supply for OC-level check
             )
             
             if not is_valid:
                 result['row_errors'][ocd_id] = errors
-            else:
-                # Track supply consumption
-                supply_consumed[product_id] = consumed + final_qty
         
         # Check for any row errors
         if result['row_errors']:
             result['valid'] = False
             result['errors'].append(f"{len(result['row_errors'])} OC(s) have validation errors")
-        
-        # Add warnings for edge cases
-        for product_id, consumed in supply_consumed.items():
-            available = supply_dict.get(product_id, 0)
-            if consumed > available:
-                result['warnings'].append(
-                    f"Product {product_id}: Total allocation ({consumed:.0f}) exceeds available supply ({available:.0f})"
-                )
         
         # Warning for low coverage
         allocated_ocs = sum(1 for a in allocation_results if float(a.get('final_qty', 0)) > 0)
