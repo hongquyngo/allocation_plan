@@ -9,6 +9,7 @@ from .allocation_service import AllocationService
 from .formatters import format_number, format_reason_category
 from .validators import AllocationValidator
 from .uom_converter import UOMConverter
+from .allocation_email import AllocationEmailService
 from ..auth import AuthManager
 
 
@@ -17,6 +18,7 @@ allocation_service = AllocationService()
 validator = AllocationValidator()
 uom_converter = UOMConverter()
 auth = AuthManager()
+email_service = AllocationEmailService()
 
 
 def return_to_history_if_context():
@@ -232,6 +234,25 @@ def show_cancel_allocation_modal():
                             )
                         else:
                             st.info(f"Remaining pending: {format_number(remaining_qty)} {saved_standard_uom}")
+                    
+                    # Send email notification
+                    try:
+                        # Get ocd_id from demand_reference_id field
+                        ocd_id = allocation.get('demand_reference_id') or allocation.get('ocd_id')
+                        email_success, email_msg = email_service.send_allocation_cancelled_email(
+                            ocd_id=ocd_id,
+                            allocation_number=allocation.get('allocation_number', ''),
+                            cancelled_qty=saved_cancel_qty,
+                            reason=reason,
+                            reason_category=reason_category,
+                            user_id=user_id
+                        )
+                        if email_success:
+                            st.caption("📧 Email notification sent")
+                        else:
+                            st.caption(f"⚠️ Email not sent: {email_msg}")
+                    except Exception as email_error:
+                        st.caption(f"⚠️ Email error: {str(email_error)}")
                     
                     # Wait briefly for user to see the message
                     time.sleep(1.5)

@@ -9,6 +9,7 @@ from .allocation_service import AllocationService
 from .formatters import format_number, format_date
 from .validators import AllocationValidator
 from .uom_converter import UOMConverter
+from .allocation_email import AllocationEmailService
 from ..auth import AuthManager
 
 
@@ -17,6 +18,7 @@ allocation_service = AllocationService()
 validator = AllocationValidator()
 uom_converter = UOMConverter()
 auth = AuthManager()
+email_service = AllocationEmailService()
 
 
 def return_to_history_if_context():
@@ -104,7 +106,30 @@ def show_reverse_cancellation_modal():
             
             if result['success']:
                 st.success("✅ Cancellation reversed successfully")
+                
+                # Send email notification
+                try:
+                    # Get ocd_id from demand_reference_id field
+                    ocd_id = cancellation.get('demand_reference_id') or cancellation.get('ocd_id')
+                    email_success, email_msg = email_service.send_cancellation_reversed_email(
+                        ocd_id=ocd_id,
+                        allocation_number=cancellation.get('allocation_number', ''),
+                        restored_qty=cancellation.get('cancelled_qty', 0),
+                        reversal_reason=reversal_reason,
+                        user_id=user_id
+                    )
+                    if email_success:
+                        st.caption("📧 Email notification sent")
+                    else:
+                        st.caption(f"⚠️ Email not sent: {email_msg}")
+                except Exception as email_error:
+                    st.caption(f"⚠️ Email error: {str(email_error)}")
+                
                 time.sleep(1)
+                
+                # Close this modal before opening history
+                st.session_state.modals['reverse'] = False
+                st.session_state.selections['cancellation_for_reverse'] = None
                 
                 return_to_history_if_context()
                 st.cache_data.clear()

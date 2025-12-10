@@ -10,6 +10,7 @@ from datetime import datetime
 from .allocation_service import AllocationService
 from .formatters import format_number, format_date
 from .validators import AllocationValidator
+from .allocation_email import AllocationEmailService
 from ..auth import AuthManager
 
 
@@ -17,6 +18,7 @@ from ..auth import AuthManager
 allocation_service = AllocationService()
 validator = AllocationValidator()
 auth = AuthManager()
+email_service = AllocationEmailService()
 
 
 def return_to_history_if_context():
@@ -109,7 +111,33 @@ def show_update_etd_modal():
                 st.success("✅ ETD updated successfully")
                 if result.get('update_count'):
                     st.caption(f"This is update #{result['update_count']} for this allocation")
+                
+                # Send email notification
+                try:
+                    pending_qty = allocation.get('pending_allocated_qty', 0)
+                    # Get ocd_id from demand_reference_id field
+                    ocd_id = allocation.get('demand_reference_id') or allocation.get('ocd_id')
+                    email_success, email_msg = email_service.send_allocation_etd_updated_email(
+                        ocd_id=ocd_id,
+                        allocation_number=allocation.get('allocation_number', ''),
+                        previous_etd=current_etd,
+                        new_etd=new_etd,
+                        pending_qty=pending_qty,
+                        update_count=result.get('update_count', 1),
+                        user_id=user_id
+                    )
+                    if email_success:
+                        st.caption("📧 Email notification sent")
+                    else:
+                        st.caption(f"⚠️ Email not sent: {email_msg}")
+                except Exception as email_error:
+                    st.caption(f"⚠️ Email error: {str(email_error)}")
+                
                 time.sleep(1)
+                
+                # Close this modal before opening history
+                st.session_state.modals['update_etd'] = False
+                st.session_state.selections['allocation_for_update'] = None
                 
                 return_to_history_if_context()
                 

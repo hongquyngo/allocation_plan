@@ -11,6 +11,7 @@ from .supply_data import SupplyData
 from .formatters import format_number, format_date
 from .validators import AllocationValidator
 from .uom_converter import UOMConverter
+from .allocation_email import AllocationEmailService
 from ..auth import AuthManager
 
 
@@ -20,6 +21,7 @@ supply_data = SupplyData()
 validator = AllocationValidator()
 uom_converter = UOMConverter()
 auth = AuthManager()
+email_service = AllocationEmailService()
 
 
 def show_dual_uom_metric(label: str, 
@@ -520,6 +522,24 @@ def show_allocation_modal():
                     
                     st.success(success_msg)
                     st.balloons()
+                    
+                    # Send email notification
+                    try:
+                        email_success, email_msg = email_service.send_allocation_created_email(
+                            ocd_id=oc['ocd_id'],
+                            allocations=selected_supplies,
+                            total_qty=total_selected_standard,
+                            mode='SOFT' if use_soft else 'HARD',
+                            etd=allocated_etd,
+                            user_id=user_id,
+                            allocation_number=result['allocation_number']
+                        )
+                        if email_success:
+                            st.caption("📧 Email notification sent")
+                        else:
+                            st.caption(f"⚠️ Email not sent: {email_msg}")
+                    except Exception as email_error:
+                        st.caption(f"⚠️ Email error: {str(email_error)}")
                     
                     time.sleep(2)
                     st.session_state.modals['allocation'] = False
