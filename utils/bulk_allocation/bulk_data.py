@@ -6,6 +6,7 @@ Handles all data queries for bulk allocation including:
 - Demand data (OCs pending delivery)
 - Supply data (Inventory, CAN, PO, WHT)
 - Committed calculation with MIN logic
+- Allocation status breakdown (NEW)
 """
 import pandas as pd
 import logging
@@ -107,23 +108,31 @@ class BulkAllocationData:
             logger.error(f"Error loading legal entity options: {e}")
             return []
     
-    # ==================== SCOPE PREVIEW ====================
+    # ==================== SCOPE PREVIEW (UPDATED) ====================
     
     def get_scope_summary(self, scope: Dict) -> Dict[str, Any]:
         """
-        Get summary statistics for selected scope
+        Get summary statistics for selected scope with allocation status breakdown
         
         Args:
             scope: Dict with keys: brand_ids, customer_codes, legal_entities, 
-                   etd_from, etd_to, include_partial_allocated
+                   etd_from, etd_to, include_partial_allocated,
+                   exclude_fully_allocated, only_unallocated
         
         Returns:
-            Dict with: total_products, total_ocs, total_demand, 
-                       total_supply, avg_coverage
+            Dict with: 
+            - total_products, total_ocs
+            - Allocation status breakdown: not_allocated_count, partially_allocated_count, 
+              fully_allocated_count, need_allocation_count
+            - Demand metrics: total_demand, allocatable_demand, total_undelivered_allocated
+            - Supply metrics: total_supply, total_committed, available_supply
+            - coverage_percent
         """
         try:
-            where_conditions, params = self._build_scope_conditions(scope)
-            where_clause = f"WHERE {' AND '.join(where_conditions)}" if where_conditions else ""
+            # Build conditions WITHOUT allocation status filters for summary
+            # We want to see ALL OCs first, then filter
+            base_conditions, params = self._build_base_scope_conditions(scope)
+            where_clause = f"WHERE {' AND '.join(base_conditions)}" if base_conditions else ""
             
             query = f"""
                 WITH scope_ocs AS (
@@ -131,48 +140,71 @@ class BulkAllocationData:
                         ocpd.ocd_id,
                         ocpd.product_id,
                         ocpd.pending_standard_delivery_quantity as pending_qty,
-                        ocpd.total_effective_allocated_qty_standard as allocated_qty,
-                        ocpd.undelivered_allocated_qty_standard as undelivered_allocated,
-                        ocpd.standard_quantity as effective_qty
+                        ocpd.standard_quantity as effective_qty,
+                        COALESCE(ocpd.total_effective_allocated_qty_standard, 0) as current_allocated,
+                        COALESCE(ocpd.undelivered_allocated_qty_standard, 0) as undelivered_allocated,
+                        
+                        -- Calculate max allocatable for each OC
+                        GREATEST(0, LEAST(
+                            ocpd.standard_quantity - COALESCE(ocpd.total_effective_allocated_qty_standard, 0),
+                            ocpd.pending_standard_delivery_quantity - COALESCE(ocpd.undelivered_allocated_qty_standard, 0)
+                        )) as max_allocatable,
+                        
+                        -- Allocation status
+                        CASE 
+                            WHEN COALESCE(ocpd.undelivered_allocated_qty_standard, 0) = 0 
+                                AND COALESCE(ocpd.total_effective_allocated_qty_standard, 0) = 0
+                            THEN 'NOT_ALLOCATED'
+                            WHEN GREATEST(0, LEAST(
+                                    ocpd.standard_quantity - COALESCE(ocpd.total_effective_allocated_qty_standard, 0),
+                                    ocpd.pending_standard_delivery_quantity - COALESCE(ocpd.undelivered_allocated_qty_standard, 0)
+                                 )) <= 0
+                            THEN 'FULLY_ALLOCATED'
+                            ELSE 'PARTIALLY_ALLOCATED'
+                        END as allocation_status
+                        
                     FROM outbound_oc_pending_delivery_view ocpd
                     INNER JOIN products p ON p.id = ocpd.product_id
                     LEFT JOIN brands b ON p.brand_id = b.id
                     {where_clause}
                 ),
+                -- Get unique products for supply calculation
+                scope_products AS (
+                    SELECT DISTINCT product_id FROM scope_ocs
+                ),
+                -- Supply calculation
                 product_supply AS (
                     SELECT 
-                        product_id,
-                        SUM(quantity) as total_supply
-                    FROM (
-                        SELECT product_id, SUM(remaining_quantity) as quantity
+                        sp.product_id,
+                        COALESCE(inv.qty, 0) + COALESCE(can.qty, 0) + 
+                        COALESCE(po.qty, 0) + COALESCE(wht.qty, 0) as total_supply
+                    FROM scope_products sp
+                    LEFT JOIN (
+                        SELECT product_id, SUM(remaining_quantity) as qty
                         FROM inventory_detailed_view
                         WHERE remaining_quantity > 0
                         GROUP BY product_id
-                        
-                        UNION ALL
-                        
-                        SELECT product_id, SUM(pending_quantity) as quantity
+                    ) inv ON sp.product_id = inv.product_id
+                    LEFT JOIN (
+                        SELECT product_id, SUM(pending_quantity) as qty
                         FROM can_pending_stockin_view
                         WHERE pending_quantity > 0
                         GROUP BY product_id
-                        
-                        UNION ALL
-                        
-                        SELECT product_id, SUM(pending_standard_arrival_quantity) as quantity
+                    ) can ON sp.product_id = can.product_id
+                    LEFT JOIN (
+                        SELECT product_id, SUM(pending_standard_arrival_quantity) as qty
                         FROM purchase_order_full_view
                         WHERE pending_standard_arrival_quantity > 0
                         GROUP BY product_id
-                        
-                        UNION ALL
-                        
-                        SELECT product_id, SUM(transfer_quantity) as quantity
+                    ) po ON sp.product_id = po.product_id
+                    LEFT JOIN (
+                        SELECT product_id, SUM(transfer_quantity) as qty
                         FROM warehouse_transfer_details_view
                         WHERE is_completed = 0 AND transfer_quantity > 0
                         GROUP BY product_id
-                    ) supply_union
-                    GROUP BY product_id
+                    ) wht ON sp.product_id = wht.product_id
                 ),
-                -- Committed using MIN logic
+                -- Committed calculation using MIN logic
                 product_committed AS (
                     SELECT 
                         product_id,
@@ -185,61 +217,119 @@ class BulkAllocationData:
                             )
                         ) as total_committed
                     FROM outbound_oc_pending_delivery_view
-                    WHERE pending_standard_delivery_quantity > 0
+                    WHERE product_id IN (SELECT product_id FROM scope_products)
+                    AND pending_standard_delivery_quantity > 0
                     AND undelivered_allocated_qty_standard > 0
                     GROUP BY product_id
+                ),
+                -- Aggregate supply
+                supply_totals AS (
+                    SELECT 
+                        COALESCE(SUM(ps.total_supply), 0) as total_supply,
+                        COALESCE(SUM(pc.total_committed), 0) as total_committed
+                    FROM product_supply ps
+                    LEFT JOIN product_committed pc ON ps.product_id = pc.product_id
+                ),
+                -- OC summary with allocation status breakdown
+                oc_summary AS (
+                    SELECT
+                        COUNT(DISTINCT product_id) as total_products,
+                        COUNT(*) as total_ocs,
+                        
+                        -- Allocation status breakdown
+                        SUM(CASE WHEN allocation_status = 'NOT_ALLOCATED' THEN 1 ELSE 0 END) as not_allocated_count,
+                        SUM(CASE WHEN allocation_status = 'PARTIALLY_ALLOCATED' THEN 1 ELSE 0 END) as partially_allocated_count,
+                        SUM(CASE WHEN allocation_status = 'FULLY_ALLOCATED' THEN 1 ELSE 0 END) as fully_allocated_count,
+                        SUM(CASE WHEN max_allocatable > 0 THEN 1 ELSE 0 END) as need_allocation_count,
+                        
+                        -- Demand breakdown
+                        COALESCE(SUM(pending_qty), 0) as total_demand,
+                        COALESCE(SUM(CASE WHEN max_allocatable > 0 THEN pending_qty ELSE 0 END), 0) as need_allocation_demand,
+                        COALESCE(SUM(max_allocatable), 0) as total_allocatable,
+                        COALESCE(SUM(undelivered_allocated), 0) as total_undelivered_allocated
+                    FROM scope_ocs
                 )
                 SELECT 
-                    COUNT(DISTINCT so.product_id) as total_products,
-                    COUNT(DISTINCT so.ocd_id) as total_ocs,
-                    COALESCE(SUM(so.pending_qty), 0) as total_demand,
-                    COALESCE(SUM(DISTINCT ps.total_supply), 0) as total_supply_raw,
-                    COALESCE(SUM(DISTINCT pc.total_committed), 0) as total_committed
-                FROM scope_ocs so
-                LEFT JOIN product_supply ps ON so.product_id = ps.product_id
-                LEFT JOIN product_committed pc ON so.product_id = pc.product_id
+                    os.*,
+                    st.total_supply,
+                    st.total_committed,
+                    st.total_supply - st.total_committed as available_supply
+                FROM oc_summary os
+                CROSS JOIN supply_totals st
             """
             
             with self.engine.connect() as conn:
                 result = conn.execute(text(query), params).fetchone()
                 
                 if result:
-                    total_demand = float(result._mapping['total_demand'] or 0)
-                    total_supply = float(result._mapping['total_supply_raw'] or 0)
-                    total_committed = float(result._mapping['total_committed'] or 0)
-                    available_supply = total_supply - total_committed
+                    data = dict(result._mapping)
+                    
+                    # Calculate coverage percentages
+                    total_demand = float(data.get('total_demand', 0) or 0)
+                    total_allocatable = float(data.get('total_allocatable', 0) or 0)
+                    available_supply = float(data.get('available_supply', 0) or 0)
+                    total_ocs = int(data.get('total_ocs', 0) or 0)
+                    need_allocation_count = int(data.get('need_allocation_count', 0) or 0)
                     
                     return {
-                        'total_products': result._mapping['total_products'] or 0,
-                        'total_ocs': result._mapping['total_ocs'] or 0,
+                        # Counts
+                        'total_products': int(data.get('total_products', 0) or 0),
+                        'total_ocs': total_ocs,
+                        
+                        # Allocation status breakdown
+                        'not_allocated_count': int(data.get('not_allocated_count', 0) or 0),
+                        'partially_allocated_count': int(data.get('partially_allocated_count', 0) or 0),
+                        'fully_allocated_count': int(data.get('fully_allocated_count', 0) or 0),
+                        'need_allocation_count': need_allocation_count,
+                        
+                        # Percentages
+                        'need_allocation_percent': (need_allocation_count / total_ocs * 100) if total_ocs > 0 else 0,
+                        'fully_allocated_percent': (int(data.get('fully_allocated_count', 0) or 0) / total_ocs * 100) if total_ocs > 0 else 0,
+                        
+                        # Demand metrics
                         'total_demand': total_demand,
-                        'total_supply': total_supply,
-                        'total_committed': total_committed,
+                        'need_allocation_demand': float(data.get('need_allocation_demand', 0) or 0),
+                        'total_allocatable': total_allocatable,
+                        'total_undelivered_allocated': float(data.get('total_undelivered_allocated', 0) or 0),
+                        
+                        # Supply metrics
+                        'total_supply': float(data.get('total_supply', 0) or 0),
+                        'total_committed': float(data.get('total_committed', 0) or 0),
                         'available_supply': available_supply,
-                        'coverage_percent': (available_supply / total_demand * 100) if total_demand > 0 else 0
+                        
+                        # Coverage
+                        'coverage_percent': (available_supply / total_demand * 100) if total_demand > 0 else 0,
+                        'allocatable_coverage_percent': (available_supply / total_allocatable * 100) if total_allocatable > 0 else 0
                     }
             
-            return {
-                'total_products': 0,
-                'total_ocs': 0,
-                'total_demand': 0,
-                'total_supply': 0,
-                'total_committed': 0,
-                'available_supply': 0,
-                'coverage_percent': 0
-            }
+            # Return empty result
+            return self._empty_scope_summary()
             
         except Exception as e:
             logger.error(f"Error getting scope summary: {e}")
-            return {
-                'total_products': 0,
-                'total_ocs': 0,
-                'total_demand': 0,
-                'total_supply': 0,
-                'total_committed': 0,
-                'available_supply': 0,
-                'coverage_percent': 0
-            }
+            return self._empty_scope_summary()
+    
+    def _empty_scope_summary(self) -> Dict[str, Any]:
+        """Return empty scope summary structure"""
+        return {
+            'total_products': 0,
+            'total_ocs': 0,
+            'not_allocated_count': 0,
+            'partially_allocated_count': 0,
+            'fully_allocated_count': 0,
+            'need_allocation_count': 0,
+            'need_allocation_percent': 0,
+            'fully_allocated_percent': 0,
+            'total_demand': 0,
+            'need_allocation_demand': 0,
+            'total_allocatable': 0,
+            'total_undelivered_allocated': 0,
+            'total_supply': 0,
+            'total_committed': 0,
+            'available_supply': 0,
+            'coverage_percent': 0,
+            'allocatable_coverage_percent': 0
+        }
     
     # ==================== DEMAND DATA ====================
     
@@ -253,6 +343,8 @@ class BulkAllocationData:
         - etd, pending_qty, effective_qty, allocated_qty, undelivered_allocated
         - standard_uom, selling_uom, uom_conversion
         - outstanding_amount_usd (for revenue priority)
+        - allocation_status (NEW)
+        - max_allocatable (NEW)
         """
         try:
             where_conditions, params = self._build_scope_conditions(scope)
@@ -269,6 +361,14 @@ class BulkAllocationData:
                     ocpd.product_id,
                     ocpd.pt_code,
                     ocpd.product_name,
+                    COALESCE(p.package_size, '') as package_size,
+                    CONCAT(
+                        ocpd.pt_code, 
+                        CASE WHEN ocpd.product_name IS NOT NULL AND ocpd.product_name != '' 
+                             THEN CONCAT(' | ', ocpd.product_name) ELSE '' END,
+                        CASE WHEN p.package_size IS NOT NULL AND p.package_size != '' 
+                             THEN CONCAT(' | ', p.package_size) ELSE '' END
+                    ) as product_display,
                     p.brand_id,
                     b.brand_name,
                     ocpd.etd,
@@ -281,14 +381,34 @@ class BulkAllocationData:
                     COALESCE(ocpd.uom_conversion, 1) as uom_conversion,
                     COALESCE(ocpd.outstanding_amount_usd, 0) as outstanding_amount_usd,
                     ocpd.over_allocation_type,
-                    -- Calculate remaining allocatable
+                    
+                    -- Calculate max allocatable
+                    GREATEST(0, LEAST(
+                        ocpd.standard_quantity - COALESCE(ocpd.total_effective_allocated_qty_standard, 0),
+                        ocpd.pending_standard_delivery_quantity - COALESCE(ocpd.undelivered_allocated_qty_standard, 0)
+                    )) as max_allocatable,
+                    
+                    -- Allocation status
+                    CASE 
+                        WHEN COALESCE(ocpd.undelivered_allocated_qty_standard, 0) = 0 
+                            AND COALESCE(ocpd.total_effective_allocated_qty_standard, 0) = 0
+                        THEN 'NOT_ALLOCATED'
+                        WHEN GREATEST(0, LEAST(
+                                ocpd.standard_quantity - COALESCE(ocpd.total_effective_allocated_qty_standard, 0),
+                                ocpd.pending_standard_delivery_quantity - COALESCE(ocpd.undelivered_allocated_qty_standard, 0)
+                             )) <= 0
+                        THEN 'FULLY_ALLOCATED'
+                        ELSE 'PARTIALLY_ALLOCATED'
+                    END as allocation_status,
+                    
+                    -- Legacy columns for compatibility
                     GREATEST(0, 
                         ocpd.standard_quantity - COALESCE(ocpd.total_effective_allocated_qty_standard, 0)
                     ) as remaining_allocatable,
-                    -- Calculate top-up needed (for partially allocated)
                     GREATEST(0,
                         ocpd.pending_standard_delivery_quantity - COALESCE(ocpd.undelivered_allocated_qty_standard, 0)
                     ) as topup_needed
+                    
                 FROM outbound_oc_pending_delivery_view ocpd
                 INNER JOIN products p ON p.id = ocpd.product_id
                 LEFT JOIN brands b ON p.brand_id = b.id
@@ -556,8 +676,11 @@ class BulkAllocationData:
     
     # ==================== HELPER METHODS ====================
     
-    def _build_scope_conditions(self, scope: Dict) -> Tuple[List[str], Dict]:
-        """Build WHERE conditions from scope filters"""
+    def _build_base_scope_conditions(self, scope: Dict) -> Tuple[List[str], Dict]:
+        """
+        Build WHERE conditions from scope filters WITHOUT allocation status filters.
+        Used for getting summary statistics.
+        """
         conditions = [
             "p.delete_flag = 0",
             "ocpd.pending_standard_delivery_quantity > 0"
@@ -594,8 +717,34 @@ class BulkAllocationData:
             conditions.append("ocpd.etd <= :etd_to")
             params['etd_to'] = scope['etd_to']
         
-        # Include/exclude partial allocated
-        if not scope.get('include_partial_allocated', True):
+        return conditions, params
+    
+    def _build_scope_conditions(self, scope: Dict) -> Tuple[List[str], Dict]:
+        """
+        Build WHERE conditions from scope filters INCLUDING allocation status filters.
+        Used for getting demands to allocate.
+        """
+        # Start with base conditions
+        conditions, params = self._build_base_scope_conditions(scope)
+        
+        # NEW: Exclude fully allocated OCs (default: True)
+        if scope.get('exclude_fully_allocated', True):
+            # Only include OCs that still need allocation (max_allocatable > 0)
+            conditions.append("""
+                GREATEST(0, LEAST(
+                    ocpd.standard_quantity - COALESCE(ocpd.total_effective_allocated_qty_standard, 0),
+                    ocpd.pending_standard_delivery_quantity - COALESCE(ocpd.undelivered_allocated_qty_standard, 0)
+                )) > 0
+            """)
+        
+        # NEW: Only unallocated OCs
+        if scope.get('only_unallocated', False):
+            # Only OCs with zero allocation
+            conditions.append("COALESCE(ocpd.total_effective_allocated_qty_standard, 0) = 0")
+            conditions.append("COALESCE(ocpd.undelivered_allocated_qty_standard, 0) = 0")
+        
+        # Include/exclude partial allocated (legacy - for backward compatibility)
+        elif not scope.get('include_partial_allocated', True):
             # Only include OCs that have not been allocated yet
             conditions.append("COALESCE(ocpd.total_effective_allocated_qty_standard, 0) = 0")
         
