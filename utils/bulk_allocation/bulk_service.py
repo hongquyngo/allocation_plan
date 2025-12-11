@@ -19,6 +19,8 @@ from contextlib import contextmanager
 from threading import local
 from sqlalchemy import text
 import streamlit as st
+import numpy as np
+import pandas as pd
 
 from utils.db import get_db_engine
 from utils.config import config
@@ -105,6 +107,38 @@ class BulkAllocationService:
                 return float(str(value))
             except:
                 return 0.0
+    
+    def _convert_numpy_types(self, obj):
+        """
+        Recursively convert numpy types to native Python types for JSON serialization.
+        
+        Handles numpy integers, floats, booleans, arrays, pandas Timestamps, and Decimals.
+        """
+        if isinstance(obj, dict):
+            return {k: self._convert_numpy_types(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [self._convert_numpy_types(item) for item in obj]
+        elif isinstance(obj, tuple):
+            return tuple(self._convert_numpy_types(item) for item in obj)
+        elif isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, np.bool_):
+            return bool(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, pd.Timestamp):
+            return obj.isoformat() if pd.notna(obj) else None
+        elif isinstance(obj, Decimal):
+            return float(obj)
+        elif pd.isna(obj) if isinstance(obj, (float, type(None))) or hasattr(obj, '__class__') else False:
+            try:
+                if pd.isna(obj):
+                    return None
+            except (TypeError, ValueError):
+                pass
+        return obj
     
     # ==================== TRANSACTION MANAGEMENT ====================
     
@@ -301,7 +335,7 @@ class BulkAllocationService:
                     'allocation_number': allocation_number,
                     'creator_id': user_id,
                     'notes': notes or f"Bulk allocation: {len(valid_allocations)} OCs",
-                    'allocation_context': json.dumps(allocation_context)
+                    'allocation_context': json.dumps(self._convert_numpy_types(allocation_context))
                 })
                 
                 allocation_plan_id = result.lastrowid

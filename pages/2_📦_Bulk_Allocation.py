@@ -11,6 +11,8 @@ Features:
 - Bulk commit with summary email
 
 REFACTORED: 2024-12 - Added customer name display, deduplicated product display logic
+REFACTORED: 2024-12 - Fixed CSS leak in allocation status chart
+REFACTORED: 2024-12 - Added demands_dict to email notification for OC creator lookup
 """
 import streamlit as st
 import pandas as pd
@@ -207,26 +209,28 @@ def render_allocation_status_chart(summary: Dict):
     partial_pct = partial / total * 100 if total > 0 else 0
     fully_pct = fully / total * 100 if total > 0 else 0
     
-    st.markdown(f"""
-    <div style="margin: 15px 0;">
-        <div style="display: flex; height: 28px; border-radius: 6px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.1);">
-            <div style="width: {not_alloc_pct}%; background: linear-gradient(135deg, #ef4444, #dc2626); display: flex; align-items: center; justify-content: center; color: white; font-size: 11px; font-weight: 600;" title="Not Allocated: {not_alloc}">
-                {not_alloc if not_alloc_pct > 8 else ''}
-            </div>
-            <div style="width: {partial_pct}%; background: linear-gradient(135deg, #f59e0b, #d97706); display: flex; align-items: center; justify-content: center; color: white; font-size: 11px; font-weight: 600;" title="Partially Allocated: {partial}">
-                {partial if partial_pct > 8 else ''}
-            </div>
-            <div style="width: {fully_pct}%; background: linear-gradient(135deg, #22c55e, #16a34a); display: flex; align-items: center; justify-content: center; color: white; font-size: 11px; font-weight: 600;" title="Fully Allocated: {fully}">
-                {fully if fully_pct > 8 else ''}
-            </div>
-        </div>
-        <div style="display: flex; justify-content: space-between; font-size: 12px; color: #666; margin-top: 8px;">
-            <span>🔴 Not Allocated: <b>{not_alloc}</b> ({not_alloc_pct:.1f}%)</span>
-            <span>🟡 Partial: <b>{partial}</b> ({partial_pct:.1f}%)</span>
-            <span>🟢 Fully Allocated: <b>{fully}</b> ({fully_pct:.1f}%)</span>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
+    # Display values for bar segments
+    not_alloc_display = str(not_alloc) if not_alloc_pct > 8 else ''
+    partial_display = str(partial) if partial_pct > 8 else ''
+    fully_display = str(fully) if fully_pct > 8 else ''
+    
+    # Build HTML as compact single-line strings to avoid Streamlit rendering issues
+    bar_html = (
+        '<div style="margin:15px 0">'
+        '<div style="display:flex;height:28px;border-radius:6px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,0.1)">'
+        f'<div style="width:{not_alloc_pct}%;background:linear-gradient(135deg,#ef4444,#dc2626);display:flex;align-items:center;justify-content:center;color:white;font-size:11px;font-weight:600" title="Not Allocated: {not_alloc}">{not_alloc_display}</div>'
+        f'<div style="width:{partial_pct}%;background:linear-gradient(135deg,#f59e0b,#d97706);display:flex;align-items:center;justify-content:center;color:white;font-size:11px;font-weight:600" title="Partially Allocated: {partial}">{partial_display}</div>'
+        f'<div style="width:{fully_pct}%;background:linear-gradient(135deg,#22c55e,#16a34a);display:flex;align-items:center;justify-content:center;color:white;font-size:11px;font-weight:600" title="Fully Allocated: {fully}">{fully_display}</div>'
+        '</div>'
+        '</div>'
+    )
+    st.markdown(bar_html, unsafe_allow_html=True)
+    
+    # Legend using columns (avoids HTML rendering issues)
+    col1, col2, col3 = st.columns(3)
+    col1.caption(f"🔴 Not Allocated: **{not_alloc}** ({not_alloc_pct:.1f}%)")
+    col2.caption(f"🟡 Partial: **{partial}** ({partial_pct:.1f}%)")
+    col3.caption(f"🟢 Fully Allocated: **{fully}** ({fully_pct:.1f}%)")
 
 
 # ==================== HELP PANEL ====================
@@ -1211,7 +1215,7 @@ def commit_bulk_allocation(edited_df: pd.DataFrame, original_df: pd.DataFrame, n
             
             # Send email notifications
             # 1. Summary email to allocator
-            # 2. Individual emails to each OC creator
+            # 2. Individual emails to each OC creator (using OC creator info from demands_dict)
             try:
                 email_result = services['email'].send_bulk_allocation_emails(
                     commit_result=result,
@@ -1219,7 +1223,7 @@ def commit_bulk_allocation(edited_df: pd.DataFrame, original_df: pd.DataFrame, n
                     scope=get_current_scope(),
                     strategy_config=strategy_config,
                     allocator_user_id=user.get('id'),
-                    demands_dict=demands_dict,
+                    demands_dict=demands_dict,  # NEW: Pass demands_dict for OC creator info
                     split_allocations=st.session_state.split_allocations
                 )
                 
