@@ -1,315 +1,379 @@
 """
 Bulk Allocation Formatters
 ==========================
-Formatting utilities for bulk allocation UI.
+Formatting utilities for displaying data in bulk allocation UI.
 
-CHANGELOG:
-- 2024-12: Added format_product_display() to eliminate code duplication
-           across UI components (was repeated 3+ times)
+REFACTORED: 2024-12 - Added format_product_display, format_customer_display
 """
-from typing import Any, Optional, Union, Dict
+import pandas as pd
+from typing import Dict, Any, Optional, Union
 from datetime import datetime, date
 from decimal import Decimal
-import pandas as pd
 
 
-def format_number(value: Any, decimals: int = 0, prefix: str = "", suffix: str = "") -> str:
+# ==================== Number Formatting ====================
+
+def format_number(value: Any, decimal_places: int = 0, prefix: str = '', suffix: str = '') -> str:
     """
-    Format number with thousands separator
+    Format number with thousand separators.
     
     Args:
         value: Number to format
-        decimals: Number of decimal places
-        prefix: Prefix string (e.g., "$")
-        suffix: Suffix string (e.g., " pcs")
+        decimal_places: Number of decimal places
+        prefix: Optional prefix (e.g., '$')
+        suffix: Optional suffix (e.g., 'kg')
     
     Returns:
-        Formatted string
+        Formatted string like "1,234,567" or "$1,234.56"
     """
+    if value is None:
+        return '-'
+    
     try:
-        if value is None or (isinstance(value, float) and pd.isna(value)):
-            return "-"
-        
         num = float(value)
-        
-        if decimals == 0:
+        if decimal_places == 0:
             formatted = f"{num:,.0f}"
         else:
-            formatted = f"{num:,.{decimals}f}"
-        
+            formatted = f"{num:,.{decimal_places}f}"
         return f"{prefix}{formatted}{suffix}"
-        
     except (ValueError, TypeError):
-        return str(value) if value is not None else "-"
+        return str(value)
 
 
-def format_percentage(value: Any, decimals: int = 1) -> str:
+def format_percentage(value: Any, decimal_places: int = 1) -> str:
     """
-    Format value as percentage
+    Format number as percentage.
     
     Args:
-        value: Number to format (already in percentage form, e.g., 75.5 for 75.5%)
-        decimals: Number of decimal places
+        value: Number to format (already as percentage, not decimal)
+        decimal_places: Number of decimal places
     
     Returns:
-        Formatted percentage string
+        Formatted string like "85.5%"
     """
+    if value is None:
+        return '-'
+    
     try:
-        if value is None or (isinstance(value, float) and pd.isna(value)):
-            return "-"
-        
         num = float(value)
-        return f"{num:.{decimals}f}%"
-        
+        return f"{num:.{decimal_places}f}%"
     except (ValueError, TypeError):
-        return "-"
+        return str(value)
 
 
-def format_date(value: Any, format_str: str = "%Y-%m-%d") -> str:
+def format_currency(value: Any, currency: str = 'USD', decimal_places: int = 2) -> str:
     """
-    Format date value
+    Format number as currency.
     
     Args:
-        value: Date to format
+        value: Number to format
+        currency: Currency code
+        decimal_places: Number of decimal places
+    
+    Returns:
+        Formatted string like "USD 1,234.56"
+    """
+    if value is None:
+        return '-'
+    
+    try:
+        num = float(value)
+        formatted = f"{num:,.{decimal_places}f}"
+        return f"{currency} {formatted}"
+    except (ValueError, TypeError):
+        return str(value)
+
+
+def format_quantity_with_uom(qty: Any, uom: str = '') -> str:
+    """
+    Format quantity with unit of measure.
+    
+    Args:
+        qty: Quantity value
+        uom: Unit of measure
+    
+    Returns:
+        Formatted string like "1,234 pcs"
+    """
+    if qty is None:
+        return '-'
+    
+    try:
+        num = float(qty)
+        formatted = f"{num:,.0f}"
+        if uom:
+            return f"{formatted} {uom}"
+        return formatted
+    except (ValueError, TypeError):
+        return str(qty)
+
+
+# ==================== Date Formatting ====================
+
+def format_date(value: Any, format_str: str = '%Y-%m-%d') -> str:
+    """
+    Format date value.
+    
+    Args:
+        value: Date to format (datetime, date, or string)
         format_str: strftime format string
     
     Returns:
         Formatted date string
     """
-    try:
-        if value is None:
-            return "-"
-        
-        if isinstance(value, str):
-            dt = pd.to_datetime(value)
-        elif isinstance(value, (datetime, date)):
-            dt = value
-        else:
-            dt = pd.to_datetime(value)
-        
-        if isinstance(dt, datetime):
-            return dt.strftime(format_str)
-        elif isinstance(dt, date):
-            return dt.strftime(format_str)
-        else:
-            return str(value)
-            
-    except:
-        return str(value) if value is not None else "-"
+    if value is None:
+        return '-'
+    
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        except ValueError:
+            return value
+    
+    if isinstance(value, datetime):
+        return value.strftime(format_str)
+    elif isinstance(value, date):
+        return value.strftime(format_str)
+    
+    return str(value)
 
 
-def format_datetime(value: Any, format_str: str = "%Y-%m-%d %H:%M") -> str:
-    """Format datetime value"""
+def format_datetime(value: Any, format_str: str = '%Y-%m-%d %H:%M') -> str:
+    """
+    Format datetime value.
+    
+    Args:
+        value: Datetime to format
+        format_str: strftime format string
+    
+    Returns:
+        Formatted datetime string
+    """
     return format_date(value, format_str)
 
 
-def format_currency(value: Any, currency: str = "USD", decimals: int = 2) -> str:
+# ==================== Status Formatting ====================
+
+def format_coverage_badge(coverage_pct: float) -> str:
     """
-    Format value as currency
+    Format coverage percentage as colored badge.
     
     Args:
-        value: Amount to format
-        currency: Currency code
-        decimals: Number of decimal places
-    """
-    try:
-        if value is None or (isinstance(value, float) and pd.isna(value)):
-            return "-"
-        
-        num = float(value)
-        
-        if currency == "USD":
-            return f"${num:,.{decimals}f}"
-        elif currency == "VND":
-            return f"{num:,.0f} ₫"
-        else:
-            return f"{num:,.{decimals}f} {currency}"
-            
-    except (ValueError, TypeError):
-        return "-"
-
-
-def format_quantity_with_uom(value: Any, uom: str = "", decimals: int = 0) -> str:
-    """
-    Format quantity with UOM
-    
-    Args:
-        value: Quantity to format
-        uom: Unit of measure
-        decimals: Number of decimal places
+        coverage_pct: Coverage percentage (0-100+)
     
     Returns:
-        Formatted string like "1,000 pcs"
+        HTML badge string
     """
-    formatted = format_number(value, decimals)
-    if formatted == "-":
-        return formatted
+    if coverage_pct >= 100:
+        color = '#22c55e'  # Green
+        label = 'Full'
+    elif coverage_pct >= 70:
+        color = '#f59e0b'  # Amber
+        label = 'Partial'
+    elif coverage_pct > 0:
+        color = '#ef4444'  # Red
+        label = 'Low'
+    else:
+        color = '#6b7280'  # Gray
+        label = 'None'
     
-    if uom:
-        return f"{formatted} {uom}"
-    return formatted
+    return f'<span style="background:{color}; color:white; padding:2px 8px; border-radius:4px; font-size:11px;">{label} ({coverage_pct:.0f}%)</span>'
 
 
-def format_coverage_badge(coverage_percent: float) -> str:
+def format_etd_urgency(etd: Any, threshold_days: int = 7) -> str:
     """
-    Format coverage percentage as colored badge
+    Format ETD with urgency indicator.
     
-    Returns HTML-safe string for Streamlit
+    Args:
+        etd: ETD date
+        threshold_days: Days threshold for urgent status
+    
+    Returns:
+        Formatted string with urgency indicator
     """
-    try:
-        pct = float(coverage_percent)
-        
-        if pct >= 100:
-            color = "🟢"
-            label = "Full"
-        elif pct >= 80:
-            color = "🟢"
-            label = f"{pct:.0f}%"
-        elif pct >= 50:
-            color = "🟡"
-            label = f"{pct:.0f}%"
-        elif pct > 0:
-            color = "🟠"
-            label = f"{pct:.0f}%"
-        else:
-            color = "⚪"
-            label = "0%"
-        
-        return f"{color} {label}"
-        
-    except:
-        return "⚪ -"
+    if etd is None:
+        return '-'
+    
+    if isinstance(etd, str):
+        try:
+            etd = datetime.fromisoformat(etd.replace('Z', '+00:00')).date()
+        except ValueError:
+            return etd
+    
+    if isinstance(etd, datetime):
+        etd = etd.date()
+    
+    today = date.today()
+    days_until = (etd - today).days
+    
+    date_str = etd.strftime('%Y-%m-%d')
+    
+    if days_until < 0:
+        return f"🔴 {date_str} (Overdue)"
+    elif days_until <= threshold_days:
+        return f"🟡 {date_str} ({days_until}d)"
+    else:
+        return f"🟢 {date_str}"
 
+
+# ==================== Strategy Formatting ====================
 
 def format_strategy_name(strategy_type: str) -> str:
-    """Format strategy type to display name"""
+    """
+    Format strategy type to display name.
+    
+    Args:
+        strategy_type: Strategy type code (e.g., 'FCFS', 'ETD_PRIORITY')
+    
+    Returns:
+        Formatted display name
+    """
     names = {
-        'FCFS': '📅 First Come First Serve',
-        'ETD_PRIORITY': '🚨 ETD Priority',
-        'PROPORTIONAL': '⚖️ Proportional',
-        'REVENUE_PRIORITY': '💰 Revenue Priority',
-        'HYBRID': '🎯 Hybrid (Recommended)'
+        'FCFS': 'First Come First Served',
+        'ETD_PRIORITY': 'ETD Priority',
+        'PROPORTIONAL': 'Proportional',
+        'REVENUE_PRIORITY': 'Revenue Priority',
+        'HYBRID': 'Hybrid (Multi-Phase)'
     }
-    return names.get(strategy_type.upper(), strategy_type)
+    return names.get(strategy_type, strategy_type)
 
 
 def format_allocation_mode(mode: str) -> str:
-    """Format allocation mode for display"""
-    modes = {
-        'SOFT': '🔵 SOFT (Flexible)',
-        'HARD': '🔴 HARD (Fixed Source)'
-    }
-    return modes.get(mode.upper(), mode)
-
-
-def format_etd_urgency(etd_date: Any, today: date = None) -> str:
     """
-    Format ETD with urgency indicator
+    Format allocation mode to display name.
+    
+    Args:
+        mode: Mode code ('SOFT' or 'HARD')
     
     Returns:
-        String with emoji indicator
+        Formatted display name with description
     """
-    try:
-        if etd_date is None:
-            return "⚪ No ETD"
-        
-        if today is None:
-            today = date.today()
-        
-        if isinstance(etd_date, str):
-            etd = pd.to_datetime(etd_date).date()
-        elif isinstance(etd_date, datetime):
-            etd = etd_date.date()
-        elif isinstance(etd_date, date):
-            etd = etd_date
-        else:
-            return str(etd_date)
-        
-        days = (etd - today).days
-        
-        if days < 0:
-            return f"🔴 Overdue ({abs(days)}d)"
-        elif days <= 3:
-            return f"🔴 Urgent ({days}d)"
-        elif days <= 7:
-            return f"🟠 Soon ({days}d)"
-        elif days <= 14:
-            return f"🟡 Normal ({days}d)"
-        else:
-            return f"🟢 {etd.strftime('%Y-%m-%d')}"
-            
-    except:
-        return str(etd_date) if etd_date else "-"
+    modes = {
+        'SOFT': 'Soft (Allow partial)',
+        'HARD': 'Hard (All or nothing)'
+    }
+    return modes.get(mode, mode)
 
 
-def format_scope_summary(scope: dict) -> str:
-    """Format scope configuration for display"""
+# ==================== Scope Formatting ====================
+
+def format_scope_summary(scope: Dict) -> str:
+    """
+    Format scope dictionary as summary string.
+    
+    Args:
+        scope: Scope dictionary with filters
+    
+    Returns:
+        Summary string like "2 Brands, 3 Customers, ETD: 2024-01-01 to 2024-01-31"
+    """
     parts = []
     
     if scope.get('brand_ids'):
         count = len(scope['brand_ids'])
-        parts.append(f"🏷️ {count} brand{'s' if count > 1 else ''}")
+        parts.append(f"{count} Brand{'s' if count > 1 else ''}")
     
     if scope.get('customer_codes'):
         count = len(scope['customer_codes'])
-        parts.append(f"👥 {count} customer{'s' if count > 1 else ''}")
+        parts.append(f"{count} Customer{'s' if count > 1 else ''}")
     
     if scope.get('legal_entities'):
         count = len(scope['legal_entities'])
-        parts.append(f"🏢 {count} entity/ies")
+        parts.append(f"{count} Legal Entity" if count == 1 else f"{count} Legal Entities")
     
     if scope.get('etd_from') or scope.get('etd_to'):
-        etd_from = scope.get('etd_from', 'Any')
-        etd_to = scope.get('etd_to', 'Any')
-        parts.append(f"📅 {etd_from} → {etd_to}")
+        etd_from = format_date(scope.get('etd_from')) if scope.get('etd_from') else 'Any'
+        etd_to = format_date(scope.get('etd_to')) if scope.get('etd_to') else 'Any'
+        parts.append(f"ETD: {etd_from} → {etd_to}")
     
-    return " | ".join(parts) if parts else "No filters"
+    if not parts:
+        return "All (No filters)"
+    
+    return " | ".join(parts)
 
 
-def format_diff(old_value: float, new_value: float, suffix: str = "") -> str:
+# ==================== Diff Formatting ====================
+
+def format_diff(original: Any, adjusted: Any, show_arrow: bool = True) -> str:
     """
-    Format difference between two values
+    Format difference between original and adjusted values.
+    
+    Args:
+        original: Original value
+        adjusted: Adjusted value
+        show_arrow: Whether to show arrow indicator
     
     Returns:
-        String with arrow indicator (e.g., "↑ +100 pcs")
+        Formatted diff string like "100 → 150 (+50)"
     """
+    if original is None or adjusted is None:
+        return '-'
+    
     try:
-        diff = new_value - old_value
+        orig = float(original)
+        adj = float(adjusted)
+        diff = adj - orig
         
-        if abs(diff) < 0.01:
-            return f"→ {suffix}".strip()
-        elif diff > 0:
-            return f"↑ +{diff:,.0f} {suffix}".strip()
+        if diff == 0:
+            return format_number(orig)
+        
+        diff_str = f"+{format_number(diff)}" if diff > 0 else format_number(diff)
+        
+        if show_arrow:
+            return f"{format_number(orig)} → {format_number(adj)} ({diff_str})"
         else:
-            return f"↓ {diff:,.0f} {suffix}".strip()
-            
-    except:
-        return "-"
+            return f"{format_number(adj)} ({diff_str})"
+    except (ValueError, TypeError):
+        return f"{original} → {adjusted}"
 
 
-def truncate_text(text: str, max_length: int = 50, suffix: str = "...") -> str:
-    """Truncate text to max length"""
+# ==================== Text Formatting ====================
+
+def truncate_text(text: str, max_length: int = 50, suffix: str = '...') -> str:
+    """
+    Truncate text to max length with suffix.
+    
+    Args:
+        text: Text to truncate
+        max_length: Maximum length including suffix
+        suffix: Suffix to add when truncated
+    
+    Returns:
+        Truncated text
+    """
     if not text:
-        return ""
+        return ''
+    
     if len(text) <= max_length:
         return text
+    
     return text[:max_length - len(suffix)] + suffix
 
 
-def format_list_summary(items: list, max_items: int = 3) -> str:
-    """Format list with count summary"""
+def format_list_summary(items: list, max_items: int = 3, separator: str = ', ') -> str:
+    """
+    Format list as summary with overflow.
+    
+    Args:
+        items: List of items
+        max_items: Max items to show before overflow
+        separator: Separator between items
+    
+    Returns:
+        Summary string like "A, B, C, +2 more"
+    """
     if not items:
-        return "-"
+        return '-'
     
     if len(items) <= max_items:
-        return ", ".join(str(i) for i in items)
+        return separator.join(str(item) for item in items)
     
-    shown = ", ".join(str(i) for i in items[:max_items])
-    remaining = len(items) - max_items
-    return f"{shown} (+{remaining} more)"
+    shown = separator.join(str(item) for item in items[:max_items])
+    overflow = len(items) - max_items
+    return f"{shown}, +{overflow} more"
 
 
-# ==================== NEW: Product Display Formatter ====================
+# ==================== NEW: Product Display Formatting ====================
 
 def format_product_display(
     oc_info: Dict,
@@ -319,102 +383,76 @@ def format_product_display(
     """
     Build consistent product display string from OC info.
     
-    This function consolidates the product display logic that was previously
-    duplicated across multiple UI components.
-    
     Format: "PT Code | Product Name | Package Size (Brand)"
     
+    This function consolidates the duplicated product display building
+    logic that was previously scattered across multiple locations.
+    
     Args:
-        oc_info: Dictionary containing product information. Expected keys:
-            - product_display (optional): Pre-formatted display string
-            - pt_code: Product code
-            - product_name: Product name
-            - package_size: Package size
-            - brand_name: Brand name (optional)
-        include_brand: Whether to append brand name in parentheses
-        max_length: Optional max length for truncation
+        oc_info: Dict with keys: product_display, pt_code, product_name, 
+                 package_size, brand_name
+        include_brand: Whether to append brand in parentheses
+        max_length: Optional truncation length
     
     Returns:
-        Formatted product display string
-        
+        Formatted string like "P025000563 | 3M Tape | 19mmx33m (Vietape)"
+    
     Examples:
-        >>> format_product_display({'pt_code': 'P025000563', 'product_name': '3M Tape', 'package_size': '19mmx33m', 'brand_name': 'Vietape'})
-        'P025000563 | 3M Tape | 19mmx33m (Vietape)'
+        >>> format_product_display({
+        ...     'pt_code': 'P025000563',
+        ...     'product_name': '3M Glass Cloth Tape',
+        ...     'package_size': '19mmx33m',
+        ...     'brand_name': 'Vietape'
+        ... })
+        'P025000563 | 3M Glass Cloth Tape | 19mmx33m (Vietape)'
         
-        >>> format_product_display({'product_display': 'Already Formatted'})
-        'Already Formatted'
+        >>> format_product_display({'pt_code': 'P001'})
+        'P001'
     """
-    # If pre-formatted display exists, use it
+    # Use pre-formatted if exists and not empty
     if display := oc_info.get('product_display'):
         if max_length and len(display) > max_length:
             return truncate_text(display, max_length)
         return display
     
-    # Build display from components
+    # Build from components
     parts = []
     
-    # PT Code (required)
-    pt_code = oc_info.get('pt_code', '')
-    if pt_code:
+    if pt_code := oc_info.get('pt_code', ''):
         parts.append(pt_code)
     
-    # Product name (optional)
-    product_name = oc_info.get('product_name', '')
-    if product_name:
+    if product_name := oc_info.get('product_name', ''):
         parts.append(product_name)
     
-    # Package size (optional)
-    package_size = oc_info.get('package_size', '')
-    if package_size:
+    if package_size := oc_info.get('package_size', ''):
         parts.append(package_size)
     
-    # Join parts with separator
     result = ' | '.join(filter(None, parts))
     
-    # Append brand if available and requested
+    # Append brand if requested and available
     if include_brand:
-        brand_name = oc_info.get('brand_name', '')
-        if brand_name:
-            result += f" ({brand_name})"
+        if brand := oc_info.get('brand_name', ''):
+            result += f" ({brand})"
     
-    # Handle empty result
-    if not result:
-        result = "Unknown Product"
-    
-    # Truncate if needed
+    # Apply max_length if specified
     if max_length and len(result) > max_length:
-        return truncate_text(result, max_length)
+        result = truncate_text(result, max_length)
     
-    return result
+    return result or "Unknown Product"
 
 
 def format_product_display_short(oc_info: Dict, max_length: int = 50) -> str:
     """
-    Format product display for constrained spaces (tables, lists).
-    
-    Prioritizes PT code and truncates if needed.
+    Format product display for constrained spaces (tables, dropdowns).
     
     Args:
-        oc_info: Dictionary containing product information
-        max_length: Maximum string length
+        oc_info: Dict with product info
+        max_length: Maximum length (default 50)
     
     Returns:
-        Short formatted product display
+        Truncated product display string
     """
-    pt_code = oc_info.get('pt_code', '')
-    product_name = oc_info.get('product_name', '')
-    
-    if pt_code and product_name:
-        combined = f"{pt_code} | {product_name}"
-        if len(combined) <= max_length:
-            return combined
-        # Truncate product name, keep full pt_code
-        available = max_length - len(pt_code) - 7  # " | " + "..."
-        if available > 10:
-            return f"{pt_code} | {product_name[:available]}..."
-        return pt_code
-    
-    return pt_code or product_name or "Unknown"
+    return format_product_display(oc_info, include_brand=False, max_length=max_length)
 
 
 def build_product_display_from_row(row: Union[Dict, pd.Series]) -> str:
@@ -438,7 +476,7 @@ def build_product_display_from_row(row: Union[Dict, pd.Series]) -> str:
     return format_product_display(oc_info)
 
 
-# ==================== NEW: Customer Display Formatter ====================
+# ==================== NEW: Customer Display Formatting ====================
 
 def format_customer_display(
     customer_code: str,
@@ -449,6 +487,9 @@ def format_customer_display(
     Format customer display string combining code and name.
     
     Format: "Code - Customer Name" or just "Code" if name not available.
+    
+    This function provides consistent customer display formatting
+    across all UI components.
     
     Args:
         customer_code: Customer code (e.g., "C000587")
@@ -493,8 +534,17 @@ def format_customer_display_from_dict(oc_info: Dict, max_name_length: int = 40) 
     
     Returns:
         Formatted customer display string
+    
+    Examples:
+        >>> format_customer_display_from_dict({
+        ...     'customer_code': 'C000587',
+        ...     'customer': 'Samsung Electronics'
+        ... })
+        'C000587 - Samsung Electronics'
     """
     customer_code = oc_info.get('customer_code', '')
+    
+    # Try multiple possible field names for customer name
     customer_name = (
         oc_info.get('customer') or 
         oc_info.get('customer_name') or 
@@ -503,3 +553,53 @@ def format_customer_display_from_dict(oc_info: Dict, max_name_length: int = 40) 
     )
     
     return format_customer_display(customer_code, customer_name, max_name_length)
+
+
+# ==================== Allocation Status Formatting ====================
+
+def format_allocation_status(status: str) -> str:
+    """
+    Format allocation status with icon.
+    
+    Args:
+        status: Status code
+    
+    Returns:
+        Formatted status with icon
+    """
+    status_map = {
+        'NOT_ALLOCATED': '🔴 Not Allocated',
+        'PARTIALLY_ALLOCATED': '🟡 Partial',
+        'FULLY_ALLOCATED': '🟢 Full',
+        'OVER_ALLOCATED': '🔵 Over'
+    }
+    return status_map.get(status, status)
+
+
+def format_allocation_status_badge(status: str) -> str:
+    """
+    Format allocation status as HTML badge.
+    
+    Args:
+        status: Status code
+    
+    Returns:
+        HTML badge string
+    """
+    colors = {
+        'NOT_ALLOCATED': '#ef4444',
+        'PARTIALLY_ALLOCATED': '#f59e0b',
+        'FULLY_ALLOCATED': '#22c55e',
+        'OVER_ALLOCATED': '#3b82f6'
+    }
+    labels = {
+        'NOT_ALLOCATED': 'Not Allocated',
+        'PARTIALLY_ALLOCATED': 'Partial',
+        'FULLY_ALLOCATED': 'Full',
+        'OVER_ALLOCATED': 'Over'
+    }
+    
+    color = colors.get(status, '#6b7280')
+    label = labels.get(status, status)
+    
+    return f'<span style="background:{color}; color:white; padding:2px 8px; border-radius:4px; font-size:11px;">{label}</span>'
