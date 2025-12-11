@@ -16,6 +16,8 @@ BUGFIX: 2024-12 - Fixed HIGH VALUE FILTER: Changed unit_price_usd (non-existent)
 
 FEATURE: 2024-12 - Implemented STOCK AVAILABLE FILTER that was missing (lines 643-663)
                    Now filters OCs to only show products with available supply
+
+FEATURE: 2024-12 - Added get_supply_details_by_product() method for Supply Context UI
 """
 import pandas as pd
 import logging
@@ -489,6 +491,174 @@ class BulkAllocationData:
         except Exception as e:
             logger.error(f"Error getting product supply detail: {e}")
             return {'total_supply': 0, 'total_committed': 0, 'available': 0, 'coverage_ratio': 0}
+    
+    # ==================== NEW: SUPPLY DETAIL FOR CONTEXT UI ====================
+    
+    def get_supply_details_by_product(self, product_id: int) -> Dict[str, Any]:
+        """
+        Get detailed supply breakdown for a single product.
+        Used by Supply Context UI in Step 3 fine-tuning.
+        
+        Returns dict with:
+        - inventory: List of inventory batches with batch_number, expiry_date, remaining_quantity
+        - pending_can: List of pending CAN arrivals
+        - pending_po: List of pending PO arrivals  
+        - wh_transfer: List of in-transit warehouse transfers
+        - summary: Aggregated totals
+        """
+        try:
+            result = {
+                'inventory': [],
+                'pending_can': [],
+                'pending_po': [],
+                'wh_transfer': [],
+                'summary': {
+                    'inventory_qty': 0,
+                    'can_qty': 0,
+                    'po_qty': 0,
+                    'wht_qty': 0,
+                    'total_supply': 0,
+                    'committed': 0,
+                    'available': 0
+                }
+            }
+            
+            with self.engine.connect() as conn:
+                # 1. Inventory batches (FEFO order - First Expiry First Out)
+                inv_query = text("""
+                    SELECT 
+                        inventory_history_id,
+                        batch_number,
+                        expiry_date,
+                        remaining_quantity,
+                        warehouse_name,
+                        location,
+                        days_in_warehouse,
+                        expiry_status
+                    FROM inventory_detailed_view
+                    WHERE product_id = :product_id
+                    AND remaining_quantity > 0
+                    ORDER BY expiry_date ASC, days_in_warehouse DESC
+                """)
+                inv_result = conn.execute(inv_query, {'product_id': product_id})
+                for row in inv_result:
+                    row_dict = dict(row._mapping)
+                    # Convert date to string for JSON serialization
+                    if row_dict.get('expiry_date'):
+                        row_dict['expiry_date'] = str(row_dict['expiry_date'])
+                    result['inventory'].append(row_dict)
+                    result['summary']['inventory_qty'] += float(row.remaining_quantity or 0)
+                
+                # 2. Pending CAN (Container Arrival Notice)
+                can_query = text("""
+                    SELECT 
+                        arrival_note_number,
+                        arrival_date,
+                        pending_quantity,
+                        po_number,
+                        vendor,
+                        days_since_arrival
+                    FROM can_pending_stockin_view
+                    WHERE product_id = :product_id
+                    AND pending_quantity > 0
+                    ORDER BY arrival_date ASC
+                """)
+                can_result = conn.execute(can_query, {'product_id': product_id})
+                for row in can_result:
+                    row_dict = dict(row._mapping)
+                    if row_dict.get('arrival_date'):
+                        row_dict['arrival_date'] = str(row_dict['arrival_date'])
+                    result['pending_can'].append(row_dict)
+                    result['summary']['can_qty'] += float(row.pending_quantity or 0)
+                
+                # 3. Pending PO (Purchase Order)
+                po_query = text("""
+                    SELECT 
+                        po_number,
+                        po_date,
+                        vendor_name,
+                        pending_standard_arrival_quantity,
+                        eta,
+                        status
+                    FROM purchase_order_full_view
+                    WHERE product_id = :product_id
+                    AND pending_standard_arrival_quantity > 0
+                    ORDER BY eta ASC
+                """)
+                po_result = conn.execute(po_query, {'product_id': product_id})
+                for row in po_result:
+                    row_dict = dict(row._mapping)
+                    if row_dict.get('po_date'):
+                        row_dict['po_date'] = str(row_dict['po_date'])
+                    if row_dict.get('eta'):
+                        row_dict['eta'] = str(row_dict['eta'])
+                    result['pending_po'].append(row_dict)
+                    result['summary']['po_qty'] += float(row.pending_standard_arrival_quantity or 0)
+                
+                # 4. Warehouse Transfer in-transit
+                wht_query = text("""
+                    SELECT 
+                        warehouse_transfer_line_id,
+                        transfer_date,
+                        from_warehouse,
+                        to_warehouse,
+                        transfer_quantity,
+                        batch_number,
+                        expiry_date
+                    FROM warehouse_transfer_details_view
+                    WHERE product_id = :product_id
+                    AND is_completed = 0
+                    AND transfer_quantity > 0
+                    ORDER BY transfer_date ASC
+                """)
+                wht_result = conn.execute(wht_query, {'product_id': product_id})
+                for row in wht_result:
+                    row_dict = dict(row._mapping)
+                    if row_dict.get('transfer_date'):
+                        row_dict['transfer_date'] = str(row_dict['transfer_date'])
+                    if row_dict.get('expiry_date'):
+                        row_dict['expiry_date'] = str(row_dict['expiry_date'])
+                    result['wh_transfer'].append(row_dict)
+                    result['summary']['wht_qty'] += float(row.transfer_quantity or 0)
+                
+                # 5. Calculate committed quantity
+                committed_query = text("""
+                    SELECT COALESCE(SUM(GREATEST(0, LEAST(
+                        COALESCE(pending_standard_delivery_quantity, 0),
+                        COALESCE(undelivered_allocated_qty_standard, 0)
+                    ))), 0) as total_committed
+                    FROM outbound_oc_pending_delivery_view
+                    WHERE product_id = :product_id
+                    AND pending_standard_delivery_quantity > 0 
+                    AND undelivered_allocated_qty_standard > 0
+                """)
+                committed_result = conn.execute(committed_query, {'product_id': product_id}).fetchone()
+                committed = float(committed_result[0] or 0) if committed_result else 0
+                
+                # Calculate totals
+                result['summary']['total_supply'] = (
+                    result['summary']['inventory_qty'] + 
+                    result['summary']['can_qty'] + 
+                    result['summary']['po_qty'] + 
+                    result['summary']['wht_qty']
+                )
+                result['summary']['committed'] = committed
+                result['summary']['available'] = result['summary']['total_supply'] - committed
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error getting supply details for product {product_id}: {e}")
+            return {
+                'inventory': [], 
+                'pending_can': [], 
+                'pending_po': [], 
+                'wh_transfer': [],
+                'summary': {
+                    'inventory_qty': 0, 'can_qty': 0, 'po_qty': 0, 'wht_qty': 0,
+                    'total_supply': 0, 'committed': 0, 'available': 0
+                }
+            }
     
     # ==================== ALLOCATION SUMMARY ====================
     

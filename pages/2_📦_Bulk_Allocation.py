@@ -19,6 +19,10 @@ REFACTORED: 2024-12 - Improved email notification UI:
     - Email metrics (Summary/Individual/Errors) in columns
     - Detailed success/warning/error messages
     - Expander for error details
+FEATURE: 2024-12 - Added Supply Context UI in Step 3:
+    - Supply summary panel showing Total/Committed/Available
+    - Available supply column in fine-tuning table
+    - Product supply detail expander
 """
 import streamlit as st
 import pandas as pd
@@ -47,6 +51,13 @@ from utils.bulk_allocation.bulk_formatters import (
 )
 from utils.bulk_allocation.bulk_tooltips import (
     SCOPE_TOOLTIPS, STRATEGY_TOOLTIPS, REVIEW_TOOLTIPS, FORMULA_TOOLTIPS
+)
+# NEW: Import Supply Context UI components
+from utils.bulk_allocation.bulk_supply_context import (
+    build_supply_context,
+    render_supply_summary_panel,
+    render_product_supply_detail,
+    get_supply_tooltip
 )
 from utils.auth import AuthManager
 
@@ -1099,17 +1110,17 @@ def render_step2_strategy():
             st.rerun()
 
 
-# ==================== STEP 3: REVIEW & COMMIT (REFACTORED) ====================
+# ==================== STEP 3: REVIEW & COMMIT (WITH SUPPLY CONTEXT) ====================
 
 def render_step3_commit():
     """
-    Render review and commit step - REFACTORED to prevent reset bug
+    Render review and commit step - WITH SUPPLY CONTEXT INTEGRATION
     
-    Key changes:
-    1. REMOVED: Logic save adjustments to session_state after data_editor
-    2. Build base_df from simulation results (not from adjusted_allocations)
-    3. Read final values directly from edited_df (widget state is auto-persisted)
-    4. Only split_allocations uses session_state (needs separate UI)
+    Key changes from original:
+    1. Added supply context panel above fine-tuning table
+    2. Added "Available Supply" column in data editor
+    3. Added product supply detail expander
+    4. Supply indicators for low coverage products
     """
     st.subheader("Step 3: Review & Commit")
     
@@ -1129,12 +1140,18 @@ def render_step3_commit():
     st.info(f"📋 Scope: {format_scope_summary(scope)}")
     st.info(f"🎯 Strategy: {format_strategy_name(st.session_state.strategy_type)} | Mode: {st.session_state.allocation_mode}")
     
-    # Fine-tuning section
+    # ==================== NEW: SUPPLY CONTEXT PANEL ====================
+    # Build supply context for all products in scope
+    supply_context = build_supply_context(demands_df, supply_df, results)
+    
+    # Render collapsible supply summary panel
+    render_supply_summary_panel(supply_context, expanded=False)
+    
+    # ==================== FINE-TUNING SECTION ====================
     st.markdown("##### ✏️ Fine-tune Allocations")
     st.caption("Uncheck rows to exclude from allocation. Adjust quantities and ETDs as needed.")
     
     # Build BASE data from simulation results
-    # Widget state (edits) is automatically managed by Streamlit via the key
     base_data = []
     for r in results:
         oc_info = demands_df[demands_df['ocd_id'] == r.ocd_id].iloc[0].to_dict() if not demands_df[demands_df['ocd_id'] == r.ocd_id].empty else {}
@@ -1147,9 +1164,15 @@ def render_step3_commit():
             oc_info.get('customer', '') or oc_info.get('customer_name', '')
         )
         
+        # NEW: Get supply info for this product
+        product_supply_info = supply_context.get('products', {}).get(r.product_id, {})
+        available_supply = product_supply_info.get('available', 0)
+        supply_coverage = product_supply_info.get('coverage_pct', 0)
+        
         base_data.append({
             'ocd_id': r.ocd_id,
-            'include': r.suggested_qty > 0,  # NEW: Default include if has allocation
+            'product_id': r.product_id,  # NEW: needed for supply detail
+            'include': r.suggested_qty > 0,
             'oc_number': oc_info.get('oc_number', ''),
             'customer_code': r.customer_code,
             'customer': oc_info.get('customer', ''),
@@ -1160,12 +1183,16 @@ def render_step3_commit():
             'package_size': oc_info.get('package_size', ''),
             'allocation_status': oc_info.get('allocation_status', ''),
             'oc_etd': oc_etd,
-            'allocated_etd': oc_etd,  # Default to OC ETD
+            'allocated_etd': oc_etd,
             'demand_qty': r.demand_qty,
             'current_allocated': r.current_allocated,
             'suggested_qty': r.suggested_qty,
-            'final_qty': r.suggested_qty,  # Start with suggested
-            'coverage_pct': (r.suggested_qty / r.demand_qty * 100) if r.demand_qty > 0 else 0
+            'final_qty': r.suggested_qty,
+            'coverage_pct': (r.suggested_qty / r.demand_qty * 100) if r.demand_qty > 0 else 0,
+            # NEW: Supply context fields
+            'available_supply': available_supply,
+            'supply_coverage': supply_coverage,
+            'standard_uom': oc_info.get('standard_uom', '')
         })
     
     base_df = pd.DataFrame(base_data)
@@ -1176,59 +1203,111 @@ def render_step3_commit():
     if 'allocated_etd' in base_df.columns:
         base_df['allocated_etd'] = pd.to_datetime(base_df['allocated_etd']).dt.date
     
-    # ==================== DATA EDITOR ====================
-    # Widget state is automatically persisted by Streamlit via the key
-    # No manual save to session_state needed - this prevents the reset bug
+    # ==================== NEW: LOW COVERAGE WARNING ====================
+    low_coverage_products = [
+        p for pid, p in supply_context.get('products', {}).items()
+        if p.get('coverage_pct', 100) < 100
+    ]
     
-    # Quick actions for include/exclude
-    action_col1, action_col2, action_col3 = st.columns([1, 1, 4])
+    if low_coverage_products:
+        critical_count = len([p for p in low_coverage_products if p.get('coverage_pct', 100) < 50])
+        if critical_count > 0:
+            st.warning(f"⚠️ **{critical_count}** product(s) have critical supply shortage (<50% coverage). "
+                      f"Check the Supply Context panel above.")
+        elif len(low_coverage_products) > 0:
+            st.info(f"ℹ️ **{len(low_coverage_products)}** product(s) have supply constraints.")
+    
+    # ==================== DATA EDITOR ====================
+    # Quick actions
+    action_col1, action_col2, action_col3, action_col4 = st.columns([1, 1, 1, 3])
     with action_col1:
         if st.button("✅ Include All", key="include_all_btn", help="Include all rows for allocation"):
-            # Clear widget state to reset to defaults with all included
             if 'bulk_allocation_editor' in st.session_state:
                 del st.session_state['bulk_allocation_editor']
             st.rerun()
     with action_col2:
         if st.button("❌ Exclude Zero", key="exclude_zero_btn", help="Exclude rows with suggested qty = 0"):
             st.info("💡 Rows with suggested qty = 0 are already excluded by default")
+    with action_col3:
+        # NEW: Toggle supply column visibility
+        show_supply_col = st.checkbox("📦 Show Supply", value=True, 
+                                      help="Show available supply column")
+    
+    # Build display columns
+    display_columns = ['include', 'oc_number', 'customer_display', 'product_display']
+    if show_supply_col:
+        display_columns.append('available_supply')
+    display_columns.extend(['allocation_status', 'oc_etd', 'demand_qty', 'current_allocated', 
+                           'suggested_qty', 'final_qty', 'allocated_etd', 'coverage_pct'])
+    
+    # Build column config
+    column_config = {
+        'include': st.column_config.CheckboxColumn('✓', width="small", default=True,
+            help="Uncheck to exclude this OC from allocation"),
+        'oc_number': st.column_config.TextColumn('OC Number', disabled=True, width="medium"),
+        'customer_display': st.column_config.TextColumn('Customer', disabled=True, width="medium",
+            help="Customer Code - Customer Name"),
+        'product_display': st.column_config.TextColumn('Product', disabled=True, width="large", 
+            help="PT Code | Product Name | Package Size"),
+        'allocation_status': st.column_config.TextColumn('Status', disabled=True, width="small",
+            help="Current allocation status"),
+        'oc_etd': st.column_config.DateColumn('OC ETD', disabled=True, width="small",
+            help="Original ETD from OC"),
+        'demand_qty': st.column_config.NumberColumn('Demand', disabled=True, format="%.0f", width="small",
+            help=REVIEW_TOOLTIPS['demand_qty']),
+        'current_allocated': st.column_config.NumberColumn('Already Alloc', disabled=True, format="%.0f", width="small",
+            help=REVIEW_TOOLTIPS['current_allocated']),
+        'suggested_qty': st.column_config.NumberColumn('Suggested', disabled=True, format="%.0f", width="small",
+            help=REVIEW_TOOLTIPS['suggested_qty']),
+        'final_qty': st.column_config.NumberColumn('Final Qty ✏️', format="%.0f", width="small",
+            help=REVIEW_TOOLTIPS['final_qty']),
+        'allocated_etd': st.column_config.DateColumn('Alloc ETD ✏️', width="small",
+            help="Allocated ETD - defaults to OC ETD. Adjust if needed."),
+        'coverage_pct': st.column_config.NumberColumn('Coverage %', disabled=True, format="%.1f%%", width="small",
+            help=REVIEW_TOOLTIPS['coverage_pct'])
+    }
+    
+    # NEW: Add supply column config if shown
+    if show_supply_col:
+        column_config['available_supply'] = st.column_config.NumberColumn(
+            '📦 Avail', 
+            disabled=True, 
+            format="%.0f", 
+            width="small",
+            help="Available supply for this product.\n"
+                 "Available = Total Supply - Committed\n\n"
+                 "🟢 ≥100% coverage | 🟡 50-99% | 🔴 <50%"
+        )
     
     edited_df = st.data_editor(
-        base_df[['include', 'oc_number', 'customer_display', 'product_display', 'allocation_status', 'oc_etd', 'demand_qty', 'current_allocated', 'suggested_qty', 'final_qty', 'allocated_etd', 'coverage_pct']],
-        column_config={
-            'include': st.column_config.CheckboxColumn('✓', width="small", default=True,
-                help="Uncheck to exclude this OC from allocation"),
-            'oc_number': st.column_config.TextColumn('OC Number', disabled=True, width="medium"),
-            'customer_display': st.column_config.TextColumn('Customer', disabled=True, width="medium",
-                help="Customer Code - Customer Name"),
-            'product_display': st.column_config.TextColumn('Product', disabled=True, width="large", 
-                help="PT Code | Product Name | Package Size"),
-            'allocation_status': st.column_config.TextColumn('Status', disabled=True, width="small",
-                help="Current allocation status"),
-            'oc_etd': st.column_config.DateColumn('OC ETD', disabled=True, width="small",
-                help="Original ETD from OC"),
-            'demand_qty': st.column_config.NumberColumn('Demand', disabled=True, format="%.0f", width="small",
-                help=REVIEW_TOOLTIPS['demand_qty']),
-            'current_allocated': st.column_config.NumberColumn('Already Alloc', disabled=True, format="%.0f", width="small",
-                help=REVIEW_TOOLTIPS['current_allocated']),
-            'suggested_qty': st.column_config.NumberColumn('Suggested', disabled=True, format="%.0f", width="small",
-                help=REVIEW_TOOLTIPS['suggested_qty']),
-            'final_qty': st.column_config.NumberColumn('Final Qty ✏️', format="%.0f", width="small",
-                help=REVIEW_TOOLTIPS['final_qty']),
-            'allocated_etd': st.column_config.DateColumn('Alloc ETD ✏️', width="small",
-                help="Allocated ETD - defaults to OC ETD. Adjust if needed."),
-            'coverage_pct': st.column_config.NumberColumn('Coverage %', disabled=True, format="%.1f%%", width="small",
-                help=REVIEW_TOOLTIPS['coverage_pct'])
-        },
+        base_df[display_columns],
+        column_config=column_config,
         use_container_width=True,
         hide_index=True,
         num_rows="fixed",
         key="bulk_allocation_editor"
     )
     
-    # ==================== NO SAVE ADJUSTMENTS LOOP ====================
-    # REMOVED: The problematic loop that saved adjustments to session_state
-    # This was causing the reset bug when data_editor returned stale state
-    # Widget state is automatically managed by Streamlit
+    # ==================== NEW: PRODUCT SUPPLY DETAIL EXPANDER ====================
+    unique_products = base_df[['product_id', 'product_display', 'pt_code']].drop_duplicates()
+    
+    if len(unique_products) > 0:
+        with st.expander("🔍 View Detailed Supply by Product", expanded=False):
+            selected_product = st.selectbox(
+                "Select Product",
+                options=unique_products['product_id'].tolist(),
+                format_func=lambda x: unique_products[unique_products['product_id'] == x]['product_display'].iloc[0][:60] if len(unique_products[unique_products['product_id'] == x]['product_display'].iloc[0]) > 60 else unique_products[unique_products['product_id'] == x]['product_display'].iloc[0],
+                key="supply_detail_product_selector"
+            )
+            
+            if selected_product:
+                # Get detailed supply breakdown
+                try:
+                    supply_details = services['data'].get_supply_details_by_product(selected_product)
+                except Exception as e:
+                    logger.warning(f"Could not get supply details: {e}")
+                    supply_details = None
+                render_product_supply_detail(selected_product, supply_context, supply_details)
     
     # ==================== SPLIT ALLOCATION FEATURE ====================
     st.divider()
@@ -1247,8 +1326,8 @@ def render_step3_commit():
             }
             for i in range(len(results))
             if edited_df.iloc[i]['final_qty'] > 0 
-               and edited_df.iloc[i].get('include', True)  # Only included rows
-               and (results[i].demand_qty - results[i].current_allocated) > 0  # Only OCs with allocatable qty
+               and edited_df.iloc[i].get('include', True)
+               and (results[i].demand_qty - results[i].current_allocated) > 0
         ]
         
         if not split_candidates:
