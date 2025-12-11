@@ -128,20 +128,18 @@ class BulkAllocationData:
                         ocpd.product_id,
                         ocpd.pending_standard_delivery_quantity as pending_qty,
                         ocpd.standard_quantity as effective_qty,
-                        COALESCE(ocpd.total_effective_allocated_qty_standard, 0) as current_allocated,
+                        COALESCE(ocpd.total_effective_allocated_qty_standard, 0) as total_allocated,
                         COALESCE(ocpd.undelivered_allocated_qty_standard, 0) as undelivered_allocated,
-                        GREATEST(0, LEAST(
-                            ocpd.standard_quantity - COALESCE(ocpd.total_effective_allocated_qty_standard, 0),
+                        -- Max allocatable = pending qty - undelivered allocation
+                        GREATEST(0, 
                             ocpd.pending_standard_delivery_quantity - COALESCE(ocpd.undelivered_allocated_qty_standard, 0)
-                        )) as max_allocatable,
+                        ) as max_allocatable,
+                        -- Allocation status based on undelivered vs pending
                         CASE 
                             WHEN COALESCE(ocpd.undelivered_allocated_qty_standard, 0) = 0 
-                                AND COALESCE(ocpd.total_effective_allocated_qty_standard, 0) = 0
                             THEN 'NOT_ALLOCATED'
-                            WHEN GREATEST(0, LEAST(
-                                    ocpd.standard_quantity - COALESCE(ocpd.total_effective_allocated_qty_standard, 0),
-                                    ocpd.pending_standard_delivery_quantity - COALESCE(ocpd.undelivered_allocated_qty_standard, 0)
-                                 )) <= 0
+                            WHEN COALESCE(ocpd.undelivered_allocated_qty_standard, 0) >= 
+                                 ocpd.pending_standard_delivery_quantity
                             THEN 'FULLY_ALLOCATED'
                             ELSE 'PARTIALLY_ALLOCATED'
                         END as allocation_status
@@ -308,7 +306,10 @@ class BulkAllocationData:
                     ocpd.etd,
                     ocpd.pending_standard_delivery_quantity as pending_qty,
                     ocpd.standard_quantity as effective_qty,
-                    COALESCE(ocpd.total_effective_allocated_qty_standard, 0) as allocated_qty,
+                    -- For display: show total ever allocated (historical)
+                    COALESCE(ocpd.total_effective_allocated_qty_standard, 0) as total_allocated_qty,
+                    -- For allocation logic: use undelivered allocation (current pending)
+                    COALESCE(ocpd.undelivered_allocated_qty_standard, 0) as allocated_qty,
                     COALESCE(ocpd.undelivered_allocated_qty_standard, 0) as undelivered_allocated,
                     ocpd.standard_uom,
                     ocpd.selling_uom,
@@ -321,21 +322,17 @@ class BulkAllocationData:
                     ocpd.oc_creator_email,
                     ocpd.oc_creator_name,
                     
-                    -- Calculate max allocatable
-                    GREATEST(0, LEAST(
-                        ocpd.standard_quantity - COALESCE(ocpd.total_effective_allocated_qty_standard, 0),
+                    -- Calculate max allocatable based on PENDING needs vs UNDELIVERED allocation
+                    GREATEST(0, 
                         ocpd.pending_standard_delivery_quantity - COALESCE(ocpd.undelivered_allocated_qty_standard, 0)
-                    )) as max_allocatable,
+                    ) as max_allocatable,
                     
-                    -- Allocation status
+                    -- Allocation status based on UNDELIVERED allocation vs PENDING qty
                     CASE 
                         WHEN COALESCE(ocpd.undelivered_allocated_qty_standard, 0) = 0 
-                            AND COALESCE(ocpd.total_effective_allocated_qty_standard, 0) = 0
                         THEN 'NOT_ALLOCATED'
-                        WHEN GREATEST(0, LEAST(
-                                ocpd.standard_quantity - COALESCE(ocpd.total_effective_allocated_qty_standard, 0),
-                                ocpd.pending_standard_delivery_quantity - COALESCE(ocpd.undelivered_allocated_qty_standard, 0)
-                             )) <= 0
+                        WHEN COALESCE(ocpd.undelivered_allocated_qty_standard, 0) >= 
+                             ocpd.pending_standard_delivery_quantity
                         THEN 'FULLY_ALLOCATED'
                         ELSE 'PARTIALLY_ALLOCATED'
                     END as allocation_status,
@@ -580,35 +577,43 @@ class BulkAllocationData:
         conditions, params = self._build_base_scope_conditions(scope)
         
         # ========== ALLOCATION STATUS FILTER ==========
-        # Handle new only_partial filter first (most specific)
-        if scope.get('only_partial', False):
-            # Only partially allocated: has some allocation but not fully allocated
+        # Handle specific filters first (most specific to least)
+        
+        if scope.get('only_over_allocated', False):
+            # Only over-allocated: undelivered allocation > pending needs
+            # These are problematic OCs that need review/fix
             conditions.append("""
-                (COALESCE(ocpd.undelivered_allocated_qty_standard, 0) > 0 
-                 OR COALESCE(ocpd.total_effective_allocated_qty_standard, 0) > 0)
+                COALESCE(ocpd.undelivered_allocated_qty_standard, 0) > 
+                ocpd.pending_standard_delivery_quantity
+            """)
+        elif scope.get('only_partial', False):
+            # Only partially allocated: 
+            # 1. Has undelivered allocation > 0 (pending allocation exists)
+            # 2. Undelivered allocation < pending qty (not fully covered)
+            # 3. NOT over-allocated (undelivered <= pending)
+            conditions.append("""
+                COALESCE(ocpd.undelivered_allocated_qty_standard, 0) > 0
             """)
             conditions.append("""
-                GREATEST(0, LEAST(
-                    ocpd.standard_quantity - COALESCE(ocpd.total_effective_allocated_qty_standard, 0),
-                    ocpd.pending_standard_delivery_quantity - COALESCE(ocpd.undelivered_allocated_qty_standard, 0)
-                )) > 0
+                COALESCE(ocpd.undelivered_allocated_qty_standard, 0) < 
+                ocpd.pending_standard_delivery_quantity
             """)
         elif scope.get('only_unallocated', False):
-            # Only unallocated: never allocated
-            conditions.append("COALESCE(ocpd.total_effective_allocated_qty_standard, 0) = 0")
+            # Only unallocated: no pending allocation for current demand
+            # Either never allocated OR all allocation already delivered
             conditions.append("COALESCE(ocpd.undelivered_allocated_qty_standard, 0) = 0")
         else:
             # Default behavior: use exclude_fully_allocated and include_partial_allocated
             if scope.get('exclude_fully_allocated', True):
+                # Exclude OCs where undelivered allocation >= pending qty
                 conditions.append("""
-                    GREATEST(0, LEAST(
-                        ocpd.standard_quantity - COALESCE(ocpd.total_effective_allocated_qty_standard, 0),
-                        ocpd.pending_standard_delivery_quantity - COALESCE(ocpd.undelivered_allocated_qty_standard, 0)
-                    )) > 0
+                    COALESCE(ocpd.undelivered_allocated_qty_standard, 0) < 
+                    ocpd.pending_standard_delivery_quantity
                 """)
             
             if not scope.get('include_partial_allocated', True):
-                conditions.append("COALESCE(ocpd.total_effective_allocated_qty_standard, 0) = 0")
+                # Exclude OCs that have any pending allocation
+                conditions.append("COALESCE(ocpd.undelivered_allocated_qty_standard, 0) = 0")
         
         # ========== URGENCY FILTER ==========
         urgency_filter = scope.get('urgency_filter', 'ALL_ETD')
@@ -643,8 +648,16 @@ class BulkAllocationData:
                 COALESCE(ocpd.pending_standard_delivery_quantity * ocpd.unit_price_usd, 0) >= {threshold}
             """)
         
+        # ========== OVER-ALLOCATION EXCLUSION ==========
+        # Exclude OCs where undelivered allocation exceeds pending needs
+        if scope.get('exclude_over_allocated', True):
+            conditions.append("""
+                COALESCE(ocpd.undelivered_allocated_qty_standard, 0) <= 
+                ocpd.pending_standard_delivery_quantity
+            """)
+        
         # ========== OTHER FILTERS ==========
         if scope.get('exclude_over_committed', False):
-            conditions.append("ocpd.over_allocation_type IS NULL")
+            conditions.append("ocpd.over_allocation_type IS NULL OR ocpd.over_allocation_type = 'Normal'")
         
         return conditions, params

@@ -51,7 +51,7 @@ def reset_modal_state():
 
 
 @st.dialog("Reverse Cancellation", width="medium")
-def show_reverse_modal():
+def show_reverse_cancellation_modal():
     """Modal for reversing cancellation with improved UI/UX"""
     cancellation = st.session_state.selections.get('cancellation_for_reverse')
     

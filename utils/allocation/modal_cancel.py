@@ -55,7 +55,7 @@ def reset_modal_state():
 
 
 @st.dialog("Cancel Allocation", width="medium")
-def show_cancel_modal():
+def show_cancel_allocation_modal():
     """Modal for cancelling allocation with improved UI/UX"""
     allocation = st.session_state.selections.get('allocation_for_cancel')
     

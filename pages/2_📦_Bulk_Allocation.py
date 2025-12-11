@@ -107,6 +107,7 @@ def init_session_state():
         'scope_stock_available_only': False,  # Only products with available stock
         'scope_high_value_only': False,  # Only high value orders
         'scope_high_value_threshold': 10000,  # USD threshold
+        # Note: exclude_over_allocated is auto-managed based on allocation_status_filter
         
         # DEPRECATED but kept for backward compatibility
         'scope_include_partial': True,
@@ -175,6 +176,14 @@ ALLOCATION_STATUS_OPTIONS = {
         'include_not_allocated': True,
         'include_partial': True,
         'include_fully': True
+    },
+    'OVER_ALLOCATED': {
+        'label': '⚠️ Over-allocated OCs only',
+        'description': 'OCs with allocation exceeding pending needs - review/fix',
+        'include_not_allocated': False,
+        'include_partial': False,
+        'include_fully': False,
+        'include_over_allocated': True
     }
 }
 
@@ -204,6 +213,10 @@ def get_current_scope() -> Dict:
     status_filter = st.session_state.get('scope_allocation_status_filter', 'ALL_NEEDING')
     filter_config = ALLOCATION_STATUS_OPTIONS.get(status_filter, ALLOCATION_STATUS_OPTIONS['ALL_NEEDING'])
     
+    # Determine if we should exclude over-allocated OCs
+    # Default True, but False when viewing OVER_ALLOCATED or INCLUDE_ALL
+    exclude_over = status_filter not in ['OVER_ALLOCATED', 'INCLUDE_ALL']
+    
     return {
         # Basic filters
         'brand_ids': st.session_state.scope_brand_ids,
@@ -217,6 +230,7 @@ def get_current_scope() -> Dict:
         'exclude_fully_allocated': not filter_config['include_fully'],
         'only_unallocated': status_filter == 'ONLY_UNALLOCATED',
         'only_partial': status_filter == 'ONLY_PARTIAL',
+        'only_over_allocated': status_filter == 'OVER_ALLOCATED',
         'allocation_status_filter': status_filter,
         
         # Urgency filter
@@ -229,6 +243,9 @@ def get_current_scope() -> Dict:
         'stock_available_only': st.session_state.get('scope_stock_available_only', False),
         'high_value_only': st.session_state.get('scope_high_value_only', False),
         'high_value_threshold': st.session_state.get('scope_high_value_threshold', 10000),
+        
+        # Over-allocation protection - auto-managed based on status filter
+        'exclude_over_allocated': exclude_over,
     }
 
 def get_strategy_config() -> StrategyConfig:
@@ -1031,7 +1048,7 @@ def render_step3_commit():
     
     # Fine-tuning section
     st.markdown("##### ✏️ Fine-tune Allocations")
-    st.caption("Adjust quantities and ETDs as needed. Changes are preserved until you commit or go back.")
+    st.caption("Uncheck rows to exclude from allocation. Adjust quantities and ETDs as needed.")
     
     # Build BASE data from simulation results
     # Widget state (edits) is automatically managed by Streamlit via the key
@@ -1049,6 +1066,7 @@ def render_step3_commit():
         
         base_data.append({
             'ocd_id': r.ocd_id,
+            'include': r.suggested_qty > 0,  # NEW: Default include if has allocation
             'oc_number': oc_info.get('oc_number', ''),
             'customer_code': r.customer_code,
             'customer': oc_info.get('customer', ''),
@@ -1078,9 +1096,24 @@ def render_step3_commit():
     # ==================== DATA EDITOR ====================
     # Widget state is automatically persisted by Streamlit via the key
     # No manual save to session_state needed - this prevents the reset bug
+    
+    # Quick actions for include/exclude
+    action_col1, action_col2, action_col3 = st.columns([1, 1, 4])
+    with action_col1:
+        if st.button("✅ Include All", key="include_all_btn", help="Include all rows for allocation"):
+            # Clear widget state to reset to defaults with all included
+            if 'bulk_allocation_editor' in st.session_state:
+                del st.session_state['bulk_allocation_editor']
+            st.rerun()
+    with action_col2:
+        if st.button("❌ Exclude Zero", key="exclude_zero_btn", help="Exclude rows with suggested qty = 0"):
+            st.info("💡 Rows with suggested qty = 0 are already excluded by default")
+    
     edited_df = st.data_editor(
-        base_df[['oc_number', 'customer_display', 'product_display', 'allocation_status', 'oc_etd', 'demand_qty', 'current_allocated', 'suggested_qty', 'final_qty', 'allocated_etd', 'coverage_pct']],
+        base_df[['include', 'oc_number', 'customer_display', 'product_display', 'allocation_status', 'oc_etd', 'demand_qty', 'current_allocated', 'suggested_qty', 'final_qty', 'allocated_etd', 'coverage_pct']],
         column_config={
+            'include': st.column_config.CheckboxColumn('✓', width="small", default=True,
+                help="Uncheck to exclude this OC from allocation"),
             'oc_number': st.column_config.TextColumn('OC Number', disabled=True, width="medium"),
             'customer_display': st.column_config.TextColumn('Customer', disabled=True, width="medium",
                 help="Customer Code - Customer Name"),
@@ -1130,7 +1163,9 @@ def render_step3_commit():
                 'max_allocatable': results[i].demand_qty - results[i].current_allocated
             }
             for i in range(len(results))
-            if edited_df.iloc[i]['final_qty'] > 0
+            if edited_df.iloc[i]['final_qty'] > 0 
+               and edited_df.iloc[i].get('include', True)  # Only included rows
+               and (results[i].demand_qty - results[i].current_allocated) > 0  # Only OCs with allocatable qty
         ]
         
         if not split_candidates:
@@ -1165,13 +1200,20 @@ def render_step3_commit():
                     col1, col2 = st.columns([2, 2])
                     
                     with col1:
+                        # Ensure value is within valid range
+                        split_value = float(split.get('qty', 0))
+                        max_qty_float = float(max(max_qty, 0.0))  # Ensure non-negative
+                        # Clamp value to be within [0, max_qty]
+                        clamped_value = min(max(split_value, 0.0), max_qty_float) if max_qty_float > 0 else 0.0
+                        
                         split_qty = st.number_input(
                             f"Qty #{idx+1}",
                             min_value=0.0,
-                            max_value=float(max_qty),
-                            value=float(split.get('qty', 0)),
+                            max_value=max_qty_float if max_qty_float > 0 else 1.0,  # Avoid max=0
+                            value=clamped_value,
                             step=1.0,
-                            key=f"form_split_qty_{ocd_id}_{idx}"
+                            key=f"form_split_qty_{ocd_id}_{idx}",
+                            disabled=max_qty_float <= 0
                         )
                     
                     with col2:
@@ -1182,6 +1224,10 @@ def render_step3_commit():
                         )
                     
                     form_splits.append({'qty': split_qty, 'etd': split_etd})
+                
+                # Show warning if max_qty is 0
+                if max_qty <= 0:
+                    st.warning("⚠️ This OC has no remaining allocatable quantity.")
                 
                 col_save, col_add, col_remove = st.columns([1, 1, 1])
                 with col_save:
@@ -1208,7 +1254,10 @@ def render_step3_commit():
                 st.rerun()
             
             total_split_qty = sum(s['qty'] for s in st.session_state.split_allocations[ocd_id])
-            if total_split_qty > max_qty:
+            if max_qty <= 0:
+                if total_split_qty > 0:
+                    st.error(f"⚠️ No allocatable quantity available for this OC")
+            elif total_split_qty > max_qty:
                 st.error(f"⚠️ Total split qty ({total_split_qty:.0f}) exceeds max allocatable ({max_qty:.0f})")
             elif total_split_qty > 0 and total_split_qty < max_qty:
                 st.warning(f"ℹ️ Remaining unallocated: {max_qty - total_split_qty:.0f}")
@@ -1226,8 +1275,10 @@ def render_step3_commit():
                     st.caption(f"• {oc_info['oc_number']}: {len(splits)} splits → {sum(s['qty'] for s in splits):.0f} total")
     
     # ==================== SUMMARY METRICS ====================
+    # Only count rows where include = True
     final_total = 0
     allocated_count = 0
+    excluded_count = 0
     etd_adjustments = 0
     qty_adjustments = 0
     
@@ -1235,6 +1286,13 @@ def render_step3_commit():
         ocd_id = base_df.iloc[i]['ocd_id']
         oc_etd = base_df.iloc[i]['oc_etd']
         suggested_qty = results[i].suggested_qty
+        
+        # Check if row is included
+        is_included = row.get('include', True)
+        
+        if not is_included:
+            excluded_count += 1
+            continue
         
         if ocd_id in st.session_state.split_allocations and len(st.session_state.split_allocations[ocd_id]) > 1:
             split_total = sum(s['qty'] for s in st.session_state.split_allocations[ocd_id])
@@ -1246,35 +1304,49 @@ def render_step3_commit():
             if row['final_qty'] > 0:
                 allocated_count += 1
         
-        # Count adjustments
+        # Count adjustments (only for included rows)
         if abs(float(row['final_qty']) - float(suggested_qty)) > 0.001:
             qty_adjustments += 1
         if row['allocated_etd'] and oc_etd and row['allocated_etd'] != oc_etd:
             etd_adjustments += 1
     
-    total_demand = sum(r.demand_qty for r in results)
-    final_coverage = (final_total / total_demand * 100) if total_demand > 0 else 0
+    # Calculate totals for included rows only
+    included_demand = sum(r.demand_qty for i, r in enumerate(results) if edited_df.iloc[i].get('include', True))
+    final_coverage = (final_total / included_demand * 100) if included_demand > 0 else 0
     split_count = sum(1 for splits in st.session_state.split_allocations.values() if len(splits) > 1)
     
     st.divider()
     
+    # Show excluded warning if any
+    if excluded_count > 0:
+        st.warning(f"⚠️ **{excluded_count}** OC(s) excluded from allocation (unchecked)")
+    
     st.markdown("##### 📊 Final Summary")
-    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    m1, m2, m3, m4, m5, m6, m7 = st.columns(7)
     m1.metric("Total to Allocate", format_number(final_total))
-    m2.metric("OCs to Allocate", allocated_count)
-    m3.metric("Avg Coverage", format_percentage(final_coverage))
-    m4.metric("Qty Adjustments", qty_adjustments)
-    m5.metric("ETD Adjustments", etd_adjustments, help="OCs with allocated ETD different from OC ETD")
-    m6.metric("Split Allocations", split_count, help="OCs split into multiple allocation records")
+    m2.metric("OCs Included", allocated_count)
+    m3.metric("OCs Excluded", excluded_count)
+    m4.metric("Avg Coverage", format_percentage(final_coverage))
+    m5.metric("Qty Adjustments", qty_adjustments)
+    m6.metric("ETD Adjustments", etd_adjustments, help="OCs with allocated ETD different from OC ETD")
+    m7.metric("Split Allocations", split_count, help="OCs split into multiple allocation records")
     
     # ==================== VALIDATION ====================
+    # Only validate included rows
+    validation_data = [
+        {
+            'ocd_id': base_df.iloc[i]['ocd_id'], 
+            'product_id': results[i].product_id, 
+            'final_qty': edited_df.iloc[i]['final_qty'],
+            'allocated_etd': edited_df.iloc[i]['allocated_etd'],
+            'oc_etd': base_df.iloc[i]['oc_etd']
+        } 
+        for i in range(len(results))
+        if edited_df.iloc[i].get('include', True)  # Only validate included rows
+    ]
+    
     validation_result = services['validator'].validate_bulk_allocation(
-        [{'ocd_id': base_df.iloc[i]['ocd_id'], 
-          'product_id': results[i].product_id, 
-          'final_qty': edited_df.iloc[i]['final_qty'],
-          'allocated_etd': edited_df.iloc[i]['allocated_etd'],
-          'oc_etd': base_df.iloc[i]['oc_etd']} 
-         for i in range(len(results))],
+        validation_data,
         demands_df,
         supply_df,
         user.get('role', '')
@@ -1282,6 +1354,9 @@ def render_step3_commit():
     
     etd_delay_warnings = []
     for i, row in edited_df.iterrows():
+        # Skip excluded rows
+        if not row.get('include', True):
+            continue
         oc_etd = base_df.iloc[i]['oc_etd']
         alloc_etd = row['allocated_etd']
         if oc_etd and alloc_etd and alloc_etd > oc_etd:
@@ -1334,7 +1409,14 @@ def commit_bulk_allocation(edited_df: pd.DataFrame, original_df: pd.DataFrame, n
     
     with st.spinner("Committing bulk allocation..."):
         allocation_results = []
+        excluded_ocs = []
+        
         for i, row in edited_df.iterrows():
+            # Skip excluded rows
+            if not row.get('include', True):
+                excluded_ocs.append(original_df.iloc[i]['oc_number'])
+                continue
+            
             ocd_id = original_df.iloc[i]['ocd_id']
             result = results[i]
             
@@ -1362,6 +1444,10 @@ def commit_bulk_allocation(edited_df: pd.DataFrame, original_df: pd.DataFrame, n
                 'allocated_etd': allocated_etd
             })
         
+        if not allocation_results:
+            st.error("❌ No OCs selected for allocation. Please include at least one OC.")
+            return
+        
         demands_dict = {int(row['ocd_id']): row.to_dict() for _, row in demands_df.iterrows()}
         
         strategy_config = {
@@ -1372,6 +1458,13 @@ def commit_bulk_allocation(edited_df: pd.DataFrame, original_df: pd.DataFrame, n
             'urgent_threshold_days': st.session_state.urgent_threshold_days
         }
         
+        # Filter split_allocations to only include checked OCs
+        included_ocd_ids = [r['ocd_id'] for r in allocation_results]
+        filtered_split_allocations = {
+            k: v for k, v in st.session_state.split_allocations.items() 
+            if k in included_ocd_ids
+        }
+        
         result = services['service'].commit_bulk_allocation(
             allocation_results=allocation_results,
             demands_dict=demands_dict,
@@ -1379,15 +1472,19 @@ def commit_bulk_allocation(edited_df: pd.DataFrame, original_df: pd.DataFrame, n
             strategy_config=strategy_config,
             user_id=user.get('id'),
             notes=notes,
-            split_allocations=st.session_state.split_allocations
+            split_allocations=filtered_split_allocations
         )
         
         if result['success']:
             st.session_state.commit_result = result
             st.success(f"✅ Bulk allocation committed successfully!")
             st.info(f"Allocation Number: **{result['allocation_number']}**")
-            st.metric("OCs Allocated", result['detail_count'])
-            st.metric("Total Quantity", format_number(result['total_allocated']))
+            
+            col_r1, col_r2, col_r3 = st.columns(3)
+            col_r1.metric("OCs Allocated", result['detail_count'])
+            col_r2.metric("Total Quantity", format_number(result['total_allocated']))
+            if excluded_ocs:
+                col_r3.metric("OCs Excluded", len(excluded_ocs))
             
             try:
                 email_result = services['email'].send_bulk_allocation_emails(
@@ -1397,7 +1494,7 @@ def commit_bulk_allocation(edited_df: pd.DataFrame, original_df: pd.DataFrame, n
                     strategy_config=strategy_config,
                     allocator_user_id=user.get('id'),
                     demands_dict=demands_dict,
-                    split_allocations=st.session_state.split_allocations
+                    split_allocations=filtered_split_allocations  # Use filtered splits
                 )
                 
                 if email_result.get('success'):

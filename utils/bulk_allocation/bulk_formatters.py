@@ -262,7 +262,8 @@ ALLOCATION_STATUS_LABELS = {
     'ALL_NEEDING': 'All needing',
     'ONLY_UNALLOCATED': 'Unallocated only',
     'ONLY_PARTIAL': 'Partial only',
-    'INCLUDE_ALL': 'Include all'
+    'INCLUDE_ALL': 'Include all',
+    'OVER_ALLOCATED': '⚠️ Over-allocated'
 }
 
 URGENCY_LABELS = {
