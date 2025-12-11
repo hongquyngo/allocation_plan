@@ -2,8 +2,12 @@
 Bulk Allocation Formatters
 ==========================
 Formatting utilities for bulk allocation UI.
+
+CHANGELOG:
+- 2024-12: Added format_product_display() to eliminate code duplication
+           across UI components (was repeated 3+ times)
 """
-from typing import Any, Optional, Union
+from typing import Any, Optional, Union, Dict
 from datetime import datetime, date
 from decimal import Decimal
 import pandas as pd
@@ -303,3 +307,132 @@ def format_list_summary(items: list, max_items: int = 3) -> str:
     shown = ", ".join(str(i) for i in items[:max_items])
     remaining = len(items) - max_items
     return f"{shown} (+{remaining} more)"
+
+
+# ==================== NEW: Product Display Formatter ====================
+
+def format_product_display(
+    oc_info: Dict,
+    include_brand: bool = True,
+    max_length: Optional[int] = None
+) -> str:
+    """
+    Build consistent product display string from OC info.
+    
+    This function consolidates the product display logic that was previously
+    duplicated across multiple UI components.
+    
+    Format: "PT Code | Product Name | Package Size (Brand)"
+    
+    Args:
+        oc_info: Dictionary containing product information. Expected keys:
+            - product_display (optional): Pre-formatted display string
+            - pt_code: Product code
+            - product_name: Product name
+            - package_size: Package size
+            - brand_name: Brand name (optional)
+        include_brand: Whether to append brand name in parentheses
+        max_length: Optional max length for truncation
+    
+    Returns:
+        Formatted product display string
+        
+    Examples:
+        >>> format_product_display({'pt_code': 'P025000563', 'product_name': '3M Tape', 'package_size': '19mmx33m', 'brand_name': 'Vietape'})
+        'P025000563 | 3M Tape | 19mmx33m (Vietape)'
+        
+        >>> format_product_display({'product_display': 'Already Formatted'})
+        'Already Formatted'
+    """
+    # If pre-formatted display exists, use it
+    if display := oc_info.get('product_display'):
+        if max_length and len(display) > max_length:
+            return truncate_text(display, max_length)
+        return display
+    
+    # Build display from components
+    parts = []
+    
+    # PT Code (required)
+    pt_code = oc_info.get('pt_code', '')
+    if pt_code:
+        parts.append(pt_code)
+    
+    # Product name (optional)
+    product_name = oc_info.get('product_name', '')
+    if product_name:
+        parts.append(product_name)
+    
+    # Package size (optional)
+    package_size = oc_info.get('package_size', '')
+    if package_size:
+        parts.append(package_size)
+    
+    # Join parts with separator
+    result = ' | '.join(filter(None, parts))
+    
+    # Append brand if available and requested
+    if include_brand:
+        brand_name = oc_info.get('brand_name', '')
+        if brand_name:
+            result += f" ({brand_name})"
+    
+    # Handle empty result
+    if not result:
+        result = "Unknown Product"
+    
+    # Truncate if needed
+    if max_length and len(result) > max_length:
+        return truncate_text(result, max_length)
+    
+    return result
+
+
+def format_product_display_short(oc_info: Dict, max_length: int = 50) -> str:
+    """
+    Format product display for constrained spaces (tables, lists).
+    
+    Prioritizes PT code and truncates if needed.
+    
+    Args:
+        oc_info: Dictionary containing product information
+        max_length: Maximum string length
+    
+    Returns:
+        Short formatted product display
+    """
+    pt_code = oc_info.get('pt_code', '')
+    product_name = oc_info.get('product_name', '')
+    
+    if pt_code and product_name:
+        combined = f"{pt_code} | {product_name}"
+        if len(combined) <= max_length:
+            return combined
+        # Truncate product name, keep full pt_code
+        available = max_length - len(pt_code) - 7  # " | " + "..."
+        if available > 10:
+            return f"{pt_code} | {product_name[:available]}..."
+        return pt_code
+    
+    return pt_code or product_name or "Unknown"
+
+
+def build_product_display_from_row(row: Union[Dict, pd.Series]) -> str:
+    """
+    Build product display from a DataFrame row or dictionary.
+    
+    Convenience wrapper for format_product_display that handles
+    both dict and pandas Series.
+    
+    Args:
+        row: DataFrame row (Series) or dictionary
+        
+    Returns:
+        Formatted product display string
+    """
+    if isinstance(row, pd.Series):
+        oc_info = row.to_dict()
+    else:
+        oc_info = row
+    
+    return format_product_display(oc_info)

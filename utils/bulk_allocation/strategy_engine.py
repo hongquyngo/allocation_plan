@@ -7,6 +7,10 @@ Implements allocation strategies:
 - PROPORTIONAL: Allocate based on order size ratio
 - REVENUE_PRIORITY: Allocate highest value orders first
 - HYBRID: Multi-phase allocation combining strategies
+
+CHANGELOG:
+- 2024-12: Fixed Hybrid Strategy proportional phase to track supply consumption
+           preventing over-allocation across multiple OCs
 """
 import logging
 from typing import Dict, List, Any, Optional
@@ -337,6 +341,9 @@ class HybridStrategy(AllocationStrategy):
     1. MIN_GUARANTEE (30%): Ensure minimum allocation for all OCs
     2. ETD_PRIORITY (40%): Prioritize urgent deliveries
     3. PROPORTIONAL (30%): Distribute remaining supply fairly
+    
+    FIXED (2024-12): Proportional phase now properly tracks supply consumption
+    to prevent over-allocation when distributing remaining supply.
     """
     
     def __init__(self):
@@ -431,6 +438,7 @@ class HybridStrategy(AllocationStrategy):
                                 spent += alloc
         
         # Phase 3: Proportional distribution of remaining
+        # FIXED: Now properly tracks supply consumption to prevent over-allocation
         if any(p['name'] == 'PROPORTIONAL' for p in phases):
             for product_id, group in demands.groupby('product_id'):
                 available = remaining_supply.get(int(product_id), 0)
@@ -438,7 +446,7 @@ class HybridStrategy(AllocationStrategy):
                 if available < config.min_allocation_qty:
                     continue
                 
-                # Calculate remaining needs
+                # Calculate remaining needs for each OC
                 needs = []
                 total_need = 0
                 for _, row in group.iterrows():
@@ -449,15 +457,27 @@ class HybridStrategy(AllocationStrategy):
                     needs.append((ocd_id, remaining_need))
                     total_need += remaining_need
                 
-                # Distribute proportionally
+                # Distribute proportionally with proper supply tracking
+                # FIX: Track spent supply to prevent over-allocation
                 if total_need > 0:
+                    spent = 0  # Track how much we've allocated in this phase
+                    
                     for ocd_id, need in needs:
-                        if need > 0:
+                        if need > 0 and spent < available:
+                            # Calculate proportional share
                             share = (need / total_need) * available
-                            # IMPORTANT: Cap share to remaining need to avoid over-allocation
-                            share = min(share, need)
+                            
+                            # Cap share to:
+                            # 1. The OC's remaining need
+                            # 2. The remaining available supply
+                            share = min(share, need, available - spent)
+                            
                             if share >= config.min_allocation_qty:
                                 accumulated[ocd_id] = accumulated.get(ocd_id, 0) + share
+                                spent += share
+                    
+                    # Update remaining supply after proportional distribution
+                    remaining_supply[int(product_id)] = available - spent
         
         # FINAL CAP: Ensure no allocation exceeds max_alloc
         for _, row in demands.iterrows():

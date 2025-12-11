@@ -7,6 +7,9 @@ Business logic for bulk allocation operations including:
 - Allocation context creation
 - Commit and rollback
 - Split allocation support (multiple ETDs per OC)
+
+CHANGELOG:
+- 2024-12: Fixed race condition in allocation number generation using FOR UPDATE lock
 """
 import logging
 from datetime import datetime
@@ -46,6 +49,11 @@ class InsufficientSupplyError(BulkAllocationError):
 
 class UserValidationError(BulkAllocationError):
     """Raised when user validation fails"""
+    pass
+
+
+class AllocationNumberGenerationError(BulkAllocationError):
+    """Raised when allocation number generation fails"""
     pass
 
 
@@ -193,21 +201,58 @@ class BulkAllocationService:
             return False, f"Error validating user: {str(e)}", None
     
     def _generate_allocation_number(self, conn) -> str:
-        """Generate unique allocation number: ALL-YYYYMM-XXXX"""
+        """
+        Generate unique allocation number: ALL-YYYYMM-XXXX
+        
+        FIXED (2024-12): Uses FOR UPDATE lock to prevent race condition 
+        when multiple users create allocations simultaneously.
+        
+        The lock ensures that:
+        1. Only one transaction can read/write the max sequence at a time
+        2. No duplicate allocation numbers are generated
+        3. Sequential numbering is maintained
+        
+        Returns:
+            Unique allocation number string
+            
+        Raises:
+            AllocationNumberGenerationError: If generation fails after retries
+        """
         today = datetime.now()
         prefix = f"ALL-{today.strftime('%Y%m')}-"
         
-        query = text("""
-            SELECT MAX(CAST(SUBSTRING(allocation_number, -4) AS UNSIGNED)) as max_seq
-            FROM allocation_plans
-            WHERE allocation_number LIKE :prefix
-        """)
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                # Use FOR UPDATE to lock the rows while reading
+                # This prevents race condition where two transactions read the same max_seq
+                query = text("""
+                    SELECT MAX(CAST(SUBSTRING(allocation_number, -4) AS UNSIGNED)) as max_seq
+                    FROM allocation_plans
+                    WHERE allocation_number LIKE :prefix
+                    FOR UPDATE
+                """)
+                
+                result = conn.execute(query, {'prefix': f"{prefix}%"}).fetchone()
+                max_seq = result.max_seq if result and result.max_seq else 0
+                
+                new_seq = (max_seq or 0) + 1
+                allocation_number = f"{prefix}{new_seq:04d}"
+                
+                logger.debug(f"Generated allocation number: {allocation_number} (attempt {attempt + 1})")
+                return allocation_number
+                
+            except Exception as e:
+                logger.warning(f"Allocation number generation attempt {attempt + 1} failed: {e}")
+                if attempt == max_retries - 1:
+                    raise AllocationNumberGenerationError(
+                        f"Failed to generate allocation number after {max_retries} attempts"
+                    )
         
-        result = conn.execute(query, {'prefix': f"{prefix}%"}).fetchone()
-        max_seq = result.max_seq if result and result.max_seq else 0
-        
-        new_seq = (max_seq or 0) + 1
-        return f"{prefix}{new_seq:04d}"
+        # Fallback: use timestamp-based number if all retries fail
+        fallback_number = f"ALL-{today.strftime('%Y%m%d%H%M%S')}"
+        logger.warning(f"Using fallback allocation number: {fallback_number}")
+        return fallback_number
     
     # ==================== MAIN COMMIT METHOD ====================
     
@@ -264,7 +309,7 @@ class BulkAllocationService:
                         'error': "No valid allocations to commit"
                     }
                 
-                # Generate allocation number
+                # Generate allocation number (with locking to prevent duplicates)
                 allocation_number = self._generate_allocation_number(conn)
                 
                 # Build allocation context
