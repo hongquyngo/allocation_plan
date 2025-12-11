@@ -7,6 +7,11 @@ REFACTORED: 2024-12 - Simplified OC creator lookup using data from
                       outbound_oc_pending_delivery_view (oc_creator_email, oc_creator_name)
                       instead of separate database queries.
 
+BUGFIX: 2024-12 - Split allocations now expanded into multiple rows in emails.
+                  Previously only showed "(X splits)" indicator with single row.
+                  Now each split gets its own row with specific qty and ETD.
+                  Fixed in: _build_allocation_table_rows(), send_individual_email_to_creator()
+
 Email flow:
 1. Summary email to allocator (contains ALL OCs)
 2. Individual emails to each OC creator (only their OCs)
@@ -388,9 +393,42 @@ class BulkEmailService:
         """
     
     def _build_allocation_table_rows(self, allocation_results: List[Dict], split_allocations: Dict, max_rows: int = 30) -> str:
+        """
+        Build HTML table rows for allocation results.
+        
+        FIXED 2024-12: Expand split allocations into multiple rows instead of just showing indicator.
+        Each split entry now gets its own row with specific qty and ETD.
+        """
         rows_html = ""
-        valid_results = [a for a in allocation_results if float(a.get('final_qty', 0)) > 0]
-        sorted_results = sorted(valid_results, key=lambda x: float(x.get('final_qty', 0)), reverse=True)[:max_rows]
+        
+        # Expand split allocations into separate rows
+        expanded_results = []
+        for alloc in allocation_results:
+            if float(alloc.get('final_qty', 0)) <= 0:
+                continue
+            
+            ocd_id = alloc.get('ocd_id')
+            splits = split_allocations.get(ocd_id, []) if split_allocations else []
+            
+            if splits and len(splits) > 1:
+                # Expand into multiple rows - one per split
+                for idx, split in enumerate(splits):
+                    split_qty = float(split.get('qty', 0))
+                    if split_qty > 0:
+                        demand_qty = float(alloc.get('demand_qty', 0))
+                        expanded_results.append({
+                            **alloc,
+                            'final_qty': split_qty,
+                            'allocated_etd': split.get('etd'),
+                            'split_info': f" (split {idx+1}/{len(splits)})",
+                            'coverage_percent': (split_qty / demand_qty * 100) if demand_qty > 0 else 0
+                        })
+            else:
+                # Single allocation - no split
+                expanded_results.append({**alloc, 'split_info': ''})
+        
+        # Sort by qty descending and limit
+        sorted_results = sorted(expanded_results, key=lambda x: float(x.get('final_qty', 0)), reverse=True)[:max_rows]
         
         for alloc in sorted_results:
             coverage = float(alloc.get('coverage_percent', 0))
@@ -409,15 +447,19 @@ class BulkEmailService:
                 if days_diff > 0:
                     etd_display = f"{self._format_date(allocated_etd)} <span class='etd-delay'>(+{days_diff}d)</span>"
             
-            ocd_id = alloc.get('ocd_id')
-            split_indicator = ""
-            if ocd_id and split_allocations.get(ocd_id) and len(split_allocations[ocd_id]) > 1:
-                split_indicator = f" <span style='color: #666; font-size: 10px;'>({len(split_allocations[ocd_id])} splits)</span>"
+            # Split indicator from expanded data
+            split_indicator = alloc.get('split_info', '')
+            
+            # Customer display with name (consistent with individual email)
+            customer_display = alloc.get('customer_code', '')
+            if alloc.get('customer'):
+                cust_name = alloc['customer'][:15] + '...' if len(alloc.get('customer', '')) > 15 else alloc.get('customer', '')
+                customer_display = f"{customer_display} - {cust_name}"
             
             rows_html += f"""
             <tr>
                 <td>{alloc.get('oc_number', 'N/A')}{split_indicator}</td>
-                <td>{alloc.get('customer_code', 'N/A')}</td>
+                <td>{customer_display}</td>
                 <td title="{alloc.get('product_display', '')}">{product}</td>
                 <td style="text-align: right; font-weight: bold;">{self._format_number(alloc.get('final_qty', 0))}</td>
                 <td style="text-align: center;">{etd_display}</td>
@@ -425,7 +467,7 @@ class BulkEmailService:
             </tr>
             """
         
-        remaining = len(valid_results) - max_rows
+        remaining = len(expanded_results) - max_rows
         if remaining > 0:
             rows_html += f"""
             <tr>
@@ -603,18 +645,48 @@ class BulkEmailService:
         self, creator_email: str, creator_name: str, creator_allocations: List[Dict],
         commit_result: Dict, allocator_email: str, allocator_name: str, split_allocations: Dict = None
     ) -> Tuple[bool, str]:
+        """
+        Send individual email to OC creator with their allocated OCs.
         
+        FIXED 2024-12: Expand split allocations into multiple rows.
+        """
         if not creator_email:
             return False, "No creator email provided"
         
         split_allocations = split_allocations or {}
         
         allocation_number = commit_result.get('allocation_number', 'N/A')
-        oc_count = len(creator_allocations)
-        total_qty = sum(float(a.get('final_qty', 0)) for a in creator_allocations)
+        
+        # Expand split allocations into separate entries
+        expanded_allocations = []
+        for alloc in creator_allocations:
+            if float(alloc.get('final_qty', 0)) <= 0:
+                continue
+            
+            ocd_id = alloc.get('ocd_id')
+            splits = split_allocations.get(ocd_id, []) if split_allocations else []
+            
+            if splits and len(splits) > 1:
+                # Expand into multiple entries
+                for idx, split in enumerate(splits):
+                    split_qty = float(split.get('qty', 0))
+                    if split_qty > 0:
+                        demand_qty = float(alloc.get('demand_qty', 0))
+                        expanded_allocations.append({
+                            **alloc,
+                            'final_qty': split_qty,
+                            'allocated_etd': split.get('etd'),
+                            'split_info': f" (split {idx+1}/{len(splits)})",
+                            'coverage_percent': (split_qty / demand_qty * 100) if demand_qty > 0 else 0
+                        })
+            else:
+                expanded_allocations.append({**alloc, 'split_info': ''})
+        
+        oc_count = len(set(a.get('ocd_id') for a in expanded_allocations))  # Unique OCs
+        total_qty = sum(float(a.get('final_qty', 0)) for a in expanded_allocations)
         
         rows_html = ""
-        for alloc in sorted(creator_allocations, key=lambda x: float(x.get('final_qty', 0)), reverse=True):
+        for alloc in sorted(expanded_allocations, key=lambda x: float(x.get('final_qty', 0)), reverse=True):
             coverage = float(alloc.get('coverage_percent', 0))
             coverage_class = 'coverage-high' if coverage >= 80 else 'coverage-mid' if coverage >= 50 else 'coverage-low'
             
@@ -631,15 +703,13 @@ class BulkEmailService:
                 if days_diff > 0:
                     etd_display = f"{self._format_date(allocated_etd)} <span class='etd-delay'>(+{days_diff}d)</span>"
             
-            ocd_id = alloc.get('ocd_id')
-            split_indicator = ""
-            if ocd_id and split_allocations.get(ocd_id) and len(split_allocations[ocd_id]) > 1:
-                split_indicator = f" <span style='color: #666; font-size: 10px;'>({len(split_allocations[ocd_id])} splits)</span>"
+            # Split indicator from expanded data
+            split_indicator = alloc.get('split_info', '')
             
             customer_display = alloc.get('customer_code', '')
             if alloc.get('customer'):
-                customer_name = alloc['customer'][:15] + '...' if len(alloc.get('customer', '')) > 15 else alloc.get('customer', '')
-                customer_display = f"{customer_display} - {customer_name}"
+                cust_name = alloc['customer'][:15] + '...' if len(alloc.get('customer', '')) > 15 else alloc.get('customer', '')
+                customer_display = f"{customer_display} - {cust_name}"
             
             rows_html += f"""
             <tr>
