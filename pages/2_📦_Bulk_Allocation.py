@@ -677,7 +677,11 @@ def render_step2_strategy():
                     parts = [oc_info.get('pt_code', '')]
                     if oc_info.get('product_name'):
                         parts.append(oc_info.get('product_name'))
+                    if oc_info.get('package_size'):
+                        parts.append(oc_info.get('package_size'))
                     product_display = ' | '.join(filter(None, parts))
+                    if oc_info.get('brand_name'):
+                        product_display += f" ({oc_info.get('brand_name')})"
                 
                 details_data.append({
                     'OC Number': oc_info.get('oc_number', ''),
@@ -805,7 +809,7 @@ def render_step3_commit():
         oc_etd = oc_info.get('etd')
         adjusted_etd = st.session_state.adjusted_allocations.get(r.ocd_id, {}).get('etd', oc_etd) if isinstance(st.session_state.adjusted_allocations.get(r.ocd_id), dict) else oc_etd
         
-        # Build product display: pt_code | product_name | package_size
+        # Build product display: pt_code | product_name | package_size (brand)
         product_display = oc_info.get('product_display', '')
         if not product_display:
             # Fallback if product_display not available
@@ -815,6 +819,8 @@ def render_step3_commit():
             if oc_info.get('package_size'):
                 parts.append(oc_info.get('package_size'))
             product_display = ' | '.join(filter(None, parts))
+            if oc_info.get('brand_name'):
+                product_display += f" ({oc_info.get('brand_name')})"
         
         edit_data.append({
             'ocd_id': r.ocd_id,
@@ -1157,6 +1163,8 @@ def commit_bulk_allocation(edited_df: pd.DataFrame, original_df: pd.DataFrame, n
                 if oc_info.get('package_size'):
                     parts.append(oc_info.get('package_size'))
                 product_display = ' | '.join(filter(None, parts))
+                if oc_info.get('brand_name'):
+                    product_display += f" ({oc_info.get('brand_name')})"
             
             allocation_results.append({
                 'ocd_id': ocd_id,

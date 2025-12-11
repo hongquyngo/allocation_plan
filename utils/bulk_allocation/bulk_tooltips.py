@@ -360,10 +360,10 @@ Expected delivery date for this allocation.
 Complete product information:
 
 ```
-PT Code | Product Name | Package Size
+PT Code | Product Name | Package Size (Brand)
 ```
 
-Example: P022001923 | Adhesive Tape | 50mm x 100m
+Example: P025000563 | 3M™ Glass Cloth Electrical Tape 69 | 19mmx33m (Vietape)
 """,
     
     'over_allocation_warning': """

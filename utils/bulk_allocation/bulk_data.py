@@ -367,7 +367,9 @@ class BulkAllocationData:
                         CASE WHEN ocpd.product_name IS NOT NULL AND ocpd.product_name != '' 
                              THEN CONCAT(' | ', ocpd.product_name) ELSE '' END,
                         CASE WHEN p.package_size IS NOT NULL AND p.package_size != '' 
-                             THEN CONCAT(' | ', p.package_size) ELSE '' END
+                             THEN CONCAT(' | ', p.package_size) ELSE '' END,
+                        CASE WHEN b.brand_name IS NOT NULL AND b.brand_name != '' 
+                             THEN CONCAT(' (', b.brand_name, ')') ELSE '' END
                     ) as product_display,
                     p.brand_id,
                     b.brand_name,
