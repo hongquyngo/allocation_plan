@@ -12,8 +12,11 @@ Features:
 """
 import streamlit as st
 import pandas as pd
+import logging
 from datetime import datetime, date, timedelta
 from typing import Dict, List, Any, Optional
+
+logger = logging.getLogger(__name__)
 
 # Import bulk allocation modules
 from utils.bulk_allocation import (
@@ -1212,21 +1215,35 @@ def commit_bulk_allocation(edited_df: pd.DataFrame, original_df: pd.DataFrame, n
             st.metric("OCs Allocated", result['detail_count'])
             st.metric("Total Quantity", format_number(result['total_allocated']))
             
-            # Send email
+            # Send email notifications
+            # 1. Summary email to allocator
+            # 2. Individual emails to each OC creator
             try:
-                recipients = services['email'].get_recipients_for_scope(
-                    get_current_scope(),
-                    user.get('email')
+                email_result = services['email'].send_bulk_allocation_emails(
+                    commit_result=result,
+                    allocation_results=allocation_results,
+                    scope=get_current_scope(),
+                    strategy_config=strategy_config,
+                    allocator_user_id=user.get('id'),
+                    split_allocations=st.session_state.split_allocations
                 )
-                if recipients:
-                    services['email'].send_bulk_allocation_email(
-                        commit_result=result,
-                        allocation_results=allocation_results,
-                        scope=get_current_scope(),
-                        strategy_config=strategy_config,
-                        recipients=recipients
-                    )
+                
+                if email_result.get('success'):
+                    summary_status = "✓" if email_result.get('summary_sent') else "✗"
+                    individual_sent = email_result.get('individual_sent', 0)
+                    individual_total = email_result.get('individual_total', 0)
+                    
+                    st.success(f"📧 Emails sent: Summary {summary_status} | Individual: {individual_sent}/{individual_total} OC creators")
+                    
+                    if email_result.get('errors'):
+                        with st.expander("⚠️ Email errors", expanded=False):
+                            for err in email_result['errors']:
+                                st.caption(f"• {err}")
+                else:
+                    st.warning(f"📧 Email: {email_result.get('message', 'Failed')}")
+                    
             except Exception as e:
+                logger.warning(f"Email notification failed: {e}")
                 st.warning(f"Email notification failed: {e}")
             
             # Clear session and offer new allocation
