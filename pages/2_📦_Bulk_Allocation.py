@@ -9,6 +9,8 @@ Features:
 - Strategy selection (FCFS, ETD Priority, Proportional, Revenue Priority, Hybrid)
 - Simulation preview with fine-tuning
 - Bulk commit with summary email
+
+REFACTORED: 2024-12 - Added customer name display, deduplicated product display logic
 """
 import streamlit as st
 import pandas as pd
@@ -30,7 +32,10 @@ from utils.bulk_allocation.strategy_engine import StrategyType, StrategyConfig
 from utils.bulk_allocation.bulk_formatters import (
     format_number, format_percentage, format_date,
     format_coverage_badge, format_strategy_name, format_allocation_mode,
-    format_etd_urgency, format_scope_summary, format_quantity_with_uom
+    format_etd_urgency, format_scope_summary, format_quantity_with_uom,
+    # NEW: Imported formatter functions
+    format_product_display,
+    format_customer_display
 )
 from utils.bulk_allocation.bulk_tooltips import (
     SCOPE_TOOLTIPS, STRATEGY_TOOLTIPS, REVIEW_TOOLTIPS, FORMULA_TOOLTIPS
@@ -674,21 +679,16 @@ def render_step2_strategy():
             for r in results:
                 oc_info = demands_df[demands_df['ocd_id'] == r.ocd_id].iloc[0].to_dict() if not demands_df[demands_df['ocd_id'] == r.ocd_id].empty else {}
                 
-                # Build product display
-                product_display = oc_info.get('product_display', '')
-                if not product_display:
-                    parts = [oc_info.get('pt_code', '')]
-                    if oc_info.get('product_name'):
-                        parts.append(oc_info.get('product_name'))
-                    if oc_info.get('package_size'):
-                        parts.append(oc_info.get('package_size'))
-                    product_display = ' | '.join(filter(None, parts))
-                    if oc_info.get('brand_name'):
-                        product_display += f" ({oc_info.get('brand_name')})"
+                # REFACTORED: Use formatter functions
+                product_display = format_product_display(oc_info)
+                customer_display = format_customer_display(
+                    r.customer_code,
+                    oc_info.get('customer', '') or oc_info.get('customer_name', '')
+                )
                 
                 details_data.append({
                     'OC Number': oc_info.get('oc_number', ''),
-                    'Customer': r.customer_code,
+                    'Customer': customer_display,
                     'Product': product_display,
                     'ETD': oc_info.get('etd'),
                     'Demand': r.demand_qty,
@@ -730,7 +730,7 @@ def render_step2_strategy():
                 details_df,
                 column_config={
                     'OC Number': st.column_config.TextColumn('OC Number', width="medium"),
-                    'Customer': st.column_config.TextColumn('Customer', width="small"),
+                    'Customer': st.column_config.TextColumn('Customer', width="medium"),
                     'Product': st.column_config.TextColumn('Product', width="large"),
                     'ETD': st.column_config.DateColumn('ETD', width="small"),
                     'Demand': st.column_config.NumberColumn('Demand', format="%.0f"),
@@ -812,24 +812,19 @@ def render_step3_commit():
         oc_etd = oc_info.get('etd')
         adjusted_etd = st.session_state.adjusted_allocations.get(r.ocd_id, {}).get('etd', oc_etd) if isinstance(st.session_state.adjusted_allocations.get(r.ocd_id), dict) else oc_etd
         
-        # Build product display: pt_code | product_name | package_size (brand)
-        product_display = oc_info.get('product_display', '')
-        if not product_display:
-            # Fallback if product_display not available
-            parts = [oc_info.get('pt_code', '')]
-            if oc_info.get('product_name'):
-                parts.append(oc_info.get('product_name'))
-            if oc_info.get('package_size'):
-                parts.append(oc_info.get('package_size'))
-            product_display = ' | '.join(filter(None, parts))
-            if oc_info.get('brand_name'):
-                product_display += f" ({oc_info.get('brand_name')})"
+        # REFACTORED: Use formatter functions
+        product_display = format_product_display(oc_info)
+        customer_display = format_customer_display(
+            r.customer_code,
+            oc_info.get('customer', '') or oc_info.get('customer_name', '')
+        )
         
         edit_data.append({
             'ocd_id': r.ocd_id,
             'oc_number': oc_info.get('oc_number', ''),
             'customer_code': r.customer_code,
             'customer': oc_info.get('customer', ''),
+            'customer_display': customer_display,
             'product_display': product_display,
             'pt_code': oc_info.get('pt_code', ''),
             'product_name': oc_info.get('product_name', ''),
@@ -852,12 +847,13 @@ def render_step3_commit():
     if 'allocated_etd' in edit_df.columns:
         edit_df['allocated_etd'] = pd.to_datetime(edit_df['allocated_etd']).dt.date
     
-    # Editable columns with product_display and allocated_etd
+    # Editable columns with product_display, customer_display and allocated_etd
     edited_df = st.data_editor(
-        edit_df[['oc_number', 'customer_code', 'product_display', 'allocation_status', 'oc_etd', 'demand_qty', 'current_allocated', 'suggested_qty', 'final_qty', 'allocated_etd', 'coverage_pct']],
+        edit_df[['oc_number', 'customer_display', 'product_display', 'allocation_status', 'oc_etd', 'demand_qty', 'current_allocated', 'suggested_qty', 'final_qty', 'allocated_etd', 'coverage_pct']],
         column_config={
             'oc_number': st.column_config.TextColumn('OC Number', disabled=True, width="medium"),
-            'customer_code': st.column_config.TextColumn('Customer', disabled=True, width="small"),
+            'customer_display': st.column_config.TextColumn('Customer', disabled=True, width="medium",
+                help="Customer Code - Customer Name"),
             'product_display': st.column_config.TextColumn('Product', disabled=True, width="large", 
                 help="PT Code | Product Name | Package Size"),
             'allocation_status': st.column_config.TextColumn('Status', disabled=True, width="small",
@@ -1163,17 +1159,8 @@ def commit_bulk_allocation(edited_df: pd.DataFrame, original_df: pd.DataFrame, n
             final_qty = row['final_qty']
             allocated_etd = row['allocated_etd']
             
-            # Build product display for email/logging
-            product_display = original_df.iloc[i].get('product_display', '')
-            if not product_display:
-                parts = [oc_info.get('pt_code', '')]
-                if oc_info.get('product_name'):
-                    parts.append(oc_info.get('product_name'))
-                if oc_info.get('package_size'):
-                    parts.append(oc_info.get('package_size'))
-                product_display = ' | '.join(filter(None, parts))
-                if oc_info.get('brand_name'):
-                    product_display += f" ({oc_info.get('brand_name')})"
+            # REFACTORED: Use formatter function for product display
+            product_display = format_product_display(oc_info)
             
             allocation_results.append({
                 'ocd_id': ocd_id,

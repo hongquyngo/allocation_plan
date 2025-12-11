@@ -436,3 +436,70 @@ def build_product_display_from_row(row: Union[Dict, pd.Series]) -> str:
         oc_info = row
     
     return format_product_display(oc_info)
+
+
+# ==================== NEW: Customer Display Formatter ====================
+
+def format_customer_display(
+    customer_code: str,
+    customer_name: str = None,
+    max_name_length: int = 40
+) -> str:
+    """
+    Format customer display string combining code and name.
+    
+    Format: "Code - Customer Name" or just "Code" if name not available.
+    
+    Args:
+        customer_code: Customer code (e.g., "C000587")
+        customer_name: Customer name (optional)
+        max_name_length: Max length for customer name before truncation
+    
+    Returns:
+        Formatted string
+    
+    Examples:
+        >>> format_customer_display("C000587", "Samsung Electronics Vietnam")
+        'C000587 - Samsung Electronics Vietnam'
+        
+        >>> format_customer_display("C000587", None)
+        'C000587'
+        
+        >>> format_customer_display("C000587", "Very Long Customer Name That Exceeds Limit", 20)
+        'C000587 - Very Long Customer ...'
+    """
+    if not customer_code:
+        return customer_name or ""
+    
+    if not customer_name:
+        return customer_code
+    
+    # Truncate long names
+    if len(customer_name) > max_name_length:
+        customer_name = customer_name[:max_name_length-3] + "..."
+    
+    return f"{customer_code} - {customer_name}"
+
+
+def format_customer_display_from_dict(oc_info: Dict, max_name_length: int = 40) -> str:
+    """
+    Format customer display from OC info dictionary.
+    
+    Looks for customer code and name in common field names.
+    
+    Args:
+        oc_info: Dictionary containing customer information
+        max_name_length: Max length for customer name
+    
+    Returns:
+        Formatted customer display string
+    """
+    customer_code = oc_info.get('customer_code', '')
+    customer_name = (
+        oc_info.get('customer') or 
+        oc_info.get('customer_name') or 
+        oc_info.get('customer_english_name') or
+        ''
+    )
+    
+    return format_customer_display(customer_code, customer_name, max_name_length)

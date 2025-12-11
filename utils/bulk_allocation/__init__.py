@@ -36,9 +36,11 @@ from .bulk_formatters import (
     format_diff,
     truncate_text,
     format_list_summary,
-    format_product_display,        # NEW
-    format_product_display_short,  # NEW
-    build_product_display_from_row # NEW
+    format_product_display,            # NEW
+    format_product_display_short,      # NEW
+    build_product_display_from_row,    # NEW
+    format_customer_display,           # NEW - for customer code + name
+    format_customer_display_from_dict  # NEW - convenience wrapper
 )
 from .bulk_tooltips import (
     SCOPE_TOOLTIPS,
@@ -74,9 +76,11 @@ __all__ = [
     'format_diff',
     'truncate_text',
     'format_list_summary',
-    'format_product_display',        # NEW
-    'format_product_display_short',  # NEW
-    'build_product_display_from_row', # NEW
+    'format_product_display',            # NEW
+    'format_product_display_short',      # NEW
+    'build_product_display_from_row',    # NEW
+    'format_customer_display',           # NEW
+    'format_customer_display_from_dict', # NEW
     
     # Tooltips
     'SCOPE_TOOLTIPS',
