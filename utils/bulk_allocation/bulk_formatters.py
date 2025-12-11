@@ -257,6 +257,21 @@ def format_allocation_mode(mode: str) -> str:
 
 # ==================== Scope Formatting ====================
 
+# Allocation status filter labels for display
+ALLOCATION_STATUS_LABELS = {
+    'ALL_NEEDING': 'All needing',
+    'ONLY_UNALLOCATED': 'Unallocated only',
+    'ONLY_PARTIAL': 'Partial only',
+    'INCLUDE_ALL': 'Include all'
+}
+
+URGENCY_LABELS = {
+    'ALL_ETD': '',
+    'URGENT_ONLY': 'Urgent',
+    'OVERDUE_ONLY': 'Overdue',
+    'URGENT_AND_OVERDUE': 'Urgent+Overdue'
+}
+
 def format_scope_summary(scope: Dict) -> str:
     """
     Format scope dictionary as summary string.
@@ -265,7 +280,7 @@ def format_scope_summary(scope: Dict) -> str:
         scope: Scope dictionary with filters
     
     Returns:
-        Summary string like "2 Brands, 3 Customers, ETD: 2024-01-01 to 2024-01-31"
+        Summary string like "2 Brands, 3 Customers, ETD: 2024-01-01 to 2024-01-31 | Unallocated only"
     """
     parts = []
     
@@ -285,6 +300,27 @@ def format_scope_summary(scope: Dict) -> str:
         etd_from = format_date(scope.get('etd_from')) if scope.get('etd_from') else 'Any'
         etd_to = format_date(scope.get('etd_to')) if scope.get('etd_to') else 'Any'
         parts.append(f"ETD: {etd_from} → {etd_to}")
+    
+    # Allocation status filter
+    status_filter = scope.get('allocation_status_filter', 'ALL_NEEDING')
+    status_label = ALLOCATION_STATUS_LABELS.get(status_filter, status_filter)
+    
+    # Urgency filter
+    urgency_filter = scope.get('urgency_filter', 'ALL_ETD')
+    urgency_label = URGENCY_LABELS.get(urgency_filter, '')
+    
+    # Build filter tag
+    filter_parts = [status_label]
+    if urgency_label:
+        filter_parts.append(urgency_label)
+    if scope.get('low_coverage_only'):
+        filter_parts.append(f"<{scope.get('low_coverage_threshold', 50)}%")
+    if scope.get('stock_available_only'):
+        filter_parts.append('Stock')
+    if scope.get('high_value_only'):
+        filter_parts.append(f"≥${scope.get('high_value_threshold', 10000):,.0f}")
+    
+    parts.append(f"[{' | '.join(filter_parts)}]")
     
     if not parts:
         return "All (No filters)"

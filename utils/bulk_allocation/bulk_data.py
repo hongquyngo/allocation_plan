@@ -579,20 +579,71 @@ class BulkAllocationData:
         """Build WHERE conditions from scope filters INCLUDING allocation status filters."""
         conditions, params = self._build_base_scope_conditions(scope)
         
-        if scope.get('exclude_fully_allocated', True):
+        # ========== ALLOCATION STATUS FILTER ==========
+        # Handle new only_partial filter first (most specific)
+        if scope.get('only_partial', False):
+            # Only partially allocated: has some allocation but not fully allocated
+            conditions.append("""
+                (COALESCE(ocpd.undelivered_allocated_qty_standard, 0) > 0 
+                 OR COALESCE(ocpd.total_effective_allocated_qty_standard, 0) > 0)
+            """)
             conditions.append("""
                 GREATEST(0, LEAST(
                     ocpd.standard_quantity - COALESCE(ocpd.total_effective_allocated_qty_standard, 0),
                     ocpd.pending_standard_delivery_quantity - COALESCE(ocpd.undelivered_allocated_qty_standard, 0)
                 )) > 0
             """)
-        
-        if scope.get('only_unallocated', False):
+        elif scope.get('only_unallocated', False):
+            # Only unallocated: never allocated
             conditions.append("COALESCE(ocpd.total_effective_allocated_qty_standard, 0) = 0")
             conditions.append("COALESCE(ocpd.undelivered_allocated_qty_standard, 0) = 0")
-        elif not scope.get('include_partial_allocated', True):
-            conditions.append("COALESCE(ocpd.total_effective_allocated_qty_standard, 0) = 0")
+        else:
+            # Default behavior: use exclude_fully_allocated and include_partial_allocated
+            if scope.get('exclude_fully_allocated', True):
+                conditions.append("""
+                    GREATEST(0, LEAST(
+                        ocpd.standard_quantity - COALESCE(ocpd.total_effective_allocated_qty_standard, 0),
+                        ocpd.pending_standard_delivery_quantity - COALESCE(ocpd.undelivered_allocated_qty_standard, 0)
+                    )) > 0
+                """)
+            
+            if not scope.get('include_partial_allocated', True):
+                conditions.append("COALESCE(ocpd.total_effective_allocated_qty_standard, 0) = 0")
         
+        # ========== URGENCY FILTER ==========
+        urgency_filter = scope.get('urgency_filter', 'ALL_ETD')
+        urgent_days = scope.get('urgent_days', 7)
+        
+        if urgency_filter == 'URGENT_ONLY':
+            # ETD within urgent_days from today
+            conditions.append(f"ocpd.etd <= DATE_ADD(CURDATE(), INTERVAL {int(urgent_days)} DAY)")
+            conditions.append("ocpd.etd >= CURDATE()")  # Not overdue
+        elif urgency_filter == 'OVERDUE_ONLY':
+            # ETD already passed
+            conditions.append("ocpd.etd < CURDATE()")
+        elif urgency_filter == 'URGENT_AND_OVERDUE':
+            # Either urgent or overdue
+            conditions.append(f"ocpd.etd <= DATE_ADD(CURDATE(), INTERVAL {int(urgent_days)} DAY)")
+        # 'ALL_ETD' - no filter
+        
+        # ========== LOW COVERAGE FILTER ==========
+        if scope.get('low_coverage_only', False):
+            threshold = scope.get('low_coverage_threshold', 50)
+            # Coverage = undelivered_allocated / pending_qty * 100 < threshold
+            conditions.append(f"""
+                (COALESCE(ocpd.undelivered_allocated_qty_standard, 0) / 
+                 NULLIF(ocpd.pending_standard_delivery_quantity, 0) * 100) < {threshold}
+            """)
+        
+        # ========== HIGH VALUE FILTER ==========
+        if scope.get('high_value_only', False):
+            threshold = scope.get('high_value_threshold', 10000)
+            # Order value = qty * unit_price (assuming oc has order_value or can calculate)
+            conditions.append(f"""
+                COALESCE(ocpd.pending_standard_delivery_quantity * ocpd.unit_price_usd, 0) >= {threshold}
+            """)
+        
+        # ========== OTHER FILTERS ==========
         if scope.get('exclude_over_committed', False):
             conditions.append("ocpd.over_allocation_type IS NULL")
         

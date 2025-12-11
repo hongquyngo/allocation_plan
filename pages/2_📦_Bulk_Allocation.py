@@ -91,10 +91,26 @@ def init_session_state():
         'scope_legal_entities': [],
         'scope_etd_from': None,
         'scope_etd_to': None,
-        'scope_include_partial': True,
         
-        # NEW: Allocation status filters
-        'scope_exclude_fully_allocated': True,  # Default: exclude fully allocated
+        # ========== ALLOCATION STATUS FILTER ==========
+        # Options: 'ALL_NEEDING', 'ONLY_UNALLOCATED', 'ONLY_PARTIAL', 'INCLUDE_ALL'
+        'scope_allocation_status_filter': 'ALL_NEEDING',
+        
+        # ========== URGENCY FILTER ==========
+        # Options: 'ALL_ETD', 'URGENT_ONLY', 'OVERDUE_ONLY', 'URGENT_AND_OVERDUE'
+        'scope_urgency_filter': 'ALL_ETD',
+        'scope_urgent_days': 7,  # Days threshold for "urgent"
+        
+        # ========== ADDITIONAL FILTERS ==========
+        'scope_low_coverage_only': False,  # Only OCs with coverage < threshold
+        'scope_low_coverage_threshold': 50,  # Coverage % threshold
+        'scope_stock_available_only': False,  # Only products with available stock
+        'scope_high_value_only': False,  # Only high value orders
+        'scope_high_value_threshold': 10000,  # USD threshold
+        
+        # DEPRECATED but kept for backward compatibility
+        'scope_include_partial': True,
+        'scope_exclude_fully_allocated': True,
         'scope_only_unallocated': False,
         
         # Strategy configuration
@@ -130,18 +146,89 @@ init_session_state()
 
 # ==================== HELPER FUNCTIONS ====================
 
+# Allocation status filter options
+ALLOCATION_STATUS_OPTIONS = {
+    'ALL_NEEDING': {
+        'label': '🔄 All needing allocation',
+        'description': 'Not Allocated + Partially Allocated',
+        'include_not_allocated': True,
+        'include_partial': True,
+        'include_fully': False
+    },
+    'ONLY_UNALLOCATED': {
+        'label': '🆕 Only unallocated OCs',
+        'description': 'Fresh orders never allocated',
+        'include_not_allocated': True,
+        'include_partial': False,
+        'include_fully': False
+    },
+    'ONLY_PARTIAL': {
+        'label': '📈 Only partially allocated OCs',
+        'description': 'Top-up existing allocations',
+        'include_not_allocated': False,
+        'include_partial': True,
+        'include_fully': False
+    },
+    'INCLUDE_ALL': {
+        'label': '📋 All OCs (include fully allocated)',
+        'description': 'Review or re-allocate everything',
+        'include_not_allocated': True,
+        'include_partial': True,
+        'include_fully': True
+    }
+}
+
+# Urgency filter options
+URGENCY_FILTER_OPTIONS = {
+    'ALL_ETD': {
+        'label': '📅 All ETDs',
+        'description': 'No urgency filter'
+    },
+    'URGENT_ONLY': {
+        'label': '🔴 Urgent only',
+        'description': 'ETD within threshold days'
+    },
+    'OVERDUE_ONLY': {
+        'label': '⚠️ Overdue only',
+        'description': 'ETD already passed'
+    },
+    'URGENT_AND_OVERDUE': {
+        'label': '🚨 Urgent + Overdue',
+        'description': 'Both urgent and overdue OCs'
+    }
+}
+
 def get_current_scope() -> Dict:
     """Build current scope from session state"""
+    # Get allocation status filter and convert to old params for backward compatibility
+    status_filter = st.session_state.get('scope_allocation_status_filter', 'ALL_NEEDING')
+    filter_config = ALLOCATION_STATUS_OPTIONS.get(status_filter, ALLOCATION_STATUS_OPTIONS['ALL_NEEDING'])
+    
     return {
+        # Basic filters
         'brand_ids': st.session_state.scope_brand_ids,
         'customer_codes': st.session_state.scope_customer_codes,
         'legal_entities': st.session_state.scope_legal_entities,
         'etd_from': st.session_state.scope_etd_from,
         'etd_to': st.session_state.scope_etd_to,
-        'include_partial_allocated': st.session_state.scope_include_partial,
-        # NEW filters
-        'exclude_fully_allocated': st.session_state.scope_exclude_fully_allocated,
-        'only_unallocated': st.session_state.scope_only_unallocated,
+        
+        # Allocation status filter (converted to old params for backward compatibility)
+        'include_partial_allocated': filter_config['include_partial'],
+        'exclude_fully_allocated': not filter_config['include_fully'],
+        'only_unallocated': status_filter == 'ONLY_UNALLOCATED',
+        'only_partial': status_filter == 'ONLY_PARTIAL',
+        'allocation_status_filter': status_filter,
+        
+        # Urgency filter
+        'urgency_filter': st.session_state.get('scope_urgency_filter', 'ALL_ETD'),
+        'urgent_days': st.session_state.get('scope_urgent_days', 7),
+        
+        # Additional filters
+        'low_coverage_only': st.session_state.get('scope_low_coverage_only', False),
+        'low_coverage_threshold': st.session_state.get('scope_low_coverage_threshold', 50),
+        'stock_available_only': st.session_state.get('scope_stock_available_only', False),
+        'high_value_only': st.session_state.get('scope_high_value_only', False),
+        'high_value_threshold': st.session_state.get('scope_high_value_threshold', 10000),
     }
 
 def get_strategy_config() -> StrategyConfig:
@@ -155,12 +242,15 @@ def get_strategy_config() -> StrategyConfig:
     )
 
 def clear_simulation():
-    """Clear simulation results"""
+    """Clear simulation results and widget state"""
     st.session_state.simulation_results = None
     st.session_state.demands_df = None
     st.session_state.supply_df = None
     st.session_state.adjusted_allocations = {}
     st.session_state.split_allocations = {}
+    # Clear data_editor widget state to prevent stale edits from applying to new simulation
+    if 'bulk_allocation_editor' in st.session_state:
+        del st.session_state['bulk_allocation_editor']
 
 # ==================== PAGE HEADER ====================
 
@@ -357,41 +447,111 @@ def render_step1_scope():
             )
             st.session_state.scope_etd_to = etd_to
     
-    # ========== OPTIONS SECTION (UPDATED) ==========
-    st.markdown("##### ⚙️ Options")
+    # ========== OPTIONS SECTION (REDESIGNED) ==========
+    st.markdown("##### ⚙️ Filter Options")
     
-    opt_col1, opt_col2 = st.columns(2)
+    # ===== ROW 1: Allocation Status Filter =====
+    st.markdown("###### 📦 Allocation Status")
+    status_options = list(ALLOCATION_STATUS_OPTIONS.keys())
+    current_filter = st.session_state.get('scope_allocation_status_filter', 'ALL_NEEDING')
+    current_index = status_options.index(current_filter) if current_filter in status_options else 0
     
-    with opt_col1:
-        exclude_fully = st.checkbox(
-            "Exclude fully allocated OCs",
-            value=st.session_state.scope_exclude_fully_allocated,
-            key="exclude_fully_check",
-            help=SCOPE_TOOLTIPS['exclude_fully_allocated']
-        )
-        st.session_state.scope_exclude_fully_allocated = exclude_fully
+    selected_status = st.radio(
+        "Select which OCs to include by allocation status",
+        options=status_options,
+        format_func=lambda x: ALLOCATION_STATUS_OPTIONS[x]['label'],
+        index=current_index,
+        key="allocation_status_radio",
+        horizontal=True,
+        label_visibility="collapsed"
+    )
+    st.session_state.scope_allocation_status_filter = selected_status
+    st.caption(f"ℹ️ {ALLOCATION_STATUS_OPTIONS[selected_status]['description']}")
+    
+    # ===== ROW 2: Urgency Filter =====
+    st.markdown("###### 📅 Urgency Filter")
+    urg_col1, urg_col2 = st.columns([3, 1])
+    
+    with urg_col1:
+        urgency_options = list(URGENCY_FILTER_OPTIONS.keys())
+        current_urgency = st.session_state.get('scope_urgency_filter', 'ALL_ETD')
+        current_urg_index = urgency_options.index(current_urgency) if current_urgency in urgency_options else 0
         
-        include_partial = st.checkbox(
-            "Include partially allocated OCs (top-up)",
-            value=st.session_state.scope_include_partial,
-            key="include_partial_check",
-            help=SCOPE_TOOLTIPS['include_partial'],
-            disabled=st.session_state.scope_only_unallocated  # Disable if only_unallocated is checked
+        selected_urgency = st.radio(
+            "Filter by ETD urgency",
+            options=urgency_options,
+            format_func=lambda x: URGENCY_FILTER_OPTIONS[x]['label'],
+            index=current_urg_index,
+            key="urgency_filter_radio",
+            horizontal=True,
+            label_visibility="collapsed"
         )
-        st.session_state.scope_include_partial = include_partial
+        st.session_state.scope_urgency_filter = selected_urgency
     
-    with opt_col2:
-        only_unallocated = st.checkbox(
-            "Only unallocated OCs",
-            value=st.session_state.scope_only_unallocated,
-            key="only_unallocated_check",
-            help=SCOPE_TOOLTIPS['only_unallocated']
+    with urg_col2:
+        if selected_urgency in ['URGENT_ONLY', 'URGENT_AND_OVERDUE']:
+            urgent_days = st.number_input(
+                "Urgent threshold (days)",
+                min_value=1,
+                max_value=30,
+                value=st.session_state.get('scope_urgent_days', 7),
+                key="urgent_days_input",
+                help="OCs with ETD within this many days are considered urgent"
+            )
+            st.session_state.scope_urgent_days = urgent_days
+    
+    # ===== ROW 3: Additional Filters =====
+    st.markdown("###### 🔍 Additional Filters")
+    add_col1, add_col2, add_col3 = st.columns(3)
+    
+    with add_col1:
+        low_coverage = st.checkbox(
+            "Low coverage only",
+            value=st.session_state.get('scope_low_coverage_only', False),
+            key="low_coverage_check",
+            help="Only include OCs with coverage below threshold"
         )
-        st.session_state.scope_only_unallocated = only_unallocated
+        st.session_state.scope_low_coverage_only = low_coverage
         
-        # If only_unallocated is checked, auto-enable exclude_fully
-        if only_unallocated:
-            st.session_state.scope_include_partial = False
+        if low_coverage:
+            coverage_threshold = st.slider(
+                "Coverage threshold %",
+                min_value=10,
+                max_value=90,
+                value=st.session_state.get('scope_low_coverage_threshold', 50),
+                key="coverage_threshold_slider",
+                help="OCs with coverage below this % will be included"
+            )
+            st.session_state.scope_low_coverage_threshold = coverage_threshold
+    
+    with add_col2:
+        stock_available = st.checkbox(
+            "Products with stock only",
+            value=st.session_state.get('scope_stock_available_only', False),
+            key="stock_available_check",
+            help="Only include OCs for products that have available supply"
+        )
+        st.session_state.scope_stock_available_only = stock_available
+    
+    with add_col3:
+        high_value = st.checkbox(
+            "High value orders only",
+            value=st.session_state.get('scope_high_value_only', False),
+            key="high_value_check",
+            help="Only include orders above value threshold"
+        )
+        st.session_state.scope_high_value_only = high_value
+        
+        if high_value:
+            value_threshold = st.number_input(
+                "Value threshold (USD)",
+                min_value=1000,
+                max_value=1000000,
+                value=st.session_state.get('scope_high_value_threshold', 10000),
+                step=1000,
+                key="value_threshold_input"
+            )
+            st.session_state.scope_high_value_threshold = value_threshold
     
     # ========== SCOPE PREVIEW (UPDATED) ==========
     st.divider()
@@ -489,10 +649,54 @@ def render_step1_scope():
                     help=SCOPE_TOOLTIPS.get('coverage', '')
                 )
                 
-                # Info box for filter effect
-                if st.session_state.scope_exclude_fully_allocated:
-                    filtered_count = summary.get('fully_allocated_count', 0)
-                    st.info(f"ℹ️ **{filtered_count}** fully allocated OCs will be excluded from allocation.")
+                # Info box for filter effect - based on new filters
+                status_filter = st.session_state.get('scope_allocation_status_filter', 'ALL_NEEDING')
+                urgency_filter = st.session_state.get('scope_urgency_filter', 'ALL_ETD')
+                not_alloc = summary.get('not_allocated_count', 0)
+                partial = summary.get('partially_allocated_count', 0)
+                fully = summary.get('fully_allocated_count', 0)
+                
+                # Build filter summary messages
+                filter_msgs = []
+                
+                # Allocation status message
+                if status_filter == 'ALL_NEEDING':
+                    filter_msgs.append(f"📦 **{not_alloc + partial}** OCs (Not Allocated + Partial)")
+                elif status_filter == 'ONLY_UNALLOCATED':
+                    filter_msgs.append(f"🆕 **{not_alloc}** unallocated OCs only")
+                elif status_filter == 'ONLY_PARTIAL':
+                    filter_msgs.append(f"📈 **{partial}** partially allocated OCs only")
+                elif status_filter == 'INCLUDE_ALL':
+                    filter_msgs.append(f"📋 ALL **{not_alloc + partial + fully}** OCs")
+                
+                # Urgency message
+                if urgency_filter == 'URGENT_ONLY':
+                    days = st.session_state.get('scope_urgent_days', 7)
+                    filter_msgs.append(f"🔴 Urgent only (ETD ≤ {days} days)")
+                elif urgency_filter == 'OVERDUE_ONLY':
+                    filter_msgs.append("⚠️ Overdue only (ETD passed)")
+                elif urgency_filter == 'URGENT_AND_OVERDUE':
+                    days = st.session_state.get('scope_urgent_days', 7)
+                    filter_msgs.append(f"🚨 Urgent ({days}d) + Overdue")
+                
+                # Additional filters
+                if st.session_state.get('scope_low_coverage_only', False):
+                    threshold = st.session_state.get('scope_low_coverage_threshold', 50)
+                    filter_msgs.append(f"📉 Coverage < {threshold}%")
+                if st.session_state.get('scope_stock_available_only', False):
+                    filter_msgs.append("📦 With stock only")
+                if st.session_state.get('scope_high_value_only', False):
+                    threshold = st.session_state.get('scope_high_value_threshold', 10000)
+                    filter_msgs.append(f"💰 Value ≥ ${threshold:,.0f}")
+                
+                # Display summary
+                if len(filter_msgs) > 1:
+                    st.info("ℹ️ **Active Filters:** " + " | ".join(filter_msgs))
+                elif filter_msgs:
+                    if status_filter == 'INCLUDE_ALL':
+                        st.warning("⚠️ " + filter_msgs[0] + " - Use with caution.")
+                    else:
+                        st.info("ℹ️ " + filter_msgs[0])
             
             else:
                 # ===== FALLBACK: Old UI (backward compatible) =====
@@ -641,17 +845,34 @@ def render_step2_strategy():
                 product_ids = demands_df['product_id'].unique().tolist()
                 supply_df = services['data'].get_supply_by_products(product_ids)
                 
-                # Run simulation
-                config = get_strategy_config()
-                results = services['engine'].simulate(demands_df, supply_df, config)
+                # ========== STOCK AVAILABLE FILTER ==========
+                # Filter demands to only include products with available supply
+                if scope.get('stock_available_only', False):
+                    # Get products with available supply > 0
+                    if not supply_df.empty:
+                        products_with_stock = supply_df[supply_df['available_supply'] > 0]['product_id'].unique().tolist()
+                        original_count = len(demands_df)
+                        demands_df = demands_df[demands_df['product_id'].isin(products_with_stock)]
+                        filtered_count = original_count - len(demands_df)
+                        if filtered_count > 0:
+                            st.info(f"ℹ️ Filtered out {filtered_count} OCs for products without available stock")
+                    else:
+                        st.warning("⚠️ No supply data available. Stock filter cannot be applied.")
                 
-                # Store in session
-                st.session_state.simulation_results = results
-                st.session_state.demands_df = demands_df
-                st.session_state.supply_df = supply_df
-                
-                st.success(f"✅ Simulation complete: {len(results)} OCs processed")
-                st.rerun()
+                if demands_df.empty:
+                    st.error("No demands remain after applying filters")
+                else:
+                    # Run simulation
+                    config = get_strategy_config()
+                    results = services['engine'].simulate(demands_df, supply_df, config)
+                    
+                    # Store in session
+                    st.session_state.simulation_results = results
+                    st.session_state.demands_df = demands_df
+                    st.session_state.supply_df = supply_df
+                    
+                    st.success(f"✅ Simulation complete: {len(results)} OCs processed")
+                    st.rerun()
     
     # Show simulation results preview
     if st.session_state.simulation_results:
@@ -778,10 +999,18 @@ def render_step2_strategy():
             st.rerun()
 
 
-# ==================== STEP 3: REVIEW & COMMIT ====================
+# ==================== STEP 3: REVIEW & COMMIT (REFACTORED) ====================
 
 def render_step3_commit():
-    """Render review and commit step"""
+    """
+    Render review and commit step - REFACTORED to prevent reset bug
+    
+    Key changes:
+    1. REMOVED: Logic save adjustments to session_state after data_editor
+    2. Build base_df from simulation results (not from adjusted_allocations)
+    3. Read final values directly from edited_df (widget state is auto-persisted)
+    4. Only split_allocations uses session_state (needs separate UI)
+    """
     st.subheader("Step 3: Review & Commit")
     
     results = st.session_state.simulation_results
@@ -802,28 +1031,23 @@ def render_step3_commit():
     
     # Fine-tuning section
     st.markdown("##### ✏️ Fine-tune Allocations")
-    st.caption("Adjust quantities if needed before committing")
+    st.caption("Adjust quantities and ETDs as needed. Changes are preserved until you commit or go back.")
     
-    # Build editable data
-    edit_data = []
+    # Build BASE data from simulation results
+    # Widget state (edits) is automatically managed by Streamlit via the key
+    base_data = []
     for r in results:
         oc_info = demands_df[demands_df['ocd_id'] == r.ocd_id].iloc[0].to_dict() if not demands_df[demands_df['ocd_id'] == r.ocd_id].empty else {}
         
-        # Check for adjustments (qty and etd)
-        adjusted_qty = st.session_state.adjusted_allocations.get(r.ocd_id, {}).get('qty', r.final_qty) if isinstance(st.session_state.adjusted_allocations.get(r.ocd_id), dict) else st.session_state.adjusted_allocations.get(r.ocd_id, r.final_qty)
-        
-        # Get OC ETD as default for allocated_etd
         oc_etd = oc_info.get('etd')
-        adjusted_etd = st.session_state.adjusted_allocations.get(r.ocd_id, {}).get('etd', oc_etd) if isinstance(st.session_state.adjusted_allocations.get(r.ocd_id), dict) else oc_etd
         
-        # REFACTORED: Use formatter functions
         product_display = format_product_display(oc_info)
         customer_display = format_customer_display(
             r.customer_code,
             oc_info.get('customer', '') or oc_info.get('customer_name', '')
         )
         
-        edit_data.append({
+        base_data.append({
             'ocd_id': r.ocd_id,
             'oc_number': oc_info.get('oc_number', ''),
             'customer_code': r.customer_code,
@@ -835,25 +1059,27 @@ def render_step3_commit():
             'package_size': oc_info.get('package_size', ''),
             'allocation_status': oc_info.get('allocation_status', ''),
             'oc_etd': oc_etd,
-            'allocated_etd': adjusted_etd,
+            'allocated_etd': oc_etd,  # Default to OC ETD
             'demand_qty': r.demand_qty,
             'current_allocated': r.current_allocated,
             'suggested_qty': r.suggested_qty,
-            'final_qty': adjusted_qty,
-            'coverage_pct': (adjusted_qty / r.demand_qty * 100) if r.demand_qty > 0 else 0
+            'final_qty': r.suggested_qty,  # Start with suggested
+            'coverage_pct': (r.suggested_qty / r.demand_qty * 100) if r.demand_qty > 0 else 0
         })
     
-    edit_df = pd.DataFrame(edit_data)
+    base_df = pd.DataFrame(base_data)
     
     # Convert dates properly for data_editor
-    if 'oc_etd' in edit_df.columns:
-        edit_df['oc_etd'] = pd.to_datetime(edit_df['oc_etd']).dt.date
-    if 'allocated_etd' in edit_df.columns:
-        edit_df['allocated_etd'] = pd.to_datetime(edit_df['allocated_etd']).dt.date
+    if 'oc_etd' in base_df.columns:
+        base_df['oc_etd'] = pd.to_datetime(base_df['oc_etd']).dt.date
+    if 'allocated_etd' in base_df.columns:
+        base_df['allocated_etd'] = pd.to_datetime(base_df['allocated_etd']).dt.date
     
-    # Editable columns with product_display, customer_display and allocated_etd
+    # ==================== DATA EDITOR ====================
+    # Widget state is automatically persisted by Streamlit via the key
+    # No manual save to session_state needed - this prevents the reset bug
     edited_df = st.data_editor(
-        edit_df[['oc_number', 'customer_display', 'product_display', 'allocation_status', 'oc_etd', 'demand_qty', 'current_allocated', 'suggested_qty', 'final_qty', 'allocated_etd', 'coverage_pct']],
+        base_df[['oc_number', 'customer_display', 'product_display', 'allocation_status', 'oc_etd', 'demand_qty', 'current_allocated', 'suggested_qty', 'final_qty', 'allocated_etd', 'coverage_pct']],
         column_config={
             'oc_number': st.column_config.TextColumn('OC Number', disabled=True, width="medium"),
             'customer_display': st.column_config.TextColumn('Customer', disabled=True, width="medium",
@@ -880,34 +1106,13 @@ def render_step3_commit():
         use_container_width=True,
         hide_index=True,
         num_rows="fixed",
-        key="bulk_allocation_editor"  # Key to stabilize state
+        key="bulk_allocation_editor"
     )
     
-    # Save adjustments (both qty and etd)
-    for i, row in edited_df.iterrows():
-        ocd_id = edit_df.iloc[i]['ocd_id']
-        original_qty = results[i].suggested_qty
-        original_etd = edit_df.iloc[i]['oc_etd']
-        
-        final_qty = row['final_qty']
-        final_etd = row['allocated_etd']
-        
-        # Skip if this OC has split allocations (handled separately)
-        if ocd_id in st.session_state.split_allocations:
-            continue
-        
-        # Check if either qty or etd was adjusted
-        qty_changed = final_qty != original_qty
-        etd_changed = final_etd != original_etd
-        
-        if qty_changed or etd_changed:
-            st.session_state.adjusted_allocations[ocd_id] = {
-                'qty': final_qty,
-                'etd': final_etd
-            }
-        elif ocd_id in st.session_state.adjusted_allocations:
-            # Remove if reverted to original
-            del st.session_state.adjusted_allocations[ocd_id]
+    # ==================== NO SAVE ADJUSTMENTS LOOP ====================
+    # REMOVED: The problematic loop that saved adjustments to session_state
+    # This was causing the reset bug when data_editor returned stale state
+    # Widget state is automatically managed by Streamlit
     
     # ==================== SPLIT ALLOCATION FEATURE ====================
     st.divider()
@@ -917,11 +1122,11 @@ def render_step3_commit():
         # Get OCs with allocation > 0 for split options
         split_candidates = [
             {
-                'ocd_id': edit_df.iloc[i]['ocd_id'],
-                'oc_number': edit_df.iloc[i]['oc_number'],
-                'product': edit_df.iloc[i]['product_display'][:40] + '...' if len(edit_df.iloc[i]['product_display']) > 40 else edit_df.iloc[i]['product_display'],
+                'ocd_id': base_df.iloc[i]['ocd_id'],
+                'oc_number': base_df.iloc[i]['oc_number'],
+                'product': base_df.iloc[i]['product_display'][:40] + '...' if len(base_df.iloc[i]['product_display']) > 40 else base_df.iloc[i]['product_display'],
                 'final_qty': edited_df.iloc[i]['final_qty'],
-                'oc_etd': edit_df.iloc[i]['oc_etd'],
+                'oc_etd': base_df.iloc[i]['oc_etd'],
                 'max_allocatable': results[i].demand_qty - results[i].current_allocated
             }
             for i in range(len(results))
@@ -929,9 +1134,8 @@ def render_step3_commit():
         ]
         
         if not split_candidates:
-            st.info("No OCs with allocation to split. Run simulation first.")
+            st.info("No OCs with allocation to split. Adjust quantities above first.")
         else:
-            # Select OC to split - outside form
             selected_idx = st.selectbox(
                 "Select OC to split",
                 options=range(len(split_candidates)),
@@ -946,7 +1150,6 @@ def render_step3_commit():
             
             st.markdown(f"**Max allocatable:** {max_qty:.0f} | **OC ETD:** {default_etd}")
             
-            # Initialize split if not exists
             if ocd_id not in st.session_state.split_allocations:
                 st.session_state.split_allocations[ocd_id] = [
                     {'qty': selected_oc['final_qty'], 'etd': default_etd}
@@ -954,7 +1157,6 @@ def render_step3_commit():
             
             splits = st.session_state.split_allocations[ocd_id]
             
-            # Use form to batch changes
             with st.form(key=f"split_form_{ocd_id}"):
                 st.markdown("**Split Entries:**")
                 
@@ -981,7 +1183,6 @@ def render_step3_commit():
                     
                     form_splits.append({'qty': split_qty, 'etd': split_etd})
                 
-                # Form submit buttons
                 col_save, col_add, col_remove = st.columns([1, 1, 1])
                 with col_save:
                     save_clicked = st.form_submit_button("💾 Save Splits", type="primary")
@@ -990,16 +1191,13 @@ def render_step3_commit():
                 with col_remove:
                     remove_clicked = st.form_submit_button("🗑️ Remove Last")
             
-            # Handle form submissions
             if save_clicked:
-                # Filter out zero qty splits
                 valid_splits = [s for s in form_splits if s['qty'] > 0]
                 st.session_state.split_allocations[ocd_id] = valid_splits if valid_splits else [{'qty': 0, 'etd': default_etd}]
                 st.success("Splits saved!")
                 st.rerun()
             
             if add_clicked:
-                # Add to session state, then form will reload
                 total_so_far = sum(s['qty'] for s in form_splits)
                 remaining = max(0, max_qty - total_so_far)
                 st.session_state.split_allocations[ocd_id] = form_splits + [{'qty': remaining, 'etd': default_etd}]
@@ -1009,7 +1207,6 @@ def render_step3_commit():
                 st.session_state.split_allocations[ocd_id] = form_splits[:-1] if len(form_splits) > 1 else [form_splits[0]]
                 st.rerun()
             
-            # Show validation
             total_split_qty = sum(s['qty'] for s in st.session_state.split_allocations[ocd_id])
             if total_split_qty > max_qty:
                 st.error(f"⚠️ Total split qty ({total_split_qty:.0f}) exceeds max allocatable ({max_qty:.0f})")
@@ -1017,93 +1214,79 @@ def render_step3_commit():
                 st.warning(f"ℹ️ Remaining unallocated: {max_qty - total_split_qty:.0f}")
             elif total_split_qty > 0:
                 st.success(f"✅ Total: {total_split_qty:.0f} / {max_qty:.0f}")
-            
-            # Remove from simple adjustments if using splits
-            if len(st.session_state.split_allocations.get(ocd_id, [])) > 1:
-                if ocd_id in st.session_state.adjusted_allocations:
-                    del st.session_state.adjusted_allocations[ocd_id]
         
-        # Show summary of all active splits
         active_splits = {k: v for k, v in st.session_state.split_allocations.items() if len(v) > 1}
         if active_splits:
             st.markdown("---")
             st.markdown("**Active Splits:**")
             for ocd_id, splits in active_splits.items():
-                oc_match = edit_df[edit_df['ocd_id'] == ocd_id]
+                oc_match = base_df[base_df['ocd_id'] == ocd_id]
                 if len(oc_match) > 0:
                     oc_info = oc_match.iloc[0]
                     st.caption(f"• {oc_info['oc_number']}: {len(splits)} splits → {sum(s['qty'] for s in splits):.0f} total")
     
-    # Recalculate metrics with adjustments (including splits)
+    # ==================== SUMMARY METRICS ====================
     final_total = 0
+    allocated_count = 0
+    etd_adjustments = 0
+    qty_adjustments = 0
+    
     for i, row in edited_df.iterrows():
-        ocd_id = edit_df.iloc[i]['ocd_id']
-        if ocd_id in st.session_state.split_allocations:
-            # Use split total
-            final_total += sum(s['qty'] for s in st.session_state.split_allocations[ocd_id])
+        ocd_id = base_df.iloc[i]['ocd_id']
+        oc_etd = base_df.iloc[i]['oc_etd']
+        suggested_qty = results[i].suggested_qty
+        
+        if ocd_id in st.session_state.split_allocations and len(st.session_state.split_allocations[ocd_id]) > 1:
+            split_total = sum(s['qty'] for s in st.session_state.split_allocations[ocd_id])
+            final_total += split_total
+            if split_total > 0:
+                allocated_count += 1
         else:
             final_total += row['final_qty']
+            if row['final_qty'] > 0:
+                allocated_count += 1
+        
+        # Count adjustments
+        if abs(float(row['final_qty']) - float(suggested_qty)) > 0.001:
+            qty_adjustments += 1
+        if row['allocated_etd'] and oc_etd and row['allocated_etd'] != oc_etd:
+            etd_adjustments += 1
     
     total_demand = sum(r.demand_qty for r in results)
     final_coverage = (final_total / total_demand * 100) if total_demand > 0 else 0
-    
-    # Count OCs with allocation (including splits)
-    allocated_count = 0
-    for i, row in edited_df.iterrows():
-        ocd_id = edit_df.iloc[i]['ocd_id']
-        if ocd_id in st.session_state.split_allocations:
-            if sum(s['qty'] for s in st.session_state.split_allocations[ocd_id]) > 0:
-                allocated_count += 1
-        elif row['final_qty'] > 0:
-            allocated_count += 1
-    
-    # Count splits
     split_count = sum(1 for splits in st.session_state.split_allocations.values() if len(splits) > 1)
-    
-    # Count ETD adjustments
-    etd_adjustments = 0
-    for ocd_id, adj in st.session_state.adjusted_allocations.items():
-        if isinstance(adj, dict) and 'etd' in adj:
-            # Find original OC ETD
-            oc_rows = edit_df[edit_df['ocd_id'] == ocd_id]
-            if len(oc_rows) > 0:
-                original_etd = oc_rows['oc_etd'].values[0]
-                if adj['etd'] != original_etd:
-                    etd_adjustments += 1
     
     st.divider()
     
-    # Final summary
     st.markdown("##### 📊 Final Summary")
     m1, m2, m3, m4, m5, m6 = st.columns(6)
     m1.metric("Total to Allocate", format_number(final_total))
     m2.metric("OCs to Allocate", allocated_count)
     m3.metric("Avg Coverage", format_percentage(final_coverage))
-    m4.metric("Qty Adjustments", len(st.session_state.adjusted_allocations))
+    m4.metric("Qty Adjustments", qty_adjustments)
     m5.metric("ETD Adjustments", etd_adjustments, help="OCs with allocated ETD different from OC ETD")
     m6.metric("Split Allocations", split_count, help="OCs split into multiple allocation records")
     
-    # Validation
+    # ==================== VALIDATION ====================
     validation_result = services['validator'].validate_bulk_allocation(
-        [{'ocd_id': edit_df.iloc[i]['ocd_id'], 
+        [{'ocd_id': base_df.iloc[i]['ocd_id'], 
           'product_id': results[i].product_id, 
           'final_qty': edited_df.iloc[i]['final_qty'],
           'allocated_etd': edited_df.iloc[i]['allocated_etd'],
-          'oc_etd': edit_df.iloc[i]['oc_etd']} 
+          'oc_etd': base_df.iloc[i]['oc_etd']} 
          for i in range(len(results))],
         demands_df,
         supply_df,
         user.get('role', '')
     )
     
-    # Check for ETD delays
     etd_delay_warnings = []
     for i, row in edited_df.iterrows():
-        oc_etd = edit_df.iloc[i]['oc_etd']
+        oc_etd = base_df.iloc[i]['oc_etd']
         alloc_etd = row['allocated_etd']
         if oc_etd and alloc_etd and alloc_etd > oc_etd:
             days_delay = (alloc_etd - oc_etd).days
-            oc_number = edit_df.iloc[i]['oc_number']
+            oc_number = base_df.iloc[i]['oc_number']
             etd_delay_warnings.append(f"{oc_number}: Allocated ETD is {days_delay} days after OC ETD")
     
     if not validation_result['valid']:
@@ -1115,12 +1298,12 @@ def render_step3_commit():
             st.caption(f"  • {warning}")
         if etd_delay_warnings:
             with st.expander(f"📅 ETD Delay Warnings ({len(etd_delay_warnings)})", expanded=False):
-                for warning in etd_delay_warnings[:10]:  # Show first 10
+                for warning in etd_delay_warnings[:10]:
                     st.caption(f"  • {warning}")
                 if len(etd_delay_warnings) > 10:
                     st.caption(f"  ... and {len(etd_delay_warnings) - 10} more")
     
-    # Commit section
+    # ==================== COMMIT SECTION ====================
     st.divider()
     st.markdown("##### 💾 Commit Allocation")
     
@@ -1130,7 +1313,6 @@ def render_step3_commit():
         key="commit_notes"
     )
     
-    # Navigation and commit
     nav_col1, nav_col2, nav_col3 = st.columns([1, 1, 1])
     
     with nav_col1:
@@ -1142,7 +1324,7 @@ def render_step3_commit():
         if st.button("💾 Commit Allocation", type="primary", 
                     disabled=not validation_result['valid'] or allocated_count == 0,
                     key="commit_btn"):
-            commit_bulk_allocation(edited_df, edit_df, notes)
+            commit_bulk_allocation(edited_df, base_df, notes)
 
 
 def commit_bulk_allocation(edited_df: pd.DataFrame, original_df: pd.DataFrame, notes: str):
@@ -1151,7 +1333,6 @@ def commit_bulk_allocation(edited_df: pd.DataFrame, original_df: pd.DataFrame, n
     demands_df = st.session_state.demands_df
     
     with st.spinner("Committing bulk allocation..."):
-        # Build allocation results with final quantities and ETDs
         allocation_results = []
         for i, row in edited_df.iterrows():
             ocd_id = original_df.iloc[i]['ocd_id']
@@ -1159,11 +1340,9 @@ def commit_bulk_allocation(edited_df: pd.DataFrame, original_df: pd.DataFrame, n
             
             oc_info = demands_df[demands_df['ocd_id'] == ocd_id].iloc[0].to_dict() if not demands_df[demands_df['ocd_id'] == ocd_id].empty else {}
             
-            # Get final qty and allocated_etd from edited data
             final_qty = row['final_qty']
             allocated_etd = row['allocated_etd']
-            
-            # REFACTORED: Use formatter function for product display
+            coverage_pct = (final_qty / result.demand_qty * 100) if result.demand_qty > 0 else 0
             product_display = format_product_display(oc_info)
             
             allocation_results.append({
@@ -1173,20 +1352,18 @@ def commit_bulk_allocation(edited_df: pd.DataFrame, original_df: pd.DataFrame, n
                 'demand_qty': result.demand_qty,
                 'suggested_qty': result.suggested_qty,
                 'final_qty': final_qty,
-                'coverage_percent': row['coverage_pct'],
+                'coverage_percent': coverage_pct,
                 'oc_number': oc_info.get('oc_number', ''),
                 'pt_code': oc_info.get('pt_code', ''),
                 'product_name': oc_info.get('product_name', ''),
                 'package_size': oc_info.get('package_size', ''),
                 'product_display': product_display,
                 'oc_etd': oc_info.get('etd'),
-                'allocated_etd': allocated_etd  # Use edited ETD
+                'allocated_etd': allocated_etd
             })
         
-        # Build demands dict
         demands_dict = {int(row['ocd_id']): row.to_dict() for _, row in demands_df.iterrows()}
         
-        # Build strategy config dict
         strategy_config = {
             'strategy_type': st.session_state.strategy_type,
             'allocation_mode': st.session_state.allocation_mode,
@@ -1195,7 +1372,6 @@ def commit_bulk_allocation(edited_df: pd.DataFrame, original_df: pd.DataFrame, n
             'urgent_threshold_days': st.session_state.urgent_threshold_days
         }
         
-        # Commit with split allocations
         result = services['service'].commit_bulk_allocation(
             allocation_results=allocation_results,
             demands_dict=demands_dict,
@@ -1203,7 +1379,7 @@ def commit_bulk_allocation(edited_df: pd.DataFrame, original_df: pd.DataFrame, n
             strategy_config=strategy_config,
             user_id=user.get('id'),
             notes=notes,
-            split_allocations=st.session_state.split_allocations  # Pass split data
+            split_allocations=st.session_state.split_allocations
         )
         
         if result['success']:
@@ -1213,9 +1389,6 @@ def commit_bulk_allocation(edited_df: pd.DataFrame, original_df: pd.DataFrame, n
             st.metric("OCs Allocated", result['detail_count'])
             st.metric("Total Quantity", format_number(result['total_allocated']))
             
-            # Send email notifications
-            # 1. Summary email to allocator
-            # 2. Individual emails to each OC creator (using OC creator info from demands_dict)
             try:
                 email_result = services['email'].send_bulk_allocation_emails(
                     commit_result=result,
@@ -1223,7 +1396,7 @@ def commit_bulk_allocation(edited_df: pd.DataFrame, original_df: pd.DataFrame, n
                     scope=get_current_scope(),
                     strategy_config=strategy_config,
                     allocator_user_id=user.get('id'),
-                    demands_dict=demands_dict,  # NEW: Pass demands_dict for OC creator info
+                    demands_dict=demands_dict,
                     split_allocations=st.session_state.split_allocations
                 )
                 
@@ -1245,7 +1418,6 @@ def commit_bulk_allocation(edited_df: pd.DataFrame, original_df: pd.DataFrame, n
                 logger.warning(f"Email notification failed: {e}")
                 st.warning(f"Email notification failed: {e}")
             
-            # Clear session and offer new allocation
             if st.button("🔄 Start New Bulk Allocation", key="new_allocation_btn"):
                 for key in list(st.session_state.keys()):
                     if key.startswith('bulk_') or key.startswith('scope_') or key.startswith('strategy_'):
@@ -1254,6 +1426,8 @@ def commit_bulk_allocation(edited_df: pd.DataFrame, original_df: pd.DataFrame, n
                 st.rerun()
         else:
             st.error(f"❌ Failed to commit: {result.get('error', 'Unknown error')}")
+
+
 
 
 # ==================== MAIN RENDER ====================
