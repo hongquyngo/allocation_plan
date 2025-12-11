@@ -105,6 +105,7 @@ def init_session_state():
         
         # Fine-tuning
         'adjusted_allocations': {},
+        'split_allocations': {},  # {ocd_id: [{'qty': X, 'etd': Y}, ...]} for multi-ETD splits
         
         # Commit state
         'is_committing': False,
@@ -149,6 +150,7 @@ def clear_simulation():
     st.session_state.demands_df = None
     st.session_state.supply_df = None
     st.session_state.adjusted_allocations = {}
+    st.session_state.split_allocations = {}
 
 # ==================== PAGE HEADER ====================
 
@@ -223,42 +225,42 @@ def render_allocation_status_chart(summary: Dict):
 
 def render_help_panel():
     """Render expandable help section"""
-    with st.expander("❓ Hướng dẫn & Giải thích công thức", expanded=False):
+    with st.expander("❓ Guide & Formula Explanations", expanded=False):
         tab1, tab2, tab3 = st.tabs(["📋 Scope & Metrics", "🎯 Strategies", "📐 Formulas"])
         
         with tab1:
             st.markdown("""
             ### Allocation Status
             
-            | Status | Điều kiện | Hành động |
-            |--------|-----------|-----------|
-            | 🔴 **Not Allocated** | `undelivered_allocated = 0` | Cần allocate mới |
-            | 🟡 **Partially Allocated** | `0 < undelivered < pending` | Có thể top-up |
-            | 🟢 **Fully Allocated** | `undelivered >= pending` | Không cần thêm |
+            | Status | Condition | Action |
+            |--------|-----------|--------|
+            | 🔴 **Not Allocated** | `undelivered_allocated = 0` | Need new allocation |
+            | 🟡 **Partially Allocated** | `0 < undelivered < pending` | Can be topped up |
+            | 🟢 **Fully Allocated** | `undelivered >= pending` | No action needed |
             
             ### Key Metrics
             
-            - **Need Allocation**: Số OC cần được allocate (Not Allocated + Partially Allocated có room)
-            - **Allocatable Demand**: Tổng số lượng còn có thể allocate thêm
-            - **Available Supply**: Supply sau khi trừ committed
+            - **Need Allocation**: OCs that need allocation (Not Allocated + Partially Allocated with room)
+            - **Allocatable Demand**: Total quantity that can still be allocated
+            - **Available Supply**: Supply after deducting committed quantity
             """)
             
         with tab2:
             st.markdown("""
             ### Allocation Strategies
             
-            | Strategy | Ưu tiên theo | Best For |
+            | Strategy | Priority By | Best For |
             |----------|-------------|----------|
-            | **FCFS** | Ngày tạo OC (cũ → mới) | Công bằng theo thứ tự |
-            | **ETD Priority** | ETD (gần → xa) | Meeting delivery dates |
-            | **Proportional** | Tỷ lệ demand | Fair distribution |
-            | **Revenue Priority** | Giá trị đơn hàng | Maximize revenue |
+            | **FCFS** | OC creation date (old → new) | Fair by order sequence |
+            | **ETD Priority** | ETD (near → far) | Meeting delivery dates |
+            | **Proportional** | Demand ratio | Fair distribution |
+            | **Revenue Priority** | Order value | Maximize revenue |
             | **Hybrid** ⭐ | Multi-phase | Balanced approach |
             
             ### Hybrid Phases (Default)
-            1. **MIN_GUARANTEE (30%)**: Mỗi OC nhận tối thiểu 30%
-            2. **ETD_PRIORITY (40%)**: Ưu tiên urgent (≤7 days)
-            3. **PROPORTIONAL (30%)**: Chia đều phần còn lại
+            1. **MIN_GUARANTEE (30%)**: Each OC receives at least 30%
+            2. **ETD_PRIORITY (40%)**: Prioritize urgent (≤7 days)
+            3. **PROPORTIONAL (30%)**: Distribute remaining fairly
             """)
             
         with tab3:
@@ -295,7 +297,7 @@ def render_step1_scope():
             format_func=lambda x: brand_options.get(x, x),
             default=st.session_state.scope_brand_ids,
             key="brand_selector",
-            help="Lọc theo thương hiệu sản phẩm"
+            help="Filter by product brand"
         )
         st.session_state.scope_brand_ids = selected_brands
         
@@ -307,7 +309,7 @@ def render_step1_scope():
             format_func=lambda x: customer_options.get(x, x),
             default=st.session_state.scope_customer_codes,
             key="customer_selector",
-            help="Lọc theo khách hàng"
+            help="Filter by customer"
         )
         st.session_state.scope_customer_codes = selected_customers
     
@@ -320,7 +322,7 @@ def render_step1_scope():
             format_func=lambda x: le_options.get(x, x),
             default=st.session_state.scope_legal_entities,
             key="le_selector",
-            help="Lọc theo pháp nhân (Prostech VN, SG...)"
+            help="Filter by legal entity (Prostech VN, SG...)"
         )
         st.session_state.scope_legal_entities = selected_les
         
@@ -331,7 +333,7 @@ def render_step1_scope():
                 "From",
                 value=st.session_state.scope_etd_from,
                 key="etd_from_input",
-                help="ETD bắt đầu từ ngày"
+                help="ETD start date"
             )
             st.session_state.scope_etd_from = etd_from
         with etd_col2:
@@ -339,7 +341,7 @@ def render_step1_scope():
                 "To",
                 value=st.session_state.scope_etd_to or (date.today() + timedelta(days=30)),
                 key="etd_to_input",
-                help="ETD kết thúc đến ngày"
+                help="ETD end date"
             )
             st.session_state.scope_etd_to = etd_to
     
@@ -642,6 +644,7 @@ def render_step2_strategy():
     # Show simulation results preview
     if st.session_state.simulation_results:
         results = st.session_state.simulation_results
+        demands_df = st.session_state.demands_df
         
         st.markdown("##### 📊 Simulation Results")
         
@@ -650,14 +653,98 @@ def render_step2_strategy():
         total_demand = sum(r.demand_qty for r in results)
         avg_coverage = (total_suggested / total_demand * 100) if total_demand > 0 else 0
         allocated_count = sum(1 for r in results if r.suggested_qty > 0)
+        unallocated_count = len(results) - allocated_count
         
-        sm1, sm2, sm3, sm4 = st.columns(4)
+        sm1, sm2, sm3, sm4, sm5 = st.columns(5)
         sm1.metric("OCs with Allocation", allocated_count)
         sm2.metric("Total Suggested Qty", format_number(total_suggested))
         sm3.metric("Total Demand", format_number(total_demand))
         sm4.metric("Avg Coverage", format_percentage(avg_coverage))
+        sm5.metric("Unallocated", unallocated_count)
         
         st.info(f"Strategy: **{format_strategy_name(st.session_state.strategy_type)}** | Mode: **{st.session_state.allocation_mode}**")
+        
+        # Details table in expander
+        with st.expander("📋 View Allocation Details", expanded=False):
+            # Build details dataframe
+            details_data = []
+            for r in results:
+                oc_info = demands_df[demands_df['ocd_id'] == r.ocd_id].iloc[0].to_dict() if not demands_df[demands_df['ocd_id'] == r.ocd_id].empty else {}
+                
+                # Build product display
+                product_display = oc_info.get('product_display', '')
+                if not product_display:
+                    parts = [oc_info.get('pt_code', '')]
+                    if oc_info.get('product_name'):
+                        parts.append(oc_info.get('product_name'))
+                    product_display = ' | '.join(filter(None, parts))
+                
+                details_data.append({
+                    'OC Number': oc_info.get('oc_number', ''),
+                    'Customer': r.customer_code,
+                    'Product': product_display,
+                    'ETD': oc_info.get('etd'),
+                    'Demand': r.demand_qty,
+                    'Already Allocated': r.current_allocated,
+                    'Suggested': r.suggested_qty,
+                    'Coverage %': round((r.suggested_qty / r.demand_qty * 100) if r.demand_qty > 0 else 0, 1)
+                })
+            
+            details_df = pd.DataFrame(details_data)
+            
+            # Filter options
+            filter_col1, filter_col2 = st.columns(2)
+            with filter_col1:
+                show_filter = st.selectbox(
+                    "Filter by",
+                    options=['All', 'With Allocation', 'Zero Allocation'],
+                    key="sim_details_filter"
+                )
+            with filter_col2:
+                sort_by = st.selectbox(
+                    "Sort by",
+                    options=['ETD', 'Demand', 'Suggested', 'Coverage %'],
+                    key="sim_details_sort"
+                )
+            
+            # Apply filter
+            if show_filter == 'With Allocation':
+                details_df = details_df[details_df['Suggested'] > 0]
+            elif show_filter == 'Zero Allocation':
+                details_df = details_df[details_df['Suggested'] == 0]
+            
+            # Apply sort
+            if sort_by in details_df.columns:
+                ascending = True if sort_by == 'ETD' else False
+                details_df = details_df.sort_values(by=sort_by, ascending=ascending)
+            
+            # Display table
+            st.dataframe(
+                details_df,
+                column_config={
+                    'OC Number': st.column_config.TextColumn('OC Number', width="medium"),
+                    'Customer': st.column_config.TextColumn('Customer', width="small"),
+                    'Product': st.column_config.TextColumn('Product', width="large"),
+                    'ETD': st.column_config.DateColumn('ETD', width="small"),
+                    'Demand': st.column_config.NumberColumn('Demand', format="%.0f"),
+                    'Already Allocated': st.column_config.NumberColumn('Already Alloc', format="%.0f"),
+                    'Suggested': st.column_config.NumberColumn('Suggested', format="%.0f"),
+                    'Coverage %': st.column_config.NumberColumn('Coverage %', format="%.1f%%")
+                },
+                use_container_width=True,
+                hide_index=True,
+                height=400
+            )
+            
+            # Export button
+            csv = details_df.to_csv(index=False)
+            st.download_button(
+                label="📥 Download as CSV",
+                data=csv,
+                file_name="simulation_results.csv",
+                mime="text/csv",
+                key="download_sim_csv"
+            )
     
     # Navigation
     st.divider()
@@ -795,6 +882,10 @@ def render_step3_commit():
         final_qty = row['final_qty']
         final_etd = row['allocated_etd']
         
+        # Skip if this OC has split allocations (handled separately)
+        if ocd_id in st.session_state.split_allocations:
+            continue
+        
         # Check if either qty or etd was adjusted
         qty_changed = final_qty != original_qty
         etd_changed = final_etd != original_etd
@@ -808,11 +899,151 @@ def render_step3_commit():
             # Remove if reverted to original
             del st.session_state.adjusted_allocations[ocd_id]
     
-    # Recalculate metrics with adjustments
-    final_total = sum(edited_df['final_qty'])
+    # ==================== SPLIT ALLOCATION FEATURE ====================
+    st.divider()
+    with st.expander("✂️ Advanced: Split Allocation (Multiple ETDs)", expanded=False):
+        st.caption("Split one OC into multiple allocation records with different delivery dates")
+        
+        # Get OCs with allocation > 0 for split options
+        split_candidates = [
+            {
+                'ocd_id': edit_df.iloc[i]['ocd_id'],
+                'oc_number': edit_df.iloc[i]['oc_number'],
+                'product': edit_df.iloc[i]['product_display'][:40] + '...' if len(edit_df.iloc[i]['product_display']) > 40 else edit_df.iloc[i]['product_display'],
+                'final_qty': edited_df.iloc[i]['final_qty'],
+                'oc_etd': edit_df.iloc[i]['oc_etd'],
+                'max_allocatable': results[i].demand_qty - results[i].current_allocated
+            }
+            for i in range(len(results))
+            if edited_df.iloc[i]['final_qty'] > 0
+        ]
+        
+        if not split_candidates:
+            st.info("No OCs with allocation to split. Run simulation first.")
+        else:
+            # Select OC to split
+            selected_oc = st.selectbox(
+                "Select OC to split",
+                options=split_candidates,
+                format_func=lambda x: f"{x['oc_number']} | {x['product']} | Qty: {x['final_qty']:.0f}",
+                key="split_oc_selector"
+            )
+            
+            if selected_oc:
+                ocd_id = selected_oc['ocd_id']
+                max_qty = selected_oc['max_allocatable']
+                default_etd = selected_oc['oc_etd']
+                
+                st.markdown(f"**Max allocatable:** {max_qty:.0f} | **OC ETD:** {default_etd}")
+                
+                # Initialize split if not exists
+                if ocd_id not in st.session_state.split_allocations:
+                    # Default: single allocation with original qty and ETD
+                    st.session_state.split_allocations[ocd_id] = [
+                        {'qty': selected_oc['final_qty'], 'etd': default_etd}
+                    ]
+                
+                splits = st.session_state.split_allocations[ocd_id]
+                
+                # Display split entries
+                st.markdown("**Split Entries:**")
+                
+                total_split_qty = 0
+                updated_splits = []
+                
+                for idx, split in enumerate(splits):
+                    col1, col2, col3 = st.columns([2, 2, 1])
+                    
+                    with col1:
+                        split_qty = st.number_input(
+                            f"Qty #{idx+1}",
+                            min_value=0.0,
+                            max_value=float(max_qty),
+                            value=float(split.get('qty', 0)),
+                            step=1.0,
+                            key=f"split_qty_{ocd_id}_{idx}"
+                        )
+                    
+                    with col2:
+                        split_etd = st.date_input(
+                            f"ETD #{idx+1}",
+                            value=split.get('etd', default_etd),
+                            key=f"split_etd_{ocd_id}_{idx}"
+                        )
+                    
+                    with col3:
+                        if len(splits) > 1:
+                            if st.button("🗑️", key=f"remove_split_{ocd_id}_{idx}"):
+                                # Mark for removal
+                                continue
+                        else:
+                            st.write("")  # Placeholder
+                    
+                    if split_qty > 0:
+                        updated_splits.append({'qty': split_qty, 'etd': split_etd})
+                        total_split_qty += split_qty
+                
+                # Update session state
+                st.session_state.split_allocations[ocd_id] = updated_splits if updated_splits else [{'qty': 0, 'etd': default_etd}]
+                
+                # Add new split button
+                add_col1, add_col2 = st.columns([1, 3])
+                with add_col1:
+                    if st.button("➕ Add Split", key=f"add_split_{ocd_id}"):
+                        remaining = max_qty - total_split_qty
+                        st.session_state.split_allocations[ocd_id].append({
+                            'qty': remaining if remaining > 0 else 0,
+                            'etd': default_etd
+                        })
+                        st.rerun()
+                
+                # Show totals
+                remaining = max_qty - total_split_qty
+                if total_split_qty > max_qty:
+                    st.error(f"⚠️ Total split qty ({total_split_qty:.0f}) exceeds max allocatable ({max_qty:.0f})")
+                elif remaining > 0:
+                    st.warning(f"ℹ️ Remaining unallocated: {remaining:.0f}")
+                else:
+                    st.success(f"✅ Total: {total_split_qty:.0f} / {max_qty:.0f}")
+                
+                # Remove from simple adjustments if using splits
+                if ocd_id in st.session_state.adjusted_allocations:
+                    del st.session_state.adjusted_allocations[ocd_id]
+            
+            # Show summary of all splits
+            if st.session_state.split_allocations:
+                st.markdown("---")
+                st.markdown("**Active Splits:**")
+                for ocd_id, splits in st.session_state.split_allocations.items():
+                    oc_info = edit_df[edit_df['ocd_id'] == ocd_id].iloc[0] if len(edit_df[edit_df['ocd_id'] == ocd_id]) > 0 else None
+                    if oc_info is not None and len(splits) > 1:
+                        st.caption(f"• {oc_info['oc_number']}: {len(splits)} splits → {sum(s['qty'] for s in splits):.0f} total")
+    
+    # Recalculate metrics with adjustments (including splits)
+    final_total = 0
+    for i, row in edited_df.iterrows():
+        ocd_id = edit_df.iloc[i]['ocd_id']
+        if ocd_id in st.session_state.split_allocations:
+            # Use split total
+            final_total += sum(s['qty'] for s in st.session_state.split_allocations[ocd_id])
+        else:
+            final_total += row['final_qty']
+    
     total_demand = sum(r.demand_qty for r in results)
     final_coverage = (final_total / total_demand * 100) if total_demand > 0 else 0
-    allocated_count = sum(1 for qty in edited_df['final_qty'] if qty > 0)
+    
+    # Count OCs with allocation (including splits)
+    allocated_count = 0
+    for i, row in edited_df.iterrows():
+        ocd_id = edit_df.iloc[i]['ocd_id']
+        if ocd_id in st.session_state.split_allocations:
+            if sum(s['qty'] for s in st.session_state.split_allocations[ocd_id]) > 0:
+                allocated_count += 1
+        elif row['final_qty'] > 0:
+            allocated_count += 1
+    
+    # Count splits
+    split_count = sum(1 for splits in st.session_state.split_allocations.values() if len(splits) > 1)
     
     # Count ETD adjustments
     etd_adjustments = 0
@@ -829,12 +1060,13 @@ def render_step3_commit():
     
     # Final summary
     st.markdown("##### 📊 Final Summary")
-    m1, m2, m3, m4, m5 = st.columns(5)
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
     m1.metric("Total to Allocate", format_number(final_total))
     m2.metric("OCs to Allocate", allocated_count)
     m3.metric("Avg Coverage", format_percentage(final_coverage))
     m4.metric("Qty Adjustments", len(st.session_state.adjusted_allocations))
     m5.metric("ETD Adjustments", etd_adjustments, help="OCs with allocated ETD different from OC ETD")
+    m6.metric("Split Allocations", split_count, help="OCs split into multiple allocation records")
     
     # Validation
     validation_result = services['validator'].validate_bulk_allocation(
