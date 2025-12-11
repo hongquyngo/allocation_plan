@@ -1,15 +1,18 @@
 """
-Create Allocation Modal - REFACTORED v2.0
-==========================================
-Modal for creating new allocations with simplified email notifications.
+Create Allocation Modal - v3.0 (Improved UI/UX)
+================================================
+Modal for creating new allocations with improved progress display.
 
-CHANGES:
-- Email service now receives oc_info and actor_info directly
-- No more ocd_id + user_id based queries for email
+IMPROVEMENTS in v3.0:
+- After success: Dialog stays open, Save button disabled
+- User must click Close/Cancel to dismiss
+- Clear progress display with st.status()
+- Prevents accidental double-submissions
 """
 import streamlit as st
 import time
 from datetime import datetime
+import pandas as pd
 
 from .allocation_service import AllocationService
 from .supply_data import SupplyData
@@ -35,6 +38,14 @@ def get_actor_info() -> dict:
         'email': st.session_state.user.get('email', ''),
         'name': st.session_state.user.get('full_name', st.session_state.user.get('username', 'Unknown'))
     }
+
+
+def reset_modal_state():
+    """Reset all modal-specific state"""
+    st.session_state.allocation_processing = False
+    st.session_state.allocation_completed = False
+    st.session_state.allocation_result = None
+    st.session_state._allocation_data = None
 
 
 def show_dual_uom_metric(label: str, 
@@ -92,7 +103,7 @@ def format_supply_info_with_real_time_availability(supply, source_type, oc, curr
 
 @st.dialog("Create Allocation", width="large")
 def show_allocation_modal():
-    """Allocation modal with user validation and simplified email"""
+    """Allocation modal with improved UI/UX and progress display"""
     oc = st.session_state.selections['oc_for_allocation']
     
     if not oc:
@@ -111,6 +122,17 @@ def show_allocation_modal():
         auth.logout()
         st.switch_page("app.py")
         st.stop()
+    
+    # Initialize modal state
+    if 'allocation_processing' not in st.session_state:
+        st.session_state.allocation_processing = False
+    if 'allocation_completed' not in st.session_state:
+        st.session_state.allocation_completed = False
+    if 'allocation_result' not in st.session_state:
+        st.session_state.allocation_result = None
+    
+    is_completed = st.session_state.allocation_completed
+    is_processing = st.session_state.allocation_processing
     
     # Header
     st.markdown(f"### Allocate to {oc['oc_number']}")
@@ -195,6 +217,7 @@ def show_allocation_modal():
         st.error("⛔ No supply available for this product")
         st.info("All existing supply has been committed. Please check with procurement team.")
         if st.button("Close", use_container_width=True):
+            reset_modal_state()
             st.session_state.modals['allocation'] = False
             st.session_state.selections['oc_for_allocation'] = None
             st.rerun()
@@ -202,7 +225,9 @@ def show_allocation_modal():
     
     st.info("ℹ️ **Allocation Rule**: All allocations are made in standard UOM to ensure whole container quantities")
     
-    # Supply selection
+    # ============================================================
+    # SUPPLY SELECTION - Disabled after completion
+    # ============================================================
     st.markdown("**Supply Sources:**")
     
     selected_supplies = []
@@ -253,7 +278,7 @@ def show_allocation_modal():
                         selected = st.checkbox(
                             info,
                             key=f"supply_{supply['source_id']}_{source_type}",
-                            disabled=(not is_available or would_exceed_supply),
+                            disabled=(not is_available or would_exceed_supply or is_completed),
                             help=help_text
                         )
                     
@@ -286,7 +311,8 @@ def show_allocation_modal():
                                 value=float(max_qty_standard),
                                 step=1.0,
                                 key=f"qty_{supply['source_id']}_{source_type}",
-                                help=help_text
+                                help=help_text,
+                                disabled=is_completed
                             )
                             
                             if qty_standard > 0:
@@ -302,7 +328,7 @@ def show_allocation_modal():
     
     # SOFT allocation option
     st.markdown("**OR**")
-    use_soft = st.checkbox("🔄 SOFT Allocation (no specific source)")
+    use_soft = st.checkbox("🔄 SOFT Allocation (no specific source)", disabled=is_completed)
     
     if use_soft:
         pending_standard = oc.get('pending_standard_delivery_quantity', oc['pending_quantity'])
@@ -334,7 +360,7 @@ def show_allocation_modal():
                 value=0.0,
                 step=1.0,
                 help=help_text,
-                disabled=max_soft_qty <= 0
+                disabled=(max_soft_qty <= 0 or is_completed)
             )
             
             if soft_qty_standard > 0:
@@ -400,8 +426,8 @@ def show_allocation_modal():
                     f"({over_pct:.1f}% over)! Maximum allowed is 100% of OC quantity."
                 )
     
-    # Additional fields
-    allocated_etd = st.date_input("Allocated ETD", value=oc['etd'])
+    # Additional fields - disabled after completion
+    allocated_etd = st.date_input("Allocated ETD", value=oc['etd'], disabled=is_completed)
 
     # Validate allocated ETD against PO ETAs
     if not use_soft and selected_supplies:
@@ -413,7 +439,6 @@ def show_allocation_modal():
                 supply_info = supply_item['supply_info']
                 if supply_info.get('eta'):
                     try:
-                        import pandas as pd
                         eta_date = pd.to_datetime(supply_info['eta']).date()
                         if max_eta is None or eta_date > max_eta:
                             max_eta = eta_date
@@ -427,9 +452,11 @@ def show_allocation_modal():
                 "The goods won't arrive until the ETA date. Consider adjusting the allocated ETD to be on or after the ETA."
             )
 
-    notes = st.text_area("Notes (optional)")
+    notes = st.text_area("Notes (optional)", disabled=is_completed)
     
-    # Action buttons
+    # ============================================================
+    # ACTION BUTTONS
+    # ============================================================
     col1, col2 = st.columns(2)
     
     with col1:
@@ -445,98 +472,172 @@ def show_allocation_modal():
         else:
             button_help = "Click to save allocation"
         
+        # Disable Save button if:
+        # - Validation failed
+        # - Processing in progress  
+        # - Already completed
+        save_disabled = (
+            not can_save or 
+            st.session_state.allocation_processing or 
+            st.session_state.allocation_completed
+        )
+        
         if st.button(
             "💾 Save Allocation", 
             type="primary", 
             use_container_width=True, 
-            disabled=not can_save,
+            disabled=save_disabled,
             help=button_help
         ):
-            # Validate user session again before saving
+            # Save data before processing
+            st.session_state._allocation_data = {
+                'selected_supplies': selected_supplies,
+                'total_selected_standard': total_selected_standard,
+                'use_soft': use_soft,
+                'allocated_etd': allocated_etd,
+                'notes': notes,
+                'standard_uom': standard_uom
+            }
+            st.session_state.allocation_processing = True
+            st.rerun()
+    
+    with col2:
+        if st.button(
+            "Cancel", 
+            use_container_width=True, 
+            disabled=st.session_state.allocation_processing
+        ):
+            reset_modal_state()
+            st.session_state.modals['allocation'] = False
+            st.session_state.selections['oc_for_allocation'] = None
+            st.cache_data.clear()
+            st.rerun()
+    
+    # ============================================================
+    # SHOW COMPLETED RESULT (if already done)
+    # ============================================================
+    if st.session_state.allocation_completed and st.session_state.allocation_result:
+        result = st.session_state.allocation_result
+        with st.status("✅ Allocation complete!", state="complete", expanded=False):
+            st.write(result.get('message', 'Allocation successful'))
+            if result.get('allocation_number'):
+                st.write(f"📋 Allocation Number: **{result['allocation_number']}**")
+            if result.get('email_status'):
+                st.write(result['email_status'])
+    
+    # ============================================================
+    # PROCESS ALLOCATION
+    # ============================================================
+    if st.session_state.allocation_processing and not st.session_state.allocation_completed:
+        saved_data = st.session_state.get('_allocation_data', {})
+        
+        with st.status("Processing allocation...", expanded=True) as status:
+            result_data = {
+                'success': False, 
+                'message': '', 
+                'allocation_number': '',
+                'email_status': ''
+            }
+            
+            # Step 1: Validate user session again
+            status.update(label="🔐 Validating session...", state="running")
             user_id = st.session_state.user.get('id')
             if not user_id:
+                status.update(label="❌ Session error", state="error")
                 st.error("⚠️ Session error. Please login again.")
                 time.sleep(2)
                 auth.logout()
                 st.switch_page("app.py")
                 st.stop()
             
-            # Validate allocation
+            # Step 2: Validate allocation
+            status.update(label="✅ Validating allocation...", state="running")
             errors = validator.validate_create_allocation(
-                selected_supplies,
+                saved_data.get('selected_supplies', []),
                 oc,
-                'SOFT' if use_soft else 'HARD',
+                'SOFT' if saved_data.get('use_soft') else 'HARD',
                 st.session_state.user['role']
             )
             
             if errors:
+                status.update(label="❌ Validation failed", state="error")
                 for error in errors:
                     st.error(f"❌ {error}")
+                st.session_state.allocation_processing = False
+                st.session_state._allocation_data = None
             else:
-                # Save allocation with validated user_id
+                # Step 3: Save allocation
+                status.update(label="💾 Saving allocation...", state="running")
+                
                 result = allocation_service.create_allocation(
                     oc_detail_id=oc['ocd_id'],
-                    allocations=selected_supplies,
-                    mode='SOFT' if use_soft else 'HARD',
-                    etd=allocated_etd,
-                    notes=notes,
+                    allocations=saved_data.get('selected_supplies', []),
+                    mode='SOFT' if saved_data.get('use_soft') else 'HARD',
+                    etd=saved_data.get('allocated_etd'),
+                    notes=saved_data.get('notes', ''),
                     user_id=user_id
                 )
                 
                 if result['success']:
-                    success_msg = f"✅ Allocation Successful\nAllocated: {format_number(total_selected_standard)} {standard_uom}"
+                    total_qty = saved_data.get('total_selected_standard', 0)
+                    std_uom = saved_data.get('standard_uom', 'pcs')
                     
-                    if uom_converter.needs_conversion(oc.get('uom_conversion', '1')):
-                        total_selected_selling = uom_converter.convert_quantity(
-                            total_selected_standard, 'standard', 'selling', oc.get('uom_conversion', '1')
-                        )
-                        selling_uom = oc.get('selling_uom', 'pcs')
-                        success_msg += f" (= {format_number(total_selected_selling)} {selling_uom})"
+                    result_data['message'] = f"✅ Allocated {format_number(total_qty)} {std_uom} to {oc['oc_number']}"
+                    result_data['allocation_number'] = result['allocation_number']
+                    st.write(result_data['message'])
+                    st.write(f"📋 Allocation Number: **{result['allocation_number']}**")
+                    st.write(f"👤 Created by: {st.session_state.user.get('full_name', 'Unknown')}")
                     
-                    success_msg += f" to {oc['oc_number']}\nAllocation Number: {result['allocation_number']}"
-                    success_msg += f"\nCreated by: {st.session_state.user.get('full_name', 'Unknown')}"
-                    
-                    st.success(success_msg)
                     st.balloons()
                     
-                    # Send email notification - REFACTORED
+                    # Step 4: Send email notification
+                    status.update(label="📧 Sending email notification...", state="running")
+                    
                     try:
                         actor_info = get_actor_info()
                         
                         email_success, email_msg = email_service.send_allocation_created_email(
-                            oc_info=oc,  # Pass full oc dict
+                            oc_info=oc,
                             actor_info=actor_info,
-                            allocations=selected_supplies,
-                            total_qty=total_selected_standard,
-                            mode='SOFT' if use_soft else 'HARD',
-                            etd=allocated_etd,
+                            allocations=saved_data.get('selected_supplies', []),
+                            total_qty=total_qty,
+                            mode='SOFT' if saved_data.get('use_soft') else 'HARD',
+                            etd=saved_data.get('allocated_etd'),
                             allocation_number=result['allocation_number']
                         )
+                        
                         if email_success:
-                            st.caption("📧 Email notification sent")
+                            result_data['email_status'] = "✅ Email notification sent"
                         else:
-                            st.caption(f"⚠️ Email not sent: {email_msg}")
+                            result_data['email_status'] = f"⚠️ Email not sent: {email_msg}"
+                        st.write(result_data['email_status'])
+                        
                     except Exception as email_error:
-                        st.caption(f"⚠️ Email error: {str(email_error)}")
+                        result_data['email_status'] = f"⚠️ Email error: {str(email_error)}"
+                        st.write(result_data['email_status'])
                     
-                    time.sleep(2)
-                    st.session_state.modals['allocation'] = False
-                    st.session_state.selections['oc_for_allocation'] = None
-                    st.cache_data.clear()
+                    # Step 5: Mark as complete (DO NOT auto-close)
+                    status.update(label="✅ Allocation complete!", state="complete", expanded=False)
+                    
+                    result_data['success'] = True
+                    st.session_state.allocation_result = result_data
+                    st.session_state.allocation_processing = False
+                    st.session_state.allocation_completed = True
+                    
+                    # Rerun to update button states
+                    time.sleep(0.5)
                     st.rerun()
+                    
                 else:
                     error_msg = result.get('error', 'Unknown error')
+                    status.update(label="❌ Allocation failed", state="error")
+                    st.error(f"❌ {error_msg}")
+                    
+                    st.session_state.allocation_processing = False
+                    st.session_state._allocation_data = None
+                    
                     if 'session' in error_msg.lower() or 'user' in error_msg.lower():
-                        st.error(f"⚠️ {error_msg}")
                         time.sleep(2)
                         auth.logout()
                         st.switch_page("app.py")
                         st.stop()
-                    else:
-                        st.error(f"❌ {error_msg}")
-    
-    with col2:
-        if st.button("Cancel", use_container_width=True):
-            st.session_state.modals['allocation'] = False
-            st.session_state.selections['oc_for_allocation'] = None
-            st.rerun()

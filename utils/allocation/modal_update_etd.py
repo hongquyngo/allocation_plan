@@ -1,11 +1,13 @@
 """
-Update ETD Modal - REFACTORED v2.0
-===================================
-Self-contained modal for updating allocated ETD with simplified email notifications.
+Update ETD Modal - v3.0 (Improved UI/UX)
+=========================================
+Self-contained modal for updating allocated ETD.
 
-CHANGES:
-- Email service now receives oc_info and actor_info directly
-- Removed ocd_id + user_id based queries for email
+IMPROVEMENTS in v3.0:
+- After success: Dialog stays open, Update button disabled
+- User must click Close to dismiss
+- Clear progress display with st.status()
+- Prevents accidental double-updates
 """
 import streamlit as st
 import pandas as pd
@@ -43,9 +45,16 @@ def return_to_history_if_context():
         st.session_state.context['return_to_history'] = None
 
 
+def reset_modal_state():
+    """Reset all modal-specific state"""
+    st.session_state.etd_update_processing = False
+    st.session_state.etd_update_completed = False
+    st.session_state.etd_update_result = None
+
+
 @st.dialog("Update Allocated ETD", width="medium")
 def show_update_etd_modal():
-    """Modal for updating allocated ETD with user validation"""
+    """Modal for updating allocated ETD with improved UI/UX"""
     allocation = st.session_state.selections['allocation_for_update']
     
     if not allocation:
@@ -64,6 +73,14 @@ def show_update_etd_modal():
         auth.logout()
         st.switch_page("app.py")
         st.stop()
+    
+    # Initialize modal state
+    if 'etd_update_processing' not in st.session_state:
+        st.session_state.etd_update_processing = False
+    if 'etd_update_completed' not in st.session_state:
+        st.session_state.etd_update_completed = False
+    if 'etd_update_result' not in st.session_state:
+        st.session_state.etd_update_result = None
     
     st.markdown(f"### Update ETD for {allocation['allocation_number']}")
     
@@ -91,48 +108,84 @@ def show_update_etd_modal():
     if not valid and error != "Invalid ETD format" and error != "New ETD is the same as current ETD":
         st.error(f"❌ {error}")
         if st.button("Close"):
+            reset_modal_state()
             st.session_state.modals['update_etd'] = False
             st.rerun()
         return
     
-    # New ETD input
+    # New ETD input - disabled after completion
     current_etd = pd.to_datetime(allocation['allocated_etd']).date()
     new_etd = st.date_input(
         "New Allocated ETD",
-        value=current_etd
+        value=current_etd,
+        disabled=st.session_state.etd_update_completed
     )
     
-    # Show ETD change
-    if new_etd != current_etd:
-        diff_days = (new_etd - current_etd).days
-        if diff_days > 0:
-            st.warning(f"⚠️ Delaying by {diff_days} days")
-        else:
-            st.success(f"✅ Advancing by {abs(diff_days)} days")
+    # Show ETD change (only if not completed)
+    if not st.session_state.etd_update_completed:
+        if new_etd != current_etd:
+            diff_days = (new_etd - current_etd).days
+            if diff_days > 0:
+                st.warning(f"⚠️ Delaying by {diff_days} days")
+            else:
+                st.success(f"✅ Advancing by {abs(diff_days)} days")
     
-    # Initialize processing state for this modal
-    if 'etd_update_processing' not in st.session_state:
-        st.session_state.etd_update_processing = False
-    
-    # Action buttons
+    # ============================================================
+    # ACTION BUTTONS - Improved state management
+    # ============================================================
     col1, col2 = st.columns(2)
+    
     with col1:
-        button_disabled = (new_etd == current_etd) or st.session_state.etd_update_processing
+        # Disable Update button if:
+        # - Same date
+        # - Processing in progress
+        # - Already completed
+        update_disabled = (
+            new_etd == current_etd or 
+            st.session_state.etd_update_processing or 
+            st.session_state.etd_update_completed
+        )
         
-        if st.button("Update ETD", type="primary", disabled=button_disabled, use_container_width=True):
+        if st.button(
+            "Update ETD", 
+            type="primary", 
+            disabled=update_disabled, 
+            use_container_width=True
+        ):
             st.session_state.etd_update_processing = True
             st.rerun()
     
     with col2:
-        if st.button("Close", use_container_width=True, disabled=st.session_state.etd_update_processing):
+        # Close is always enabled (except during processing)
+        if st.button(
+            "Close", 
+            use_container_width=True, 
+            disabled=st.session_state.etd_update_processing
+        ):
+            reset_modal_state()
             st.session_state.modals['update_etd'] = False
-            st.session_state.etd_update_processing = False
+            st.session_state.selections['allocation_for_update'] = None
             return_to_history_if_context()
+            st.cache_data.clear()
             st.rerun()
     
-    # Process update when flag is set
-    if st.session_state.etd_update_processing:
+    # ============================================================
+    # SHOW COMPLETED RESULT (if already done)
+    # ============================================================
+    if st.session_state.etd_update_completed and st.session_state.etd_update_result:
+        result = st.session_state.etd_update_result
+        with st.status("✅ Update complete!", state="complete", expanded=False):
+            st.write(result.get('message', 'ETD updated successfully'))
+            if result.get('email_status'):
+                st.write(result['email_status'])
+    
+    # ============================================================
+    # PROCESS UPDATE
+    # ============================================================
+    if st.session_state.etd_update_processing and not st.session_state.etd_update_completed:
         with st.status("Processing...", expanded=True) as status:
+            result_data = {'success': False, 'message': '', 'email_status': ''}
+            
             # Step 1: Save to database
             status.update(label="💾 Saving ETD changes...", state="running")
             
@@ -143,18 +196,22 @@ def show_update_etd_modal():
             )
             
             if result['success']:
-                st.write(f"✅ ETD updated: {format_date(current_etd)} → {format_date(new_etd)}")
-                if result.get('update_count'):
-                    st.write(f"📝 This is update #{result['update_count']} for this allocation")
+                result_data['message'] = f"✅ ETD updated: {format_date(current_etd)} → {format_date(new_etd)}"
+                st.write(result_data['message'])
                 
-                # Step 2: Send email notification - REFACTORED
+                if result.get('update_count'):
+                    update_msg = f"📝 This is update #{result['update_count']} for this allocation"
+                    st.write(update_msg)
+                    result_data['message'] += f"\n{update_msg}"
+                
+                # Step 2: Send email notification
                 status.update(label="📧 Sending email notification...", state="running")
                 
                 try:
                     actor_info = get_actor_info()
                     
                     email_success, email_msg = email_service.send_allocation_etd_updated_email(
-                        oc_info=oc_info,  # Pass oc_info directly
+                        oc_info=oc_info,
                         actor_info=actor_info,
                         allocation_number=allocation.get('allocation_number', ''),
                         previous_etd=current_etd,
@@ -162,26 +219,29 @@ def show_update_etd_modal():
                         pending_qty=pending_qty,
                         update_count=result.get('update_count', 1)
                     )
+                    
                     if email_success:
-                        st.write("✅ Email notification sent")
+                        result_data['email_status'] = "✅ Email notification sent"
                     else:
-                        st.write(f"⚠️ Email not sent: {email_msg}")
+                        result_data['email_status'] = f"⚠️ Email not sent: {email_msg}"
+                    st.write(result_data['email_status'])
+                    
                 except Exception as email_error:
-                    st.write(f"⚠️ Email error: {str(email_error)}")
+                    result_data['email_status'] = f"⚠️ Email error: {str(email_error)}"
+                    st.write(result_data['email_status'])
                 
-                # Step 3: Complete
+                # Step 3: Mark as complete (DO NOT auto-close)
                 status.update(label="✅ Update complete!", state="complete", expanded=False)
-                time.sleep(1.5)
                 
-                # Cleanup and close
+                result_data['success'] = True
+                st.session_state.etd_update_result = result_data
                 st.session_state.etd_update_processing = False
-                st.session_state.modals['update_etd'] = False
-                st.session_state.selections['allocation_for_update'] = None
+                st.session_state.etd_update_completed = True
                 
-                return_to_history_if_context()
-                
-                st.cache_data.clear()
+                # Rerun to update button states
+                time.sleep(0.5)
                 st.rerun()
+                
             else:
                 error_msg = result.get('error', 'Unknown error')
                 status.update(label="❌ Update failed", state="error")
