@@ -1219,6 +1219,7 @@ def commit_bulk_allocation(edited_df: pd.DataFrame, original_df: pd.DataFrame, n
                     scope=get_current_scope(),
                     strategy_config=strategy_config,
                     allocator_user_id=user.get('id'),
+                    demands_dict=demands_dict,
                     split_allocations=st.session_state.split_allocations
                 )
                 

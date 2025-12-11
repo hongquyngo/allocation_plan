@@ -280,7 +280,6 @@ class BulkEmailService:
             msg['Reply-To'] = reply_to or self.sender_email
             
             if cc_emails:
-                # Filter out empty/None values
                 valid_cc = [cc for cc in cc_emails if cc and cc.strip()]
                 if valid_cc:
                     msg['Cc'] = ', '.join(valid_cc)
@@ -316,14 +315,12 @@ class BulkEmailService:
     # ============================================================
     
     def _format_number(self, value) -> str:
-        """Format number with thousand separators"""
         try:
             return "{:,.0f}".format(float(value))
         except:
             return str(value)
     
     def _format_date(self, date_value) -> str:
-        """Format date as DD MMM YYYY"""
         try:
             if date_value is None:
                 return 'N/A'
@@ -334,7 +331,6 @@ class BulkEmailService:
             return str(date_value) if date_value else 'N/A'
     
     def _compare_dates(self, date1, date2) -> int:
-        """Compare two dates, return difference in days (date1 - date2)"""
         try:
             from datetime import date as date_type
             
@@ -359,7 +355,6 @@ class BulkEmailService:
         return 0
     
     def _build_base_style(self) -> str:
-        """Base CSS styles for emails"""
         return """
         <style>
             body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; margin: 0; padding: 0; }
@@ -392,16 +387,8 @@ class BulkEmailService:
         </style>
         """
     
-    def _build_allocation_table_rows(
-        self, 
-        allocation_results: List[Dict], 
-        split_allocations: Dict,
-        max_rows: int = 30
-    ) -> str:
-        """Build HTML table rows for allocation details"""
+    def _build_allocation_table_rows(self, allocation_results: List[Dict], split_allocations: Dict, max_rows: int = 30) -> str:
         rows_html = ""
-        
-        # Filter and sort by final_qty descending
         valid_results = [a for a in allocation_results if float(a.get('final_qty', 0)) > 0]
         sorted_results = sorted(valid_results, key=lambda x: float(x.get('final_qty', 0)), reverse=True)[:max_rows]
         
@@ -409,23 +396,19 @@ class BulkEmailService:
             coverage = float(alloc.get('coverage_percent', 0))
             coverage_class = 'coverage-high' if coverage >= 80 else 'coverage-mid' if coverage >= 50 else 'coverage-low'
             
-            # Product display (truncate if long)
             product = alloc.get('product_display') or alloc.get('pt_code', 'N/A')
             if len(product) > 45:
                 product = product[:42] + '...'
             
-            # ETD display
             allocated_etd = alloc.get('allocated_etd')
             oc_etd = alloc.get('oc_etd')
             etd_display = self._format_date(allocated_etd or oc_etd)
             
-            # ETD delay indicator
             if oc_etd and allocated_etd:
                 days_diff = self._compare_dates(allocated_etd, oc_etd)
                 if days_diff > 0:
                     etd_display = f"{self._format_date(allocated_etd)} <span class='etd-delay'>(+{days_diff}d)</span>"
             
-            # Split indicator
             ocd_id = alloc.get('ocd_id')
             split_indicator = ""
             if ocd_id and split_allocations.get(ocd_id) and len(split_allocations[ocd_id]) > 1:
@@ -442,7 +425,6 @@ class BulkEmailService:
             </tr>
             """
         
-        # Show "and X more" if truncated
         remaining = len(valid_results) - max_rows
         if remaining > 0:
             rows_html += f"""
@@ -460,16 +442,9 @@ class BulkEmailService:
     # ============================================================
     
     def send_summary_email_to_allocator(
-        self,
-        commit_result: Dict,
-        allocation_results: List[Dict],
-        scope: Dict,
-        strategy_config: Dict,
-        allocator_email: str,
-        allocator_name: str,
-        split_allocations: Dict
+        self, commit_result: Dict, allocation_results: List[Dict], scope: Dict,
+        strategy_config: Dict, allocator_email: str, allocator_name: str, split_allocations: Dict
     ) -> Tuple[bool, str]:
-        """Send comprehensive summary email to allocator with all allocation details"""
         
         if not allocator_email:
             return False, "No allocator email provided"
@@ -480,7 +455,6 @@ class BulkEmailService:
         products_affected = commit_result.get('products_affected', 0)
         customers_affected = commit_result.get('customers_affected', 0)
         
-        # Build scope summary
         scope_parts = []
         if scope.get('brand_ids'):
             scope_parts.append(f"{len(scope['brand_ids'])} Brand(s)")
@@ -494,12 +468,34 @@ class BulkEmailService:
             scope_parts.append(f"ETD: {etd_from} → {etd_to}")
         scope_summary = ' | '.join(scope_parts) if scope_parts else 'All'
         
-        # Strategy info
         strategy_type = strategy_config.get('strategy_type', 'HYBRID')
         allocation_mode = strategy_config.get('allocation_mode', 'SOFT')
         
-        # Build allocation table rows
+        etd_delay_count = 0
+        split_count = len([k for k, v in split_allocations.items() if len(v) > 1])
+        
+        for alloc in allocation_results:
+            oc_etd = alloc.get('oc_etd')
+            allocated_etd = alloc.get('allocated_etd')
+            if oc_etd and allocated_etd:
+                if self._compare_dates(allocated_etd, oc_etd) > 0:
+                    etd_delay_count += 1
+        
         rows_html = self._build_allocation_table_rows(allocation_results, split_allocations, max_rows=50)
+        
+        warnings_html = ""
+        if etd_delay_count > 0 or split_count > 0:
+            warning_items = []
+            if etd_delay_count > 0:
+                warning_items.append(f"⚠️ {etd_delay_count} OCs have allocated ETD later than requested")
+            if split_count > 0:
+                warning_items.append(f"✂️ {split_count} OCs have split allocations")
+            warnings_html = f"""
+            <div class="warning-box">
+                <strong>Attention:</strong><br>
+                {'<br>'.join(warning_items)}
+            </div>
+            """
         
         subject = f"✅ Bulk Allocation {allocation_number} - {detail_count} OCs Allocated"
         
@@ -515,17 +511,34 @@ class BulkEmailService:
             
             <div class="content">
                 <div class="info-box">
-                    <div class="label">Scope</div>
-                    <div class="value">{scope_summary}</div>
+                    <table style="border: none; box-shadow: none;">
+                        <tr>
+                            <td style="border: none; width: 50%;">
+                                <div class="label">Created By</div>
+                                <div class="value">{allocator_name}</div>
+                            </td>
+                            <td style="border: none;">
+                                <div class="label">Date</div>
+                                <div class="value">{datetime.now().strftime('%d %b %Y %H:%M')}</div>
+                            </td>
+                        </tr>
+                        <tr>
+                            <td style="border: none;">
+                                <div class="label">Strategy</div>
+                                <div class="value">
+                                    <span class="badge badge-strategy">{strategy_type}</span>
+                                    <span class="badge badge-mode">{allocation_mode}</span>
+                                </div>
+                            </td>
+                            <td style="border: none;">
+                                <div class="label">Scope</div>
+                                <div class="value">{scope_summary}</div>
+                            </td>
+                        </tr>
+                    </table>
                 </div>
                 
-                <div class="info-box">
-                    <div class="label">Strategy</div>
-                    <div class="value">
-                        <span class="badge badge-strategy">{strategy_type}</span>
-                        <span class="badge badge-mode">{allocation_mode}</span>
-                    </div>
-                </div>
+                {warnings_html}
                 
                 <div class="summary-grid">
                     <div class="summary-item">
@@ -587,16 +600,9 @@ class BulkEmailService:
     # ============================================================
     
     def send_individual_email_to_creator(
-        self,
-        creator_email: str,
-        creator_name: str,
-        creator_allocations: List[Dict],
-        commit_result: Dict,
-        allocator_email: str,
-        allocator_name: str,
-        split_allocations: Dict = None
+        self, creator_email: str, creator_name: str, creator_allocations: List[Dict],
+        commit_result: Dict, allocator_email: str, allocator_name: str, split_allocations: Dict = None
     ) -> Tuple[bool, str]:
-        """Send individual notification to OC creator"""
         
         if not creator_email:
             return False, "No creator email provided"
@@ -607,7 +613,6 @@ class BulkEmailService:
         oc_count = len(creator_allocations)
         total_qty = sum(float(a.get('final_qty', 0)) for a in creator_allocations)
         
-        # Build rows for this creator's OCs
         rows_html = ""
         for alloc in sorted(creator_allocations, key=lambda x: float(x.get('final_qty', 0)), reverse=True):
             coverage = float(alloc.get('coverage_percent', 0))
@@ -620,13 +625,17 @@ class BulkEmailService:
             allocated_etd = alloc.get('allocated_etd') or alloc.get('oc_etd')
             etd_display = self._format_date(allocated_etd)
             
-            # Check for splits
+            oc_etd = alloc.get('oc_etd')
+            if oc_etd and allocated_etd:
+                days_diff = self._compare_dates(allocated_etd, oc_etd)
+                if days_diff > 0:
+                    etd_display = f"{self._format_date(allocated_etd)} <span class='etd-delay'>(+{days_diff}d)</span>"
+            
             ocd_id = alloc.get('ocd_id')
             split_indicator = ""
             if ocd_id and split_allocations.get(ocd_id) and len(split_allocations[ocd_id]) > 1:
                 split_indicator = f" <span style='color: #666; font-size: 10px;'>({len(split_allocations[ocd_id])} splits)</span>"
             
-            # Customer display
             customer_display = alloc.get('customer_code', '')
             if alloc.get('customer'):
                 customer_name = alloc['customer'][:15] + '...' if len(alloc.get('customer', '')) > 15 else alloc.get('customer', '')
@@ -657,7 +666,6 @@ class BulkEmailService:
             
             <div class="content">
                 <p>Hi <strong>{creator_name}</strong>,</p>
-                
                 <p>The following OCs that you created have been allocated inventory:</p>
                 
                 <div class="summary-grid">
@@ -700,7 +708,6 @@ class BulkEmailService:
         </html>
         """
         
-        # CC: allocator + allocation group
         cc_emails = [self.allocation_cc] if self.allocation_cc else []
         if allocator_email:
             cc_emails.append(allocator_email)
@@ -718,37 +725,21 @@ class BulkEmailService:
     # ============================================================
     
     def get_oc_creators_for_allocations(self, ocd_ids: List[int]) -> Dict[str, Dict]:
-        """
-        DEPRECATED: Use group_allocations_by_creator() instead.
-        
-        This method makes an extra database query which is no longer needed
-        since OC creator info is now in outbound_oc_pending_delivery_view.
-        """
-        logger.warning(
-            "get_oc_creators_for_allocations() is DEPRECATED. "
-            "Use group_allocations_by_creator(allocation_results, demands_dict) instead."
-        )
-        
+        """DEPRECATED: Use group_allocations_by_creator() instead."""
+        logger.warning("get_oc_creators_for_allocations() is DEPRECATED.")
         creators = {}
         if not ocd_ids:
             return creators
-        
         try:
             engine = get_db_engine()
             query = text("""
-                SELECT 
-                    ocd.id AS ocd_id,
-                    e.email,
-                    TRIM(CONCAT(COALESCE(e.first_name, ''), ' ', COALESCE(e.last_name, ''))) AS full_name
+                SELECT ocd.id AS ocd_id, e.email,
+                       TRIM(CONCAT(COALESCE(e.first_name, ''), ' ', COALESCE(e.last_name, ''))) AS full_name
                 FROM order_comfirmation_details ocd
                 INNER JOIN order_confirmations oc ON ocd.order_confirmation_id = oc.id
                 INNER JOIN employees e ON oc.created_by = e.keycloak_id
-                WHERE ocd.id IN :ocd_ids
-                AND e.email IS NOT NULL
-                AND e.email != ''
-                AND e.delete_flag = 0
+                WHERE ocd.id IN :ocd_ids AND e.email IS NOT NULL AND e.email != '' AND e.delete_flag = 0
             """)
-            
             with engine.connect() as conn:
                 result = conn.execute(query, {'ocd_ids': tuple(ocd_ids)})
                 for row in result:
@@ -756,81 +747,14 @@ class BulkEmailService:
                     if not email:
                         continue
                     if email not in creators:
-                        creators[email] = {
-                            'full_name': row.full_name or 'Sales',
-                            'ocd_ids': []
-                        }
+                        creators[email] = {'full_name': row.full_name or 'Sales', 'ocd_ids': []}
                     creators[email]['ocd_ids'].append(row.ocd_id)
         except Exception as e:
             logger.error(f"Error getting OC creators: {e}")
-        
         return creators
     
-    def send_bulk_allocation_email(
-        self,
-        commit_result: Dict,
-        allocation_results: List[Dict],
-        scope: Dict,
-        strategy_config: Dict,
-        recipients: List[str],
-        split_allocations: Dict = None
-    ) -> Dict:
-        """
-        DEPRECATED: Use send_bulk_allocation_emails() instead.
-        """
-        logger.warning(
-            "send_bulk_allocation_email() is DEPRECATED. "
-            "Use send_bulk_allocation_emails() instead."
-        )
-        
-        if not recipients:
-            return {'success': False, 'message': 'No recipients'}
-        
-        success, msg = self.send_summary_email_to_allocator(
-            commit_result=commit_result,
-            allocation_results=allocation_results,
-            scope=scope,
-            strategy_config=strategy_config,
-            allocator_email=recipients[0],
-            allocator_name='Allocator',
-            split_allocations=split_allocations or {}
-        )
-        
-        return {'success': success, 'message': msg}
-    
-    def send_individual_creator_emails(
-        self,
-        commit_result: Dict,
-        allocation_results: List[Dict],
-        allocator_email: str,
-        allocator_name: str
-    ) -> Dict:
-        """
-        DEPRECATED: Individual emails are now handled in send_bulk_allocation_emails()
-        using group_allocations_by_creator().
-        """
-        logger.warning(
-            "send_individual_creator_emails() is DEPRECATED. "
-            "Individual emails are now handled in send_bulk_allocation_emails()."
-        )
-        return {
-            'sent_count': 0,
-            'total_creators': 0,
-            'errors': ['Method deprecated - use send_bulk_allocation_emails with demands_dict']
-        }
-    
-    def get_recipients_for_scope(
-        self, 
-        scope: Dict, 
-        creator_email: str = None,
-        allocation_results: List[Dict] = None
-    ) -> List[str]:
-        """
-        DEPRECATED: For backward compatibility only.
-        """
-        recipients = set()
-        if creator_email:
-            recipients.add(creator_email)
-        if self.allocation_cc:
-            recipients.add(self.allocation_cc)
-        return [email for email in recipients if email]
+    def send_individual_creator_emails(self, commit_result: Dict, allocation_results: List[Dict],
+                                       allocator_email: str, allocator_name: str) -> Dict:
+        """DEPRECATED: Individual emails are now handled in send_bulk_allocation_emails()."""
+        logger.warning("send_individual_creator_emails() is DEPRECATED.")
+        return {'sent_count': 0, 'total_creators': 0, 'errors': ['Method deprecated']}
