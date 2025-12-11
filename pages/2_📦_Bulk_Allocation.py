@@ -345,7 +345,7 @@ def render_allocation_status_chart(summary: Dict):
 def render_help_panel():
     """Render expandable help section"""
     with st.expander("❓ Guide & Formula Explanations", expanded=False):
-        tab1, tab2, tab3 = st.tabs(["📋 Scope & Metrics", "🎯 Strategies", "📐 Formulas"])
+        tab1, tab2, tab3, tab4 = st.tabs(["📋 Scope & Metrics", "🎯 Strategies", "📐 Formulas", "🔍 Filters"])
         
         with tab1:
             st.markdown("""
@@ -356,12 +356,25 @@ def render_help_panel():
             | 🔴 **Not Allocated** | `undelivered_allocated = 0` | Need new allocation |
             | 🟡 **Partially Allocated** | `0 < undelivered < pending` | Can be topped up |
             | 🟢 **Fully Allocated** | `undelivered >= pending` | No action needed |
+            | ⚠️ **Over-Allocated** | `undelivered > pending` | Need to cancel excess |
+            
+            **Note**: `undelivered_allocated` = allocation that has been committed but not yet delivered.
             
             ### Key Metrics
             
-            - **Need Allocation**: OCs that need allocation (Not Allocated + Partially Allocated with room)
-            - **Allocatable Demand**: Total quantity that can still be allocated
-            - **Available Supply**: Supply after deducting committed quantity
+            - **Need Allocation**: OCs that need allocation (Not Allocated + Partially Allocated)
+            - **Allocatable Demand**: `Σ (pending_qty - undelivered_allocated)` for OCs needing allocation
+            - **Available Supply**: Total supply minus committed quantity
+            - **Committed**: `Σ MIN(pending_qty, undelivered_allocated)` - quantity locked for existing allocations
+            
+            ### Supply Sources
+            
+            | Source | Description | View |
+            |--------|-------------|------|
+            | 📦 **Inventory** | Physical stock on hand | `inventory_detailed_view.remaining_quantity` |
+            | 🚢 **CAN Pending** | Arrived but not stocked-in | `can_pending_stockin_view.pending_quantity` |
+            | 📋 **PO Pending** | Ordered but not arrived | `purchase_order_full_view.pending_standard_arrival_quantity` |
+            | 🔄 **WHT Pending** | In-transit between warehouses | `warehouse_transfer_details_view.transfer_quantity` |
             """)
             
         with tab2:
@@ -380,14 +393,78 @@ def render_help_panel():
             1. **MIN_GUARANTEE (30%)**: Each OC receives at least 30%
             2. **ETD_PRIORITY (40%)**: Prioritize urgent (≤7 days)
             3. **PROPORTIONAL (30%)**: Distribute remaining fairly
+            
+            ### Allocation Modes
+            
+            | Mode | Description |
+            |------|-------------|
+            | **SOFT** | Flexible - can be adjusted before delivery |
+            | **HARD** | Locked - requires approval to change |
             """)
             
         with tab3:
-            st.markdown(FORMULA_TOOLTIPS['max_allocatable'])
-            st.divider()
-            st.markdown(FORMULA_TOOLTIPS['committed_qty'])
-            st.divider()
-            st.markdown(FORMULA_TOOLTIPS['available_supply'])
+            st.markdown("""
+            ### Max Allocatable Formula
+            
+            ```
+            max_allocatable = MAX(0, pending_qty - undelivered_allocated)
+            ```
+            
+            **Simplified**: How much more can be allocated = What's needed - What's already allocated
+            
+            ### Committed Quantity Formula
+            
+            ```
+            committed = Σ MIN(pending_qty, undelivered_allocated)
+            ```
+            
+            Uses MIN because:
+            - If `pending < undelivered` → over-allocated, only need pending
+            - If `undelivered < pending` → partial, only committed amount is locked
+            
+            ### Available Supply Formula
+            
+            ```
+            Total Supply = Inventory + CAN + PO + WHT
+            Available = Total Supply - Committed
+            ```
+            
+            ### Coverage Formula
+            
+            ```
+            Coverage % = (undelivered_allocated / pending_qty) × 100%
+            ```
+            """)
+        
+        with tab4:
+            st.markdown("""
+            ### Allocation Status Filter
+            
+            | Option | Shows OCs Where | Use Case |
+            |--------|-----------------|----------|
+            | 🔄 **All needing** | `undelivered < pending` | Daily allocation (default) |
+            | 🆕 **Unallocated only** | `undelivered = 0` | New orders only |
+            | 📈 **Partial only** | `0 < undelivered < pending` | Top-up shortage |
+            | 📋 **All OCs** | Everything | Review all |
+            | ⚠️ **Over-allocated** | `undelivered > pending` | Fix problems |
+            
+            ### Urgency Filter
+            
+            | Option | Condition | Use Case |
+            |--------|-----------|----------|
+            | 📅 **All ETDs** | No filter | See everything |
+            | 🔴 **Urgent only** | `ETD ≤ today + X days` | Rush deliveries |
+            | ⚠️ **Overdue only** | `ETD < today` | Late orders |
+            | 🚨 **Urgent + Overdue** | Both above | Critical attention |
+            
+            ### Additional Filters
+            
+            | Filter | Condition | Use Case |
+            |--------|-----------|----------|
+            | **Low coverage** | `coverage < threshold%` | Focus on shortage |
+            | **Stock only** | Product has available supply | Where we can fulfill |
+            | **High value** | Order value ≥ threshold | Prioritize big orders |
+            """)
 
 
 # ==================== STEP 1: SELECT SCOPE ====================

@@ -403,16 +403,14 @@ FORMULA_TOOLTIPS = {
 Formula for maximum quantity that can be allocated per OC:
 
 ```
-Rule 1: max_by_oc = effective_qty - current_allocated
-        (Cannot exceed order quantity)
-
-Rule 2: max_by_pending = pending_qty - undelivered_allocated  
-        (Cannot over-allocate vs. delivery need)
-
-max_allocatable = MIN(Rule 1, Rule 2)
+max_allocatable = MAX(0, pending_qty - undelivered_allocated)
 ```
 
-Prevents over-allocation on both dimensions.
+Where:
+- `pending_qty` = OC quantity still needs delivery
+- `undelivered_allocated` = allocation committed but not yet delivered
+
+**Simplified**: How much more can be allocated = What's needed - What's already allocated
 """,
     
     'committed_qty': """
@@ -425,8 +423,8 @@ Committed = Σ MIN(pending_qty, undelivered_allocated)
 ```
 
 Uses MIN because:
-- If `pending < undelivered`: only need to deliver pending
-- If `undelivered < pending`: only committed the allocated portion
+- If `pending < undelivered`: over-allocated, only need to deliver pending
+- If `undelivered < pending`: only the allocated portion is locked
 """,
     
     'available_supply': """
@@ -434,6 +432,10 @@ Uses MIN because:
 
 ```
 Total Supply = Inventory + CAN + PO + WHT
+             = remaining_quantity (inventory)
+             + pending_quantity (CAN)
+             + pending_standard_arrival_quantity (PO)
+             + transfer_quantity (WHT in-transit)
 
 Committed = Σ MIN(pending_qty, undelivered_allocated)
             for all pending delivery OCs
@@ -445,19 +447,13 @@ Available = Total Supply - Committed
     'coverage_calculation': """
 **Coverage Calculation**
 
-Two ways to calculate coverage:
+Coverage % = (undelivered_allocated / pending_qty) × 100%
 
-1. **Overall Coverage** (Total Demand):
-```
-Coverage = Available / Total Demand × 100%
-```
-
-2. **Allocatable Coverage** (Only OCs needing allocation):
-```
-Coverage = Available / Allocatable Demand × 100%
-```
-
-Allocatable coverage is usually higher as it excludes fully allocated OCs.
+Status based on coverage:
+- 0% = Not Allocated
+- 1-99% = Partially Allocated  
+- 100% = Fully Allocated
+- >100% = Over-Allocated (problem!)
 """
 }
 
@@ -467,23 +463,40 @@ STATUS_TOOLTIPS = {
     'not_allocated': """
 🔴 **Not Allocated**
 
-OC has no allocation yet.
+OC has no pending allocation.
 `undelivered_allocated = 0`
+
+Action: Needs new allocation
 """,
     
     'partially_allocated': """
 🟡 **Partially Allocated**
 
-OC has some allocation but doesn't fully cover pending.
+OC has some allocation but doesn't fully cover pending need.
 `0 < undelivered_allocated < pending_qty`
+
+Action: Can be topped up with more allocation
 """,
     
     'fully_allocated': """
 🟢 **Fully Allocated**
 
 OC has sufficient allocation for pending delivery.
-`undelivered_allocated >= pending_qty` or
-`current_allocated >= effective_qty`
+`undelivered_allocated >= pending_qty`
+
+Action: No allocation needed (skip or review to re-allocate)
+""",
+    
+    'over_allocated': """
+⚠️ **Over-Allocated**
+
+OC has more allocation than pending delivery need.
+`undelivered_allocated > pending_qty`
+
+This is a problem! Actions:
+- Cancel excess allocation
+- Review if OC quantity was reduced
+- Check for duplicate allocations
 """
 }
 
