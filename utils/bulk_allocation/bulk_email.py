@@ -1,6 +1,5 @@
 """
 Bulk Allocation Email Service
-=============================
 Email notifications for bulk allocation operations.
 
 Email flow:
@@ -31,10 +30,8 @@ class BulkEmailService:
         self.sender_email = os.getenv("OUTBOUND_EMAIL_SENDER", os.getenv("EMAIL_SENDER", "outbound@prostech.vn"))
         self.sender_password = os.getenv("OUTBOUND_EMAIL_PASSWORD", os.getenv("EMAIL_PASSWORD", ""))
         self.allocation_cc = "allocation@prostech.vn"
-        
-        self.is_configured = bool(self.sender_email and self.sender_password)
     
-    # ============== DATA FETCHING ==============
+    # ============== DATA FETCHING METHODS ==============
     
     def get_user_info(self, user_id: int) -> Optional[Dict]:
         """Get user information"""
@@ -133,10 +130,10 @@ class BulkEmailService:
                 server.starttls()
                 server.login(self.sender_email, self.sender_password)
                 
-                recipients = [to_email] + [cc for cc in cc_emails if cc]
+                recipients = [to_email] + cc_emails
                 server.sendmail(self.sender_email, recipients, msg.as_string())
             
-            logger.info(f"Email sent to {to_email}")
+            logger.info(f"Bulk allocation email sent to {to_email}")
             return True, "Email sent successfully"
             
         except smtplib.SMTPAuthenticationError:
@@ -219,11 +216,8 @@ class BulkEmailService:
         Returns:
             Dict with summary_sent, individual_sent, errors
         """
-        if not self.is_configured:
-            logger.warning("Email not configured, skipping notifications")
-            return {'success': False, 'message': 'Email not configured'}
-        
         results = {
+            'success': False,
             'summary_sent': False,
             'individual_sent': 0,
             'individual_total': 0,
@@ -235,22 +229,28 @@ class BulkEmailService:
         allocator_email = allocator.get('email', '') if allocator else ''
         allocator_name = allocator.get('full_name', 'Unknown') if allocator else 'Unknown'
         
+        if not allocator_email:
+            logger.warning(f"Allocator email not found for user_id={allocator_user_id}")
+            results['errors'].append(f"Allocator email not found for user_id={allocator_user_id}")
+        
         # 1. Send summary email to allocator
-        try:
-            success, msg = self.send_summary_email_to_allocator(
-                commit_result=commit_result,
-                allocation_results=allocation_results,
-                scope=scope,
-                strategy_config=strategy_config,
-                allocator_email=allocator_email,
-                allocator_name=allocator_name,
-                split_allocations=split_allocations or {}
-            )
-            results['summary_sent'] = success
-            if not success:
-                results['errors'].append(f"Summary email: {msg}")
-        except Exception as e:
-            results['errors'].append(f"Summary email error: {str(e)}")
+        if allocator_email:
+            try:
+                success, msg = self.send_summary_email_to_allocator(
+                    commit_result=commit_result,
+                    allocation_results=allocation_results,
+                    scope=scope,
+                    strategy_config=strategy_config,
+                    allocator_email=allocator_email,
+                    allocator_name=allocator_name,
+                    split_allocations=split_allocations or {}
+                )
+                results['summary_sent'] = success
+                if not success:
+                    results['errors'].append(f"Summary email: {msg}")
+            except Exception as e:
+                logger.error(f"Summary email error: {e}", exc_info=True)
+                results['errors'].append(f"Summary email error: {str(e)}")
         
         # 2. Send individual emails to OC creators
         try:
@@ -265,6 +265,7 @@ class BulkEmailService:
             if individual_result.get('errors'):
                 results['errors'].extend(individual_result['errors'])
         except Exception as e:
+            logger.error(f"Individual emails error: {e}", exc_info=True)
             results['errors'].append(f"Individual emails error: {str(e)}")
         
         results['success'] = results['summary_sent'] or results['individual_sent'] > 0
@@ -536,14 +537,12 @@ class BulkEmailService:
             allocated_etd = alloc.get('allocated_etd')
             oc_etd = alloc.get('oc_etd')
             etd_display = self._format_date(allocated_etd or oc_etd)
-            etd_class = ""
             
             if oc_etd and allocated_etd:
                 try:
                     days_diff = self._compare_dates(allocated_etd, oc_etd)
                     if days_diff > 0:
                         etd_display = f"{self._format_date(allocated_etd)} <span class='etd-delay'>(+{days_diff}d)</span>"
-                        etd_class = "etd-delay"
                 except:
                     pass
             

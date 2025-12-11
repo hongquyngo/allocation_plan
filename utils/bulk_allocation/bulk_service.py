@@ -18,8 +18,8 @@ from threading import local
 from sqlalchemy import text
 import streamlit as st
 
-from ..db import get_db_engine
-from ..config import config
+from utils.db import get_db_engine
+from utils.config import config
 from .bulk_data import BulkAllocationData
 from .bulk_validator import BulkAllocationValidator
 from .strategy_engine import AllocationResult, StrategyConfig
