@@ -1,7 +1,13 @@
 """
-Allocation Planning System - REFACTORED Main Page
+Allocation Planning System - REFACTORED Main Page v2.0
 Product-centric view with Dropdown Filter Support
-UPDATED: New filter UI with multiselect dropdowns
+UPDATED: Simplified email notification with OC Creator info from view
+
+CHANGELOG v2.0:
+- Added oc_creator_email, oc_creator_name to oc_info dict
+- Added user email to session state initialization
+- Added get_actor_info() helper function
+- Updated show_undelivered_allocated() to include all email-related fields
 """
 import streamlit as st
 import pandas as pd
@@ -106,7 +112,7 @@ DEFAULT_SESSION_STATE = {
 }
 
 def init_session_state():
-    """Initialize session state with proper user validation"""
+    """Initialize session state with proper user validation - UPDATED for email support"""
     if 'state_initialized' not in st.session_state:
         for key, value in DEFAULT_SESSION_STATE.items():
             if key not in st.session_state:
@@ -145,15 +151,37 @@ def init_session_state():
         st.switch_page("app.py")
         st.stop()
     
-    # Update user information in session state
+    # ============================================================
+    # UPDATED: Include user email in session state for email notifications
+    # ============================================================
     if 'user' not in st.session_state or st.session_state.user.get('id') != user_id:
         st.session_state.user = {
             'id': user_id,
             'role': st.session_state.get('user_role', 'viewer'),
             'username': st.session_state.get('username', 'Unknown'),
-            'full_name': st.session_state.get('user_fullname', st.session_state.get('username', 'User'))
+            'full_name': st.session_state.get('user_fullname', st.session_state.get('username', 'User')),
+            # NEW: Add user email for email notifications
+            'email': st.session_state.get('user_email', '')
         }
         logger.info(f"Session initialized for user {st.session_state.user['username']} (ID: {user_id})")
+
+
+# ============================================================
+# NEW: Helper function for email notifications
+# ============================================================
+def get_actor_info() -> dict:
+    """
+    Get current user info for email notifications.
+    Used by modals when sending email notifications.
+    
+    Returns:
+        dict with 'email' and 'name' keys
+    """
+    return {
+        'email': st.session_state.user.get('email', ''),
+        'name': st.session_state.user.get('full_name', st.session_state.user.get('username', 'Unknown'))
+    }
+
 
 # Initialize session state with validation
 init_session_state()
@@ -787,8 +815,15 @@ def show_oc_row(oc):
     with cols[5]:
         show_allocation_action_button(oc)
 
+
+# ============================================================
+# UPDATED: show_undelivered_allocated with OC Creator info
+# ============================================================
 def show_undelivered_allocated(oc):
-    """Show undelivered allocated quantity with color coding"""
+    """
+    Show undelivered allocated quantity with color coding.
+    UPDATED: Now includes OC creator info in oc_info for email notifications.
+    """
     undelivered_std = float(oc.get('undelivered_allocated_qty_standard', 0))
     pending_std = float(oc.get('pending_standard_delivery_quantity', 0))
     standard_uom = oc.get('standard_uom', '')
@@ -808,16 +843,46 @@ def show_undelivered_allocated(oc):
             reset_all_modals()
             st.session_state.modals['history'] = True
             st.session_state.selections['oc_for_history'] = oc['ocd_id']
+            
+            # ============================================================
+            # UPDATED: Include all fields needed for email notifications
+            # Fields come from outbound_oc_pending_delivery_view
+            # ============================================================
             st.session_state.selections['oc_info'] = {
+                # Basic OC info
                 'oc_number': oc['oc_number'],
                 'customer': oc['customer'],
+                'customer_code': oc.get('customer_code', ''),
                 'product_name': oc['product_name'],
+                'pt_code': oc.get('pt_code', ''),
+                'brand': oc.get('brand', ''),
+                
+                # UOM info
                 'selling_uom': oc.get('selling_uom', ''),
                 'standard_uom': oc.get('standard_uom', ''),
+                'uom_conversion': oc.get('uom_conversion', '1'),
+                
+                # Quantity info
+                'selling_quantity': oc.get('selling_quantity', 0),
+                'standard_quantity': oc.get('standard_quantity', 0),
                 'pending_quantity': oc['pending_quantity'],
                 'pending_standard_delivery_quantity': oc.get('pending_standard_delivery_quantity', 0),
-                'uom_conversion': oc.get('uom_conversion', '1'),
-                'over_allocation_type': oc.get('over_allocation_type', 'Normal')
+                
+                # Allocation info
+                'total_effective_allocated_qty_standard': oc.get('total_effective_allocated_qty_standard', 0),
+                'over_allocation_type': oc.get('over_allocation_type', 'Normal'),
+                
+                # ============================================================
+                # NEW: OC Creator info for email notifications
+                # These fields come from the updated outbound_oc_pending_delivery_view
+                # ============================================================
+                'oc_creator_email': oc.get('oc_creator_email', ''),
+                'oc_creator_name': oc.get('oc_creator_name', ''),
+                'oc_created_by': oc.get('oc_created_by', ''),
+                
+                # Additional context
+                'legal_entity': oc.get('legal_entity', ''),
+                'etd': oc.get('etd'),
             }
             st.rerun()
         
@@ -831,6 +896,7 @@ def show_undelivered_allocated(oc):
             undelivered_std, 'standard', 'selling', oc.get('uom_conversion', '1')
         )
         st.caption(f"= {format_number(undelivered_selling)} {oc.get('selling_uom')}")
+
 
 def show_allocation_action_button(oc):
     """Show allocation action button"""
@@ -879,7 +945,16 @@ def show_allocation_action_button(oc):
         help=help_text
     ):
         reset_all_modals()
-        st.session_state.selections['oc_for_allocation'] = oc.to_dict()
+        # ============================================================
+        # UPDATED: Include OC creator info when selecting for allocation
+        # ============================================================
+        oc_dict = oc.to_dict() if hasattr(oc, 'to_dict') else dict(oc)
+        # Ensure creator info is in the dict
+        oc_dict['oc_creator_email'] = oc.get('oc_creator_email', '')
+        oc_dict['oc_creator_name'] = oc.get('oc_creator_name', '')
+        oc_dict['oc_created_by'] = oc.get('oc_created_by', '')
+        
+        st.session_state.selections['oc_for_allocation'] = oc_dict
         st.session_state.modals['allocation'] = True
         st.rerun()
 

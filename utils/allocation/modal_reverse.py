@@ -1,6 +1,11 @@
 """
-Reverse Cancellation Modal - Self-contained modal for reversing cancellations
-Extracted from main page for better organization
+Reverse Cancellation Modal - REFACTORED v2.0
+==============================================
+Self-contained modal for reversing cancellations with simplified email notifications.
+
+CHANGES:
+- Email service now receives oc_info and actor_info directly
+- Removed ocd_id + user_id based queries for email
 """
 import streamlit as st
 import time
@@ -19,6 +24,14 @@ validator = AllocationValidator()
 uom_converter = UOMConverter()
 auth = AuthManager()
 email_service = AllocationEmailService()
+
+
+def get_actor_info() -> dict:
+    """Get current user info for email notifications"""
+    return {
+        'email': st.session_state.user.get('email', ''),
+        'name': st.session_state.user.get('full_name', st.session_state.user.get('username', 'Unknown'))
+    }
 
 
 def return_to_history_if_context():
@@ -133,30 +146,23 @@ def show_reverse_cancellation_modal():
                 cancelled_qty = cancellation.get('cancelled_qty', 0)
                 st.write(f"✅ Restored {format_number(cancelled_qty)} {oc_info.get('standard_uom', '')} to allocation")
                 
-                # Step 2: Send email notification
+                # Step 2: Send email notification - REFACTORED
                 status.update(label="📧 Sending email notification...", state="running")
                 
                 try:
-                    ocd_id = None
-                    if st.session_state.context.get('return_to_history'):
-                        ocd_id = st.session_state.context['return_to_history'].get('oc_detail_id')
-                    if not ocd_id:
-                        ocd_id = st.session_state.selections.get('oc_for_history')
+                    actor_info = get_actor_info()
                     
-                    if ocd_id:
-                        email_success, email_msg = email_service.send_cancellation_reversed_email(
-                            ocd_id=ocd_id,
-                            allocation_number=cancellation.get('allocation_number', ''),
-                            restored_qty=cancelled_qty,
-                            reversal_reason=saved_reason,
-                            user_id=user_id
-                        )
-                        if email_success:
-                            st.write("✅ Email notification sent")
-                        else:
-                            st.write(f"⚠️ Email not sent: {email_msg}")
+                    email_success, email_msg = email_service.send_cancellation_reversed_email(
+                        oc_info=oc_info,  # Pass oc_info directly
+                        actor_info=actor_info,
+                        allocation_number=cancellation.get('allocation_number', ''),
+                        restored_qty=cancelled_qty,
+                        reversal_reason=saved_reason
+                    )
+                    if email_success:
+                        st.write("✅ Email notification sent")
                     else:
-                        st.write("⚠️ Email not sent: Missing OC reference")
+                        st.write(f"⚠️ Email not sent: {email_msg}")
                 except Exception as email_error:
                     st.write(f"⚠️ Email error: {str(email_error)}")
                 
@@ -174,7 +180,6 @@ def show_reverse_cancellation_modal():
                 st.cache_data.clear()
                 st.rerun()
             else:
-                # Handle error
                 error_msg = result.get('error', 'Unknown error')
                 status.update(label="❌ Reversal failed", state="error")
                 st.error(f"❌ {error_msg}")

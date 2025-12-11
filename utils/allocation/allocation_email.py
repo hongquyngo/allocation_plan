@@ -1,6 +1,26 @@
 """
-Allocation Email Service
-Email notifications for allocation operations (Create, Cancel, Update ETD, Reverse)
+Allocation Email Service - REFACTORED v2.0
+============================================
+Simplified email notifications for allocation operations.
+
+CHANGES from v1.0:
+- Removed get_oc_creator_info() - Now uses oc_info dict passed directly from UI
+- Removed get_user_info() - Now uses actor_info dict passed directly from session
+- All send methods now accept oc_info and actor_info dicts directly
+- Cleaner error handling with consistent fallback to allocation_cc
+
+USAGE:
+    # In modals, call with oc_info from session and actor from session_state.user
+    oc_info = st.session_state.selections.get('oc_info')
+    actor_info = {
+        'email': st.session_state.user.get('email'),
+        'name': st.session_state.user.get('full_name')
+    }
+    email_service.send_allocation_created_email(
+        oc_info=oc_info,
+        actor_info=actor_info,
+        ...
+    )
 """
 import smtplib
 from email.mime.text import MIMEText
@@ -9,15 +29,17 @@ from datetime import datetime
 import logging
 import os
 from typing import Dict, List, Tuple, Optional
-from sqlalchemy import text
-
-from ..db import get_db_engine
 
 logger = logging.getLogger(__name__)
 
 
 class AllocationEmailService:
-    """Handle email notifications for allocation operations"""
+    """
+    Simplified email notifications for allocation operations.
+    
+    All methods now accept oc_info and actor_info dicts directly,
+    eliminating the need for database queries.
+    """
     
     def __init__(self):
         self.smtp_host = os.getenv("SMTP_HOST", "smtp.gmail.com")
@@ -26,115 +48,62 @@ class AllocationEmailService:
         self.sender_password = os.getenv("OUTBOUND_EMAIL_PASSWORD", os.getenv("EMAIL_PASSWORD", ""))
         self.allocation_cc = "allocation@prostech.vn"
     
-    # ============== DATA FETCHING METHODS ==============
+    # ============== HELPER METHODS ==============
     
-    def get_oc_creator_info(self, ocd_id: int) -> Optional[Dict]:
-        """Get OC creator information from order_confirmations"""
+    def _format_number(self, value) -> str:
+        """Format number with thousand separators"""
         try:
-            if not ocd_id:
-                logger.warning("get_oc_creator_info: ocd_id is None or empty")
-                return None
-                
-            engine = get_db_engine()
-            query = text("""
-                SELECT 
-                    oc.oc_number,
-                    oc.customerponumber AS customer_po,
-                    oc.created_by AS oc_created_by,
-                    buyer.english_name AS customer_name,
-                    seller.english_name AS legal_entity,
-                    ocd.etd AS oc_etd,
-                    p.pt_code,
-                    p.name AS product_name,
-                    p.package_size,
-                    b.brand_name AS brand,
-                    ocd.uom AS standard_uom,
-                    ocd.selling_quantity,
-                    ocd.sellinguom AS selling_uom,
-                    e.email AS creator_email,
-                    CONCAT(e.first_name, ' ', e.last_name) AS creator_name
-                FROM order_comfirmation_details ocd
-                JOIN order_confirmations oc ON ocd.order_confirmation_id = oc.id
-                LEFT JOIN companies buyer ON oc.buyer_id = buyer.id
-                LEFT JOIN companies seller ON oc.seller_id = seller.id
-                LEFT JOIN products p ON ocd.product_id = p.id
-                LEFT JOIN brands b ON p.brand_id = b.id
-                LEFT JOIN employees e ON oc.created_by = e.keycloak_id
-                WHERE ocd.id = :ocd_id
-            """)
-            
-            with engine.connect() as conn:
-                result = conn.execute(query, {'ocd_id': ocd_id}).fetchone()
-                if result:
-                    row = dict(result._mapping)
-                    if not row.get('creator_email'):
-                        logger.warning(f"OC creator email not found for ocd_id={ocd_id}, created_by={row.get('oc_created_by')}")
-                    return row
-                else:
-                    logger.warning(f"No OC found for ocd_id={ocd_id}")
-        except Exception as e:
-            logger.error(f"Error fetching OC creator info: {e}", exc_info=True)
-        return None
+            return "{:,.2f}".format(float(value))
+        except:
+            return str(value)
     
-    def get_user_info(self, user_id: int) -> Optional[Dict]:
-        """Get user information"""
+    def _format_date(self, date_value) -> str:
+        """Format date as DD MMM YYYY"""
         try:
-            engine = get_db_engine()
-            query = text("""
-                SELECT 
-                    u.id,
-                    e.email,
-                    CONCAT(e.first_name, ' ', e.last_name) AS full_name
-                FROM users u
-                LEFT JOIN employees e ON u.employee_id = e.id
-                WHERE u.id = :user_id
-            """)
-            
-            with engine.connect() as conn:
-                result = conn.execute(query, {'user_id': user_id}).fetchone()
-                if result:
-                    return dict(result._mapping)
-        except Exception as e:
-            logger.error(f"Error fetching user info: {e}")
-        return None
+            if isinstance(date_value, str):
+                date_value = datetime.strptime(date_value[:10], '%Y-%m-%d')
+            return date_value.strftime('%d %b %Y')
+        except:
+            return str(date_value) if date_value else 'N/A'
     
-    def get_allocation_summary(self, ocd_id: int) -> Dict:
-        """Get current allocation summary for an OC line"""
-        try:
-            engine = get_db_engine()
-            query = text("""
-                SELECT 
-                    COALESCE(SUM(ad.allocated_qty), 0) AS total_allocated,
-                    COALESCE(SUM(CASE WHEN ac.status = 'ACTIVE' THEN ac.cancelled_qty ELSE 0 END), 0) AS total_cancelled,
-                    COALESCE(SUM(adl.delivered_qty), 0) AS total_delivered
-                FROM allocation_details ad
-                JOIN allocation_plans ap ON ad.allocation_plan_id = ap.id
-                LEFT JOIN allocation_cancellations ac ON ad.id = ac.allocation_detail_id
-                LEFT JOIN allocation_delivery_links adl ON ad.id = adl.allocation_detail_id
-                WHERE ad.demand_reference_id = :ocd_id
-                AND ad.demand_type = 'OC'
-                AND ad.status = 'ALLOCATED'
-            """)
-            
-            with engine.connect() as conn:
-                result = conn.execute(query, {'ocd_id': ocd_id}).fetchone()
-                if result:
-                    row = dict(result._mapping)
-                    total = float(row.get('total_allocated', 0))
-                    cancelled = float(row.get('total_cancelled', 0))
-                    delivered = float(row.get('total_delivered', 0))
-                    return {
-                        'total_allocated': total,
-                        'total_cancelled': cancelled,
-                        'total_delivered': delivered,
-                        'effective_allocated': total - cancelled,
-                        'pending': total - cancelled - delivered
-                    }
-        except Exception as e:
-            logger.error(f"Error fetching allocation summary: {e}")
-        return {'total_allocated': 0, 'total_cancelled': 0, 'total_delivered': 0, 'effective_allocated': 0, 'pending': 0}
+    def _get_recipient_email(self, oc_info: Dict, actor_info: Dict) -> Optional[str]:
+        """
+        Get recipient email with fallback chain:
+        1. OC Creator email (from view)
+        2. Actor email (person performing action)
+        3. Allocation CC email
+        """
+        return (
+            oc_info.get('oc_creator_email') or 
+            actor_info.get('email') or 
+            self.allocation_cc
+        )
     
-    # ============== EMAIL SENDING ==============
+    def _build_base_style(self) -> str:
+        """Base CSS styles for emails"""
+        return """
+        <style>
+            body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; }
+            .header { padding: 20px; text-align: center; color: white; }
+            .header-green { background-color: #2e7d32; }
+            .header-blue { background-color: #1976d2; }
+            .header-red { background-color: #c62828; }
+            .header-purple { background-color: #7b1fa2; }
+            .content { padding: 20px; }
+            .info-box { background-color: #f5f5f5; border-radius: 5px; padding: 15px; margin: 15px 0; }
+            .label { color: #666; font-size: 12px; margin-bottom: 3px; }
+            .value { font-weight: bold; font-size: 14px; }
+            table { width: 100%; border-collapse: collapse; margin: 15px 0; }
+            th { background-color: #f5f5f5; padding: 10px; text-align: left; border: 1px solid #ddd; }
+            td { padding: 10px; border: 1px solid #ddd; }
+            .badge { display: inline-block; padding: 3px 8px; border-radius: 3px; font-size: 12px; }
+            .badge-soft { background-color: #e3f2fd; color: #1976d2; }
+            .badge-hard { background-color: #fce4ec; color: #c62828; }
+            .progress-bar { height: 20px; background-color: #e0e0e0; border-radius: 10px; overflow: hidden; }
+            .progress-fill { height: 100%; background-color: #4caf50; }
+            .footer { margin-top: 30px; padding: 20px; background-color: #f5f5f5; text-align: center; font-size: 12px; color: #666; }
+        </style>
+        """
     
     def _send_email(self, to_email: str, cc_emails: List[str], reply_to: str, 
                     subject: str, html_content: str) -> Tuple[bool, str]:
@@ -171,78 +140,41 @@ class AllocationEmailService:
             logger.error(f"Error sending email: {e}")
             return False, str(e)
     
-    # ============== EMAIL TEMPLATES ==============
-    
-    def _format_number(self, value) -> str:
-        """Format number with thousand separators"""
-        try:
-            return "{:,.2f}".format(float(value))
-        except:
-            return str(value)
-    
-    def _format_date(self, date_value) -> str:
-        """Format date as DD MMM YYYY"""
-        try:
-            if isinstance(date_value, str):
-                from datetime import datetime
-                date_value = datetime.strptime(date_value[:10], '%Y-%m-%d')
-            return date_value.strftime('%d %b %Y')
-        except:
-            return str(date_value) if date_value else 'N/A'
-    
-    def _build_base_style(self) -> str:
-        """Base CSS styles for emails"""
-        return """
-        <style>
-            body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; }
-            .header { padding: 20px; text-align: center; color: white; }
-            .header-green { background-color: #2e7d32; }
-            .header-blue { background-color: #1976d2; }
-            .header-red { background-color: #c62828; }
-            .header-purple { background-color: #7b1fa2; }
-            .content { padding: 20px; }
-            .info-box { background-color: #f5f5f5; border-radius: 5px; padding: 15px; margin: 15px 0; }
-            .label { color: #666; font-size: 12px; margin-bottom: 3px; }
-            .value { font-weight: bold; font-size: 14px; }
-            table { width: 100%; border-collapse: collapse; margin: 15px 0; }
-            th { background-color: #f5f5f5; padding: 10px; text-align: left; border: 1px solid #ddd; }
-            td { padding: 10px; border: 1px solid #ddd; }
-            .badge { display: inline-block; padding: 3px 8px; border-radius: 3px; font-size: 12px; }
-            .badge-soft { background-color: #e3f2fd; color: #1976d2; }
-            .badge-hard { background-color: #fce4ec; color: #c62828; }
-            .progress-bar { height: 20px; background-color: #e0e0e0; border-radius: 10px; overflow: hidden; }
-            .progress-fill { height: 100%; background-color: #4caf50; }
-            .footer { margin-top: 30px; padding: 20px; background-color: #f5f5f5; text-align: center; font-size: 12px; color: #666; }
-        </style>
-        """
-    
     # ============== PUBLIC METHODS ==============
     
-    def send_allocation_created_email(self, ocd_id: int, allocations: List[Dict], 
-                                       total_qty: float, mode: str, etd, 
-                                       user_id: int, allocation_number: str) -> Tuple[bool, str]:
-        """Send email when allocation is created"""
+    def send_allocation_created_email(
+        self, 
+        oc_info: Dict,
+        actor_info: Dict,
+        allocations: List[Dict], 
+        total_qty: float, 
+        mode: str, 
+        etd,
+        allocation_number: str
+    ) -> Tuple[bool, str]:
+        """
+        Send email when allocation is created.
+        
+        Args:
+            oc_info: Dict containing OC details from view (includes oc_creator_email, oc_creator_name)
+            actor_info: Dict with 'email' and 'name' of the person creating allocation
+            allocations: List of allocation items
+            total_qty: Total allocated quantity
+            mode: 'SOFT' or 'HARD'
+            etd: Allocated ETD date
+            allocation_number: Generated allocation number
+        """
         try:
-            # Get OC info
-            oc_info = self.get_oc_creator_info(ocd_id)
             if not oc_info:
-                return False, "Could not find OC information"
+                return False, "OC information not provided"
             
-            # Get allocator info
-            allocator = self.get_user_info(user_id)
-            allocator_email = allocator.get('email', '') if allocator else ''
-            allocator_name = allocator.get('full_name', 'Unknown') if allocator else 'Unknown'
-            
-            # Use creator email, fallback to allocator email, then to allocation CC
-            to_email = oc_info.get('creator_email') or allocator_email or self.allocation_cc
+            to_email = self._get_recipient_email(oc_info, actor_info)
             if not to_email:
                 return False, "No recipient email available"
             
-            # Get allocation summary
-            summary = self.get_allocation_summary(ocd_id)
-            
-            # Build email
-            subject = f"✅ [Allocation] {oc_info['oc_number']} - {self._format_number(total_qty)} {oc_info.get('standard_uom', '')} allocated for {oc_info.get('customer_name', 'Customer')}"
+            actor_email = actor_info.get('email', '')
+            actor_name = actor_info.get('name', 'Unknown')
+            standard_uom = oc_info.get('standard_uom', '')
             
             # Build sources table
             sources_html = ""
@@ -250,22 +182,26 @@ class AllocationEmailService:
                 source_type = alloc.get('source_type', 'SOFT')
                 if source_type:
                     supply_info = alloc.get('supply_info', {})
+                    ref = supply_info.get('batch_number') or supply_info.get('po_number') or supply_info.get('arrival_note_number') or 'N/A'
+                    warehouse = supply_info.get('warehouse') or supply_info.get('warehouse_name') or 'N/A'
                     sources_html += f"""
                     <tr>
                         <td>{source_type}</td>
-                        <td>{supply_info.get('batch_number', supply_info.get('po_number', supply_info.get('arrival_note_number', 'N/A')))}</td>
+                        <td>{ref}</td>
                         <td>{self._format_number(alloc.get('quantity', 0))}</td>
-                        <td>{supply_info.get('warehouse', supply_info.get('warehouse_name', 'N/A'))}</td>
+                        <td>{warehouse}</td>
                     </tr>
                     """
             
             if not sources_html:
-                sources_html = f"<tr><td colspan='4'>SOFT Allocation - {self._format_number(total_qty)} {oc_info.get('standard_uom', '')}</td></tr>"
+                sources_html = f"<tr><td colspan='4'>SOFT Allocation - {self._format_number(total_qty)} {standard_uom}</td></tr>"
             
             # Calculate progress
-            oc_qty = float(oc_info.get('selling_quantity', 1))
-            effective = summary.get('effective_allocated', 0)
-            progress_pct = min(100, (effective / oc_qty * 100)) if oc_qty > 0 else 0
+            oc_qty = float(oc_info.get('standard_quantity', oc_info.get('selling_quantity', 1)))
+            effective_allocated = float(oc_info.get('total_effective_allocated_qty_standard', 0)) + total_qty
+            progress_pct = min(100, (effective_allocated / oc_qty * 100)) if oc_qty > 0 else 0
+            
+            subject = f"✅ [Allocation] {oc_info.get('oc_number', 'N/A')} - {self._format_number(total_qty)} {standard_uom} allocated for {oc_info.get('customer', 'Customer')}"
             
             html_content = f"""
             <!DOCTYPE html>
@@ -287,7 +223,7 @@ class AllocationEmailService:
                                 </td>
                                 <td style="border: none;">
                                     <div class="label">Customer</div>
-                                    <div class="value">{oc_info.get('customer_name', 'N/A')}</div>
+                                    <div class="value">{oc_info.get('customer', 'N/A')}</div>
                                 </td>
                             </tr>
                             <tr>
@@ -323,10 +259,10 @@ class AllocationEmailService:
                     <div class="progress-bar">
                         <div class="progress-fill" style="width: {progress_pct}%;"></div>
                     </div>
-                    <p style="text-align: center;">{progress_pct:.1f}% Allocated ({self._format_number(effective)} / {self._format_number(oc_qty)} {oc_info.get('standard_uom', '')})</p>
+                    <p style="text-align: center;">{progress_pct:.1f}% Allocated ({self._format_number(effective_allocated)} / {self._format_number(oc_qty)} {standard_uom})</p>
                     
                     <div class="footer">
-                        <p>Created by: <strong>{allocator_name}</strong></p>
+                        <p>Created by: <strong>{actor_name}</strong></p>
                         <p>Date: {datetime.now().strftime('%d %b %Y %H:%M')}</p>
                         <p style="color: #999;">This is an automated notification from Prostech Allocation System</p>
                     </div>
@@ -335,15 +271,14 @@ class AllocationEmailService:
             </html>
             """
             
-            # Send email
             cc_emails = [self.allocation_cc]
-            if allocator_email and allocator_email != to_email:
-                cc_emails.append(allocator_email)
+            if actor_email and actor_email != to_email:
+                cc_emails.append(actor_email)
             
             return self._send_email(
                 to_email=to_email,
                 cc_emails=cc_emails,
-                reply_to=allocator_email or self.sender_email,
+                reply_to=actor_email or self.sender_email,
                 subject=subject,
                 html_content=html_content
             )
@@ -352,25 +287,49 @@ class AllocationEmailService:
             logger.error(f"Error sending allocation created email: {e}", exc_info=True)
             return False, str(e)
     
-    def send_allocation_cancelled_email(self, ocd_id: int, allocation_number: str,
-                                         cancelled_qty: float, reason: str, reason_category: str,
-                                         user_id: int) -> Tuple[bool, str]:
-        """Send email when allocation is cancelled"""
+    def send_allocation_cancelled_email(
+        self, 
+        oc_info: Dict,
+        actor_info: Dict,
+        allocation_number: str,
+        cancelled_qty: float, 
+        reason: str, 
+        reason_category: str
+    ) -> Tuple[bool, str]:
+        """
+        Send email when allocation is cancelled.
+        
+        Args:
+            oc_info: Dict containing OC details from view
+            actor_info: Dict with 'email' and 'name' of the person cancelling
+            allocation_number: The allocation being cancelled
+            cancelled_qty: Quantity being cancelled
+            reason: Cancellation reason
+            reason_category: Category of reason
+        """
         try:
-            oc_info = self.get_oc_creator_info(ocd_id)
             if not oc_info:
-                return False, "Could not find OC information"
+                return False, "OC information not provided"
             
-            canceller = self.get_user_info(user_id)
-            canceller_email = canceller.get('email', '') if canceller else ''
-            canceller_name = canceller.get('full_name', 'Unknown') if canceller else 'Unknown'
-            
-            # Use creator email, fallback to canceller email, then to allocation CC
-            to_email = oc_info.get('creator_email') or canceller_email or self.allocation_cc
+            to_email = self._get_recipient_email(oc_info, actor_info)
             if not to_email:
                 return False, "No recipient email available"
             
-            subject = f"❌ [Allocation Cancelled] {oc_info['oc_number']} - {self._format_number(cancelled_qty)} {oc_info.get('standard_uom', '')} released"
+            actor_email = actor_info.get('email', '')
+            actor_name = actor_info.get('name', 'Unknown')
+            standard_uom = oc_info.get('standard_uom', '')
+            
+            # Format reason category
+            category_labels = {
+                'CUSTOMER_REQUEST': '👤 Customer Request',
+                'SUPPLY_ISSUE': '⚠️ Supply Issue',
+                'QUALITY_ISSUE': '❌ Quality Issue',
+                'BUSINESS_DECISION': '💼 Business Decision',
+                'OTHER': '📝 Other'
+            }
+            category_label = category_labels.get(reason_category, reason_category)
+            
+            subject = f"❌ [Allocation Cancelled] {oc_info.get('oc_number', 'N/A')} - {self._format_number(cancelled_qty)} {standard_uom} released"
             
             html_content = f"""
             <!DOCTYPE html>
@@ -392,7 +351,7 @@ class AllocationEmailService:
                                 </td>
                                 <td style="border: none;">
                                     <div class="label">Customer</div>
-                                    <div class="value">{oc_info.get('customer_name', 'N/A')}</div>
+                                    <div class="value">{oc_info.get('customer', 'N/A')}</div>
                                 </td>
                             </tr>
                             <tr>
@@ -402,7 +361,7 @@ class AllocationEmailService:
                                 </td>
                                 <td style="border: none;">
                                     <div class="label">Cancelled Quantity</div>
-                                    <div class="value" style="color: #c62828;">{self._format_number(cancelled_qty)} {oc_info.get('standard_uom', '')}</div>
+                                    <div class="value" style="color: #c62828;">{self._format_number(cancelled_qty)} {standard_uom}</div>
                                 </td>
                             </tr>
                         </table>
@@ -410,18 +369,18 @@ class AllocationEmailService:
                     
                     <h3>📝 Cancellation Details</h3>
                     <div class="info-box">
-                        <div class="label">Reason Category</div>
-                        <div class="value">{reason_category.replace('_', ' ').title()}</div>
-                        <div class="label" style="margin-top: 10px;">Detailed Reason</div>
+                        <div class="label">Category</div>
+                        <div class="value">{category_label}</div>
+                        <div class="label" style="margin-top: 10px;">Reason</div>
                         <div class="value">{reason}</div>
                     </div>
                     
-                    <div style="background-color: #fff3e0; border-left: 4px solid #ff9800; padding: 15px; margin: 15px 0;">
-                        <strong>⚠️ Action Required:</strong> The released quantity is now available for re-allocation.
+                    <div style="background-color: #ffebee; border-left: 4px solid #c62828; padding: 15px; margin: 15px 0;">
+                        <strong>⚠️ Impact:</strong> {self._format_number(cancelled_qty)} {standard_uom} has been released and is now available for other allocations.
                     </div>
                     
                     <div class="footer">
-                        <p>Cancelled by: <strong>{canceller_name}</strong></p>
+                        <p>Cancelled by: <strong>{actor_name}</strong></p>
                         <p>Date: {datetime.now().strftime('%d %b %Y %H:%M')}</p>
                     </div>
                 </div>
@@ -430,13 +389,13 @@ class AllocationEmailService:
             """
             
             cc_emails = [self.allocation_cc]
-            if canceller_email and canceller_email != to_email:
-                cc_emails.append(canceller_email)
+            if actor_email and actor_email != to_email:
+                cc_emails.append(actor_email)
             
             return self._send_email(
                 to_email=to_email,
                 cc_emails=cc_emails,
-                reply_to=canceller_email or self.sender_email,
+                reply_to=actor_email or self.sender_email,
                 subject=subject,
                 html_content=html_content
             )
@@ -445,42 +404,64 @@ class AllocationEmailService:
             logger.error(f"Error sending cancellation email: {e}", exc_info=True)
             return False, str(e)
     
-    def send_allocation_etd_updated_email(self, ocd_id: int, allocation_number: str,
-                                           previous_etd, new_etd, pending_qty: float,
-                                           update_count: int, user_id: int) -> Tuple[bool, str]:
-        """Send email when allocation ETD is updated"""
+    def send_allocation_etd_updated_email(
+        self, 
+        oc_info: Dict,
+        actor_info: Dict,
+        allocation_number: str,
+        previous_etd,
+        new_etd,
+        pending_qty: float,
+        update_count: int = 1
+    ) -> Tuple[bool, str]:
+        """
+        Send email when allocation ETD is updated.
+        
+        Args:
+            oc_info: Dict containing OC details from view
+            actor_info: Dict with 'email' and 'name' of the person updating
+            allocation_number: The allocation being updated
+            previous_etd: Previous ETD date
+            new_etd: New ETD date
+            pending_qty: Quantity affected by the change
+            update_count: Number of times this allocation has been updated
+        """
         try:
-            oc_info = self.get_oc_creator_info(ocd_id)
             if not oc_info:
-                return False, "Could not find OC information"
+                return False, "OC information not provided"
             
-            updater = self.get_user_info(user_id)
-            updater_email = updater.get('email', '') if updater else ''
-            updater_name = updater.get('full_name', 'Unknown') if updater else 'Unknown'
-            
-            # Use creator email, fallback to updater email, then to allocation CC
-            to_email = oc_info.get('creator_email') or updater_email or self.allocation_cc
+            to_email = self._get_recipient_email(oc_info, actor_info)
             if not to_email:
                 return False, "No recipient email available"
             
+            actor_email = actor_info.get('email', '')
+            actor_name = actor_info.get('name', 'Unknown')
+            standard_uom = oc_info.get('standard_uom', '')
+            
             # Calculate days difference
             try:
-                from datetime import datetime
+                from datetime import date
                 if isinstance(previous_etd, str):
-                    prev = datetime.strptime(previous_etd[:10], '%Y-%m-%d')
+                    prev = datetime.strptime(previous_etd[:10], '%Y-%m-%d').date()
+                elif isinstance(previous_etd, datetime):
+                    prev = previous_etd.date()
                 else:
                     prev = previous_etd
+                    
                 if isinstance(new_etd, str):
-                    new = datetime.strptime(str(new_etd)[:10], '%Y-%m-%d')
+                    new = datetime.strptime(new_etd[:10], '%Y-%m-%d').date()
+                elif isinstance(new_etd, datetime):
+                    new = new_etd.date()
                 else:
                     new = new_etd
+                    
                 days_diff = (new - prev).days
             except:
                 days_diff = 0
             
             direction = "delayed" if days_diff > 0 else "advanced"
             
-            subject = f"📅 [Allocation Update] {oc_info['oc_number']} - ETD changed: {self._format_date(previous_etd)} → {self._format_date(new_etd)}"
+            subject = f"📅 [Allocation Update] {oc_info.get('oc_number', 'N/A')} - ETD changed: {self._format_date(previous_etd)} → {self._format_date(new_etd)}"
             
             html_content = f"""
             <!DOCTYPE html>
@@ -502,7 +483,7 @@ class AllocationEmailService:
                                 </td>
                                 <td style="border: none;">
                                     <div class="label">Customer</div>
-                                    <div class="value">{oc_info.get('customer_name', 'N/A')}</div>
+                                    <div class="value">{oc_info.get('customer', 'N/A')}</div>
                                 </td>
                             </tr>
                             <tr>
@@ -512,7 +493,7 @@ class AllocationEmailService:
                                 </td>
                                 <td style="border: none;">
                                     <div class="label">Affected Quantity</div>
-                                    <div class="value">{self._format_number(pending_qty)} {oc_info.get('standard_uom', '')}</div>
+                                    <div class="value">{self._format_number(pending_qty)} {standard_uom}</div>
                                 </td>
                             </tr>
                         </table>
@@ -531,7 +512,7 @@ class AllocationEmailService:
                     <p style="text-align: center; color: #666;">This is update #{update_count} for this allocation</p>
                     
                     <div class="footer">
-                        <p>Updated by: <strong>{updater_name}</strong></p>
+                        <p>Updated by: <strong>{actor_name}</strong></p>
                         <p>Date: {datetime.now().strftime('%d %b %Y %H:%M')}</p>
                     </div>
                 </div>
@@ -540,13 +521,13 @@ class AllocationEmailService:
             """
             
             cc_emails = [self.allocation_cc]
-            if updater_email and updater_email != to_email:
-                cc_emails.append(updater_email)
+            if actor_email and actor_email != to_email:
+                cc_emails.append(actor_email)
             
             return self._send_email(
                 to_email=to_email,
                 cc_emails=cc_emails,
-                reply_to=updater_email or self.sender_email,
+                reply_to=actor_email or self.sender_email,
                 subject=subject,
                 html_content=html_content
             )
@@ -555,25 +536,37 @@ class AllocationEmailService:
             logger.error(f"Error sending ETD update email: {e}", exc_info=True)
             return False, str(e)
     
-    def send_cancellation_reversed_email(self, ocd_id: int, allocation_number: str,
-                                          restored_qty: float, reversal_reason: str,
-                                          user_id: int) -> Tuple[bool, str]:
-        """Send email when cancellation is reversed"""
+    def send_cancellation_reversed_email(
+        self, 
+        oc_info: Dict,
+        actor_info: Dict,
+        allocation_number: str,
+        restored_qty: float, 
+        reversal_reason: str
+    ) -> Tuple[bool, str]:
+        """
+        Send email when cancellation is reversed.
+        
+        Args:
+            oc_info: Dict containing OC details from view
+            actor_info: Dict with 'email' and 'name' of the person reversing
+            allocation_number: The allocation being restored
+            restored_qty: Quantity being restored
+            reversal_reason: Reason for reversal
+        """
         try:
-            oc_info = self.get_oc_creator_info(ocd_id)
             if not oc_info:
-                return False, "Could not find OC information"
+                return False, "OC information not provided"
             
-            reverser = self.get_user_info(user_id)
-            reverser_email = reverser.get('email', '') if reverser else ''
-            reverser_name = reverser.get('full_name', 'Unknown') if reverser else 'Unknown'
-            
-            # Use creator email, fallback to reverser email, then to allocation CC
-            to_email = oc_info.get('creator_email') or reverser_email or self.allocation_cc
+            to_email = self._get_recipient_email(oc_info, actor_info)
             if not to_email:
                 return False, "No recipient email available"
             
-            subject = f"🔄 [Allocation Restored] {oc_info['oc_number']} - {self._format_number(restored_qty)} {oc_info.get('standard_uom', '')} re-allocated"
+            actor_email = actor_info.get('email', '')
+            actor_name = actor_info.get('name', 'Unknown')
+            standard_uom = oc_info.get('standard_uom', '')
+            
+            subject = f"🔄 [Allocation Restored] {oc_info.get('oc_number', 'N/A')} - {self._format_number(restored_qty)} {standard_uom} re-allocated"
             
             html_content = f"""
             <!DOCTYPE html>
@@ -595,7 +588,7 @@ class AllocationEmailService:
                                 </td>
                                 <td style="border: none;">
                                     <div class="label">Customer</div>
-                                    <div class="value">{oc_info.get('customer_name', 'N/A')}</div>
+                                    <div class="value">{oc_info.get('customer', 'N/A')}</div>
                                 </td>
                             </tr>
                             <tr>
@@ -605,7 +598,7 @@ class AllocationEmailService:
                                 </td>
                                 <td style="border: none;">
                                     <div class="label">Restored Quantity</div>
-                                    <div class="value" style="color: #7b1fa2;">{self._format_number(restored_qty)} {oc_info.get('standard_uom', '')}</div>
+                                    <div class="value" style="color: #7b1fa2;">{self._format_number(restored_qty)} {standard_uom}</div>
                                 </td>
                             </tr>
                         </table>
@@ -622,7 +615,7 @@ class AllocationEmailService:
                     </div>
                     
                     <div class="footer">
-                        <p>Reversed by: <strong>{reverser_name}</strong></p>
+                        <p>Reversed by: <strong>{actor_name}</strong></p>
                         <p>Date: {datetime.now().strftime('%d %b %Y %H:%M')}</p>
                     </div>
                 </div>
@@ -631,13 +624,13 @@ class AllocationEmailService:
             """
             
             cc_emails = [self.allocation_cc]
-            if reverser_email and reverser_email != to_email:
-                cc_emails.append(reverser_email)
+            if actor_email and actor_email != to_email:
+                cc_emails.append(actor_email)
             
             return self._send_email(
                 to_email=to_email,
                 cc_emails=cc_emails,
-                reply_to=reverser_email or self.sender_email,
+                reply_to=actor_email or self.sender_email,
                 subject=subject,
                 html_content=html_content
             )

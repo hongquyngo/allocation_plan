@@ -1,6 +1,11 @@
 """
-Cancel Allocation Modal - Self-contained modal for cancelling allocations
-Extracted from main page for better organization
+Cancel Allocation Modal - REFACTORED v2.0
+==========================================
+Self-contained modal for cancelling allocations with simplified email notifications.
+
+CHANGES:
+- Email service now receives oc_info and actor_info directly
+- Removed ocd_id + user_id based queries for email
 """
 import streamlit as st
 import time
@@ -19,6 +24,14 @@ validator = AllocationValidator()
 uom_converter = UOMConverter()
 auth = AuthManager()
 email_service = AllocationEmailService()
+
+
+def get_actor_info() -> dict:
+    """Get current user info for email notifications"""
+    return {
+        'email': st.session_state.user.get('email', ''),
+        'name': st.session_state.user.get('full_name', st.session_state.user.get('username', 'Unknown'))
+    }
 
 
 def return_to_history_if_context():
@@ -67,12 +80,10 @@ def show_cancel_allocation_modal():
         selling_uom = oc_info.get('selling_uom', 'pcs')
         conversion = oc_info.get('uom_conversion', '1')
     else:
-        # Try to get from allocation data itself
         standard_uom = allocation.get('standard_uom', 'pcs')
         selling_uom = allocation.get('selling_uom', 'pcs')
         conversion = allocation.get('uom_conversion', '1')
         
-        # If still not available, use defaults
         if not standard_uom:
             standard_uom = 'pcs'
         if not selling_uom:
@@ -184,7 +195,6 @@ def show_cancel_allocation_modal():
     col1, col2 = st.columns(2)
     
     with col1:
-        # Determine if button should be disabled
         button_disabled = len(errors) > 0 or cancel_qty <= 0 or st.session_state.cancel_processing
         
         if st.button(
@@ -193,7 +203,6 @@ def show_cancel_allocation_modal():
             use_container_width=True,
             disabled=button_disabled
         ):
-            # Store values and set processing flag
             st.session_state.cancel_processing = True
             st.session_state._cancel_data = {
                 'standard_uom': standard_uom,
@@ -215,7 +224,6 @@ def show_cancel_allocation_modal():
     
     # Process cancellation when flag is set
     if st.session_state.cancel_processing:
-        # Retrieve saved data
         saved_data = st.session_state.get('_cancel_data', {})
         saved_standard_uom = saved_data.get('standard_uom', standard_uom)
         saved_selling_uom = saved_data.get('selling_uom', selling_uom)
@@ -258,31 +266,24 @@ def show_cancel_allocation_modal():
                         else:
                             st.write(f"📦 Remaining: {format_number(remaining_qty)} {saved_standard_uom}")
                     
-                    # Step 2: Send email notification
+                    # Step 2: Send email notification - REFACTORED
                     status.update(label="📧 Sending email notification...", state="running")
                     
                     try:
-                        ocd_id = None
-                        if st.session_state.context.get('return_to_history'):
-                            ocd_id = st.session_state.context['return_to_history'].get('oc_detail_id')
-                        if not ocd_id:
-                            ocd_id = st.session_state.selections.get('oc_for_history')
+                        actor_info = get_actor_info()
                         
-                        if ocd_id:
-                            email_success, email_msg = email_service.send_allocation_cancelled_email(
-                                ocd_id=ocd_id,
-                                allocation_number=allocation.get('allocation_number', ''),
-                                cancelled_qty=saved_cancel_qty,
-                                reason=saved_reason,
-                                reason_category=saved_reason_category,
-                                user_id=user_id
-                            )
-                            if email_success:
-                                st.write("✅ Email notification sent")
-                            else:
-                                st.write(f"⚠️ Email not sent: {email_msg}")
+                        email_success, email_msg = email_service.send_allocation_cancelled_email(
+                            oc_info=oc_info,  # Pass oc_info directly
+                            actor_info=actor_info,
+                            allocation_number=allocation.get('allocation_number', ''),
+                            cancelled_qty=saved_cancel_qty,
+                            reason=saved_reason,
+                            reason_category=saved_reason_category
+                        )
+                        if email_success:
+                            st.write("✅ Email notification sent")
                         else:
-                            st.write("⚠️ Email not sent: Missing OC reference")
+                            st.write(f"⚠️ Email not sent: {email_msg}")
                     except Exception as email_error:
                         st.write(f"⚠️ Email error: {str(email_error)}")
                     
@@ -301,7 +302,6 @@ def show_cancel_allocation_modal():
                     st.rerun()
                     
                 else:
-                    # Handle error
                     error_msg = result.get('error', 'Unknown error occurred')
                     status.update(label="❌ Cancellation failed", state="error")
                     st.error(f"❌ {error_msg}")
