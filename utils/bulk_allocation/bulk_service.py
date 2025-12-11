@@ -6,6 +6,7 @@ Business logic for bulk allocation operations including:
 - Database operations
 - Allocation context creation
 - Commit and rollback
+- Split allocation support (multiple ETDs per OC)
 """
 import logging
 from datetime import datetime
@@ -189,79 +190,60 @@ class BulkAllocationService:
             
         except Exception as e:
             logger.error(f"Error validating user {user_id}: {e}")
-            return False, "Unable to validate user session. Please login again.", None
-    
-    # ==================== ALLOCATION NUMBER GENERATION ====================
+            return False, f"Error validating user: {str(e)}", None
     
     def _generate_allocation_number(self, conn) -> str:
-        """Generate unique allocation number"""
-        try:
-            now = datetime.now()
-            year_month = now.strftime('%Y%m')
-            
-            query = text("""
-                SELECT allocation_number 
-                FROM allocation_plans 
-                WHERE allocation_number LIKE :prefix
-                ORDER BY id DESC 
-                LIMIT 1
-            """)
-            
-            prefix = f"ALL-{year_month}-%"
-            result = conn.execute(query, {'prefix': prefix}).fetchone()
-            
-            if result:
-                last_number = result[0]
-                sequence = int(last_number.split('-')[-1]) + 1
-            else:
-                sequence = 1
-            
-            return f"ALL-{year_month}-{sequence:04d}"
-            
-        except Exception as e:
-            logger.error(f"Error generating allocation number: {e}")
-            return f"ALL-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        """Generate unique allocation number: ALL-YYYYMM-XXXX"""
+        today = datetime.now()
+        prefix = f"ALL-{today.strftime('%Y%m')}-"
+        
+        query = text("""
+            SELECT MAX(CAST(SUBSTRING(allocation_number, -4) AS UNSIGNED)) as max_seq
+            FROM allocation_plans
+            WHERE allocation_number LIKE :prefix
+        """)
+        
+        result = conn.execute(query, {'prefix': f"{prefix}%"}).fetchone()
+        max_seq = result.max_seq if result and result.max_seq else 0
+        
+        new_seq = (max_seq or 0) + 1
+        return f"{prefix}{new_seq:04d}"
     
-    # ==================== MAIN COMMIT FUNCTION ====================
+    # ==================== MAIN COMMIT METHOD ====================
     
-    def commit_bulk_allocation(self, 
-                               allocation_results: List[Dict],
-                               demands_dict: Dict[int, Dict],
-                               scope: Dict,
-                               strategy_config: Dict,
-                               user_id: int,
-                               notes: str = "") -> Dict[str, Any]:
+    def commit_bulk_allocation(
+        self,
+        allocation_results: List[Dict],
+        demands_dict: Dict[int, Dict],
+        scope: Dict,
+        strategy_config: Dict,
+        user_id: int,
+        notes: str = None,
+        split_allocations: Dict = None  # NEW: {ocd_id: [{'qty': X, 'etd': Y}, ...]}
+    ) -> Dict:
         """
         Commit bulk allocation to database
         
         Args:
             allocation_results: List of allocation results with final_qty
-            demands_dict: Dict mapping ocd_id -> OC info
-            scope: Scope configuration
+            demands_dict: Dict of ocd_id -> demand info
+            scope: Allocation scope (brands, customers, etc.)
             strategy_config: Strategy configuration
             user_id: User performing the allocation
             notes: Optional notes
-        
-        Returns:
-            Dict with success, allocation_number, details, etc.
-        """
-        try:
-            # Early validation of user_id
-            if not user_id:
-                logger.error("commit_bulk_allocation called without user_id")
-                return {
-                    'success': False,
-                    'error': "Session error. Please login again."
-                }
+            split_allocations: Optional split allocations for multiple ETDs per OC
             
+        Returns:
+            Dict with success status, allocation_number, etc.
+        """
+        split_allocations = split_allocations or {}
+        
+        try:
             with self.db_transaction() as conn:
                 # Validate user
-                user_valid, user_error, user_info = self._validate_user_id(conn, user_id)
-                if not user_valid:
-                    return {
-                        'success': False,
-                        'error': user_error
-                    }
+                is_valid, error_msg, user_info = self._validate_user_id(conn, user_id)
+                if not is_valid:
+                    raise UserValidationError(error_msg)
                 
                 # Check permission
                 if not self.validator.check_permission(user_info['role'], 'bulk_allocate'):
@@ -290,7 +272,8 @@ class BulkAllocationService:
                     scope=scope,
                     strategy_config=strategy_config,
                     allocation_results=valid_allocations,
-                    user_info=user_info
+                    user_info=user_info,
+                    split_allocations=split_allocations
                 )
                 
                 # Create allocation plan (1 row)
@@ -315,10 +298,12 @@ class BulkAllocationService:
                 )
                 
                 # Create allocation details (N rows)
+                # Handle split allocations: create multiple rows for same OC if split
                 detail_ids = []
                 total_allocated = Decimal('0')
                 products_affected = set()
                 customers_affected = set()
+                split_count = 0
                 
                 for alloc in valid_allocations:
                     ocd_id = int(alloc['ocd_id'])
@@ -328,59 +313,55 @@ class BulkAllocationService:
                         logger.warning(f"OC info not found for ocd_id {ocd_id}")
                         continue
                     
-                    allocated_qty = self._to_decimal(alloc['final_qty'])
+                    # Check if this OC has splits
+                    splits = split_allocations.get(ocd_id, [])
                     
-                    # Determine ETD - use OC's ETD as allocated_etd for bulk
-                    etd = oc_info.get('etd')
-                    allocated_etd = alloc.get('allocated_etd') or etd
-                    
-                    # Determine allocation mode and supply source
-                    allocation_mode = strategy_config.get('allocation_mode', 'SOFT')
-                    supply_source_type = None
-                    supply_source_id = None
-                    
-                    # Insert allocation detail
-                    detail_query = text("""
-                        INSERT INTO allocation_details (
-                            allocation_plan_id, allocation_mode, demand_type, 
-                            demand_reference_id, demand_number, product_id, pt_code,
-                            customer_code, customer_name, legal_entity_name,
-                            requested_qty, allocated_qty, delivered_qty,
-                            etd, allocated_etd, status, notes,
-                            supply_source_type, supply_source_id,
-                            etd_update_count, last_updated_etd_date
-                        ) VALUES (
-                            :allocation_plan_id, :allocation_mode, 'OC',
-                            :demand_reference_id, :demand_number, :product_id, :pt_code,
-                            :customer_code, :customer_name, :legal_entity_name,
-                            :requested_qty, :allocated_qty, 0,
-                            :etd, :allocated_etd, 'ALLOCATED', :notes,
-                            :supply_source_type, :supply_source_id,
-                            0, NULL
+                    if splits and len(splits) > 1:
+                        # Insert multiple records for split allocation
+                        for split_idx, split in enumerate(splits):
+                            split_qty = self._to_decimal(split.get('qty', 0))
+                            split_etd = split.get('etd')
+                            
+                            if split_qty <= 0:
+                                continue
+                            
+                            detail_id = self._insert_allocation_detail(
+                                conn=conn,
+                                allocation_plan_id=allocation_plan_id,
+                                ocd_id=ocd_id,
+                                oc_info=oc_info,
+                                allocated_qty=split_qty,
+                                allocated_etd=split_etd,
+                                strategy_config=strategy_config,
+                                split_index=split_idx + 1,
+                                total_splits=len(splits)
+                            )
+                            
+                            if detail_id:
+                                detail_ids.append(detail_id)
+                                total_allocated += split_qty
+                        
+                        split_count += 1
+                    else:
+                        # Single allocation (no split)
+                        allocated_qty = self._to_decimal(alloc['final_qty'])
+                        etd = oc_info.get('etd')
+                        allocated_etd = alloc.get('allocated_etd') or etd
+                        
+                        detail_id = self._insert_allocation_detail(
+                            conn=conn,
+                            allocation_plan_id=allocation_plan_id,
+                            ocd_id=ocd_id,
+                            oc_info=oc_info,
+                            allocated_qty=allocated_qty,
+                            allocated_etd=allocated_etd,
+                            strategy_config=strategy_config
                         )
-                    """)
+                        
+                        if detail_id:
+                            detail_ids.append(detail_id)
+                            total_allocated += allocated_qty
                     
-                    detail_result = conn.execute(detail_query, {
-                        'allocation_plan_id': allocation_plan_id,
-                        'allocation_mode': allocation_mode,
-                        'demand_reference_id': ocd_id,
-                        'demand_number': oc_info.get('oc_number', ''),
-                        'product_id': int(oc_info.get('product_id', 0)),
-                        'pt_code': oc_info.get('pt_code', ''),
-                        'customer_code': oc_info.get('customer_code', ''),
-                        'customer_name': oc_info.get('customer', ''),
-                        'legal_entity_name': oc_info.get('legal_entity', ''),
-                        'requested_qty': self._to_decimal(oc_info.get('pending_qty', 0)),
-                        'allocated_qty': allocated_qty,
-                        'etd': etd,
-                        'allocated_etd': allocated_etd,
-                        'notes': f"Bulk allocation via {strategy_config.get('strategy_type', 'HYBRID')} strategy",
-                        'supply_source_type': supply_source_type,
-                        'supply_source_id': supply_source_id
-                    })
-                    
-                    detail_ids.append(detail_result.lastrowid)
-                    total_allocated += allocated_qty
                     products_affected.add(int(oc_info.get('product_id', 0)))
                     customers_affected.add(oc_info.get('customer_code', ''))
                 
@@ -389,7 +370,7 @@ class BulkAllocationService:
                 
                 logger.info(
                     f"Successfully committed bulk allocation {allocation_number}: "
-                    f"{len(detail_ids)} OCs, {len(products_affected)} products, "
+                    f"{len(detail_ids)} records ({split_count} splits), {len(products_affected)} products, "
                     f"total qty: {self._to_float(total_allocated):.0f}"
                 )
                 
@@ -401,6 +382,7 @@ class BulkAllocationService:
                     'total_allocated': self._to_float(total_allocated),
                     'products_affected': len(products_affected),
                     'customers_affected': len(customers_affected),
+                    'split_count': split_count,
                     'creator_id': user_id,
                     'creator_username': user_info['username']
                 }
@@ -423,12 +405,87 @@ class BulkAllocationService:
                 'technical_error': str(e)
             }
     
+    def _insert_allocation_detail(
+        self,
+        conn,
+        allocation_plan_id: int,
+        ocd_id: int,
+        oc_info: Dict,
+        allocated_qty: Decimal,
+        allocated_etd,
+        strategy_config: Dict,
+        split_index: int = None,
+        total_splits: int = None
+    ) -> Optional[int]:
+        """Insert a single allocation detail record"""
+        
+        etd = oc_info.get('etd')
+        allocation_mode = strategy_config.get('allocation_mode', 'SOFT')
+        
+        # Build notes
+        base_notes = f"Bulk allocation via {strategy_config.get('strategy_type', 'HYBRID')} strategy"
+        if split_index and total_splits:
+            base_notes += f" (Split {split_index}/{total_splits})"
+        
+        detail_query = text("""
+            INSERT INTO allocation_details (
+                allocation_plan_id, allocation_mode, demand_type, 
+                demand_reference_id, demand_number, product_id, pt_code,
+                customer_code, customer_name, legal_entity_name,
+                requested_qty, allocated_qty, delivered_qty,
+                etd, allocated_etd, status, notes,
+                supply_source_type, supply_source_id,
+                etd_update_count, last_updated_etd_date
+            ) VALUES (
+                :allocation_plan_id, :allocation_mode, 'OC',
+                :demand_reference_id, :demand_number, :product_id, :pt_code,
+                :customer_code, :customer_name, :legal_entity_name,
+                :requested_qty, :allocated_qty, 0,
+                :etd, :allocated_etd, 'ALLOCATED', :notes,
+                :supply_source_type, :supply_source_id,
+                0, NULL
+            )
+        """)
+        
+        try:
+            result = conn.execute(detail_query, {
+                'allocation_plan_id': allocation_plan_id,
+                'allocation_mode': allocation_mode,
+                'demand_reference_id': ocd_id,
+                'demand_number': oc_info.get('oc_number', ''),
+                'product_id': int(oc_info.get('product_id', 0)),
+                'pt_code': oc_info.get('pt_code', ''),
+                'customer_code': oc_info.get('customer_code', ''),
+                'customer_name': oc_info.get('customer', ''),
+                'legal_entity_name': oc_info.get('legal_entity', ''),
+                'requested_qty': self._to_decimal(oc_info.get('pending_qty', 0)),
+                'allocated_qty': allocated_qty,
+                'etd': etd,
+                'allocated_etd': allocated_etd,
+                'notes': base_notes,
+                'supply_source_type': None,
+                'supply_source_id': None
+            })
+            
+            return result.lastrowid
+            
+        except Exception as e:
+            logger.error(f"Error inserting allocation detail for ocd_id {ocd_id}: {e}")
+            return None
+    
     # ==================== CONTEXT BUILDERS ====================
     
-    def _build_allocation_context(self, scope: Dict, strategy_config: Dict,
-                                   allocation_results: List[Dict],
-                                   user_info: Dict) -> Dict:
+    def _build_allocation_context(
+        self, 
+        scope: Dict, 
+        strategy_config: Dict,
+        allocation_results: List[Dict],
+        user_info: Dict,
+        split_allocations: Dict = None
+    ) -> Dict:
         """Build allocation context JSON for audit trail"""
+        
+        split_allocations = split_allocations or {}
         
         # Calculate summary statistics
         total_qty = sum(float(a.get('final_qty', 0)) for a in allocation_results)
@@ -449,6 +506,16 @@ class BulkAllocationService:
                     'original_suggested': suggested,
                     'final_allocated': final,
                     'adjustment_reason': 'manual'
+                })
+        
+        # Track splits
+        split_info = []
+        for ocd_id, splits in split_allocations.items():
+            if len(splits) > 1:
+                split_info.append({
+                    'ocd_id': ocd_id,
+                    'split_count': len(splits),
+                    'splits': [{'qty': s.get('qty'), 'etd': str(s.get('etd', ''))} for s in splits]
                 })
         
         return {
@@ -477,6 +544,7 @@ class BulkAllocationService:
                 'avg_coverage_percent': round(avg_coverage, 2)
             },
             'adjustments': adjustments,
+            'split_allocations': split_info,
             'created_by': {
                 'user_id': user_info.get('id'),
                 'username': user_info.get('username'),

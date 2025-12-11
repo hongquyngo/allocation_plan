@@ -879,7 +879,8 @@ def render_step3_commit():
         },
         use_container_width=True,
         hide_index=True,
-        num_rows="fixed"
+        num_rows="fixed",
+        key="bulk_allocation_editor"  # Key to stabilize state
     )
     
     # Save adjustments (both qty and etd)
@@ -930,38 +931,36 @@ def render_step3_commit():
         if not split_candidates:
             st.info("No OCs with allocation to split. Run simulation first.")
         else:
-            # Select OC to split
-            selected_oc = st.selectbox(
+            # Select OC to split - outside form
+            selected_idx = st.selectbox(
                 "Select OC to split",
-                options=split_candidates,
-                format_func=lambda x: f"{x['oc_number']} | {x['product']} | Qty: {x['final_qty']:.0f}",
+                options=range(len(split_candidates)),
+                format_func=lambda i: f"{split_candidates[i]['oc_number']} | {split_candidates[i]['product']} | Qty: {split_candidates[i]['final_qty']:.0f}",
                 key="split_oc_selector"
             )
             
-            if selected_oc:
-                ocd_id = selected_oc['ocd_id']
-                max_qty = selected_oc['max_allocatable']
-                default_etd = selected_oc['oc_etd']
-                
-                st.markdown(f"**Max allocatable:** {max_qty:.0f} | **OC ETD:** {default_etd}")
-                
-                # Initialize split if not exists
-                if ocd_id not in st.session_state.split_allocations:
-                    # Default: single allocation with original qty and ETD
-                    st.session_state.split_allocations[ocd_id] = [
-                        {'qty': selected_oc['final_qty'], 'etd': default_etd}
-                    ]
-                
-                splits = st.session_state.split_allocations[ocd_id]
-                
-                # Display split entries
+            selected_oc = split_candidates[selected_idx]
+            ocd_id = selected_oc['ocd_id']
+            max_qty = selected_oc['max_allocatable']
+            default_etd = selected_oc['oc_etd']
+            
+            st.markdown(f"**Max allocatable:** {max_qty:.0f} | **OC ETD:** {default_etd}")
+            
+            # Initialize split if not exists
+            if ocd_id not in st.session_state.split_allocations:
+                st.session_state.split_allocations[ocd_id] = [
+                    {'qty': selected_oc['final_qty'], 'etd': default_etd}
+                ]
+            
+            splits = st.session_state.split_allocations[ocd_id]
+            
+            # Use form to batch changes
+            with st.form(key=f"split_form_{ocd_id}"):
                 st.markdown("**Split Entries:**")
                 
-                total_split_qty = 0
-                updated_splits = []
-                
+                form_splits = []
                 for idx, split in enumerate(splits):
-                    col1, col2, col3 = st.columns([2, 2, 1])
+                    col1, col2 = st.columns([2, 2])
                     
                     with col1:
                         split_qty = st.number_input(
@@ -970,63 +969,70 @@ def render_step3_commit():
                             max_value=float(max_qty),
                             value=float(split.get('qty', 0)),
                             step=1.0,
-                            key=f"split_qty_{ocd_id}_{idx}"
+                            key=f"form_split_qty_{ocd_id}_{idx}"
                         )
                     
                     with col2:
                         split_etd = st.date_input(
                             f"ETD #{idx+1}",
-                            value=split.get('etd', default_etd),
-                            key=f"split_etd_{ocd_id}_{idx}"
+                            value=split.get('etd') if split.get('etd') else default_etd,
+                            key=f"form_split_etd_{ocd_id}_{idx}"
                         )
                     
-                    with col3:
-                        if len(splits) > 1:
-                            if st.button("🗑️", key=f"remove_split_{ocd_id}_{idx}"):
-                                # Mark for removal
-                                continue
-                        else:
-                            st.write("")  # Placeholder
-                    
-                    if split_qty > 0:
-                        updated_splits.append({'qty': split_qty, 'etd': split_etd})
-                        total_split_qty += split_qty
+                    form_splits.append({'qty': split_qty, 'etd': split_etd})
                 
-                # Update session state
-                st.session_state.split_allocations[ocd_id] = updated_splits if updated_splits else [{'qty': 0, 'etd': default_etd}]
-                
-                # Add new split button
-                add_col1, add_col2 = st.columns([1, 3])
-                with add_col1:
-                    if st.button("➕ Add Split", key=f"add_split_{ocd_id}"):
-                        remaining = max_qty - total_split_qty
-                        st.session_state.split_allocations[ocd_id].append({
-                            'qty': remaining if remaining > 0 else 0,
-                            'etd': default_etd
-                        })
-                        st.rerun()
-                
-                # Show totals
-                remaining = max_qty - total_split_qty
-                if total_split_qty > max_qty:
-                    st.error(f"⚠️ Total split qty ({total_split_qty:.0f}) exceeds max allocatable ({max_qty:.0f})")
-                elif remaining > 0:
-                    st.warning(f"ℹ️ Remaining unallocated: {remaining:.0f}")
-                else:
-                    st.success(f"✅ Total: {total_split_qty:.0f} / {max_qty:.0f}")
-                
-                # Remove from simple adjustments if using splits
+                # Form submit buttons
+                col_save, col_add, col_remove = st.columns([1, 1, 1])
+                with col_save:
+                    save_clicked = st.form_submit_button("💾 Save Splits", type="primary")
+                with col_add:
+                    add_clicked = st.form_submit_button("➕ Add Split")
+                with col_remove:
+                    remove_clicked = st.form_submit_button("🗑️ Remove Last")
+            
+            # Handle form submissions
+            if save_clicked:
+                # Filter out zero qty splits
+                valid_splits = [s for s in form_splits if s['qty'] > 0]
+                st.session_state.split_allocations[ocd_id] = valid_splits if valid_splits else [{'qty': 0, 'etd': default_etd}]
+                st.success("Splits saved!")
+                st.rerun()
+            
+            if add_clicked:
+                # Add to session state, then form will reload
+                total_so_far = sum(s['qty'] for s in form_splits)
+                remaining = max(0, max_qty - total_so_far)
+                st.session_state.split_allocations[ocd_id] = form_splits + [{'qty': remaining, 'etd': default_etd}]
+                st.rerun()
+            
+            if remove_clicked and len(splits) > 1:
+                st.session_state.split_allocations[ocd_id] = form_splits[:-1] if len(form_splits) > 1 else [form_splits[0]]
+                st.rerun()
+            
+            # Show validation
+            total_split_qty = sum(s['qty'] for s in st.session_state.split_allocations[ocd_id])
+            if total_split_qty > max_qty:
+                st.error(f"⚠️ Total split qty ({total_split_qty:.0f}) exceeds max allocatable ({max_qty:.0f})")
+            elif total_split_qty > 0 and total_split_qty < max_qty:
+                st.warning(f"ℹ️ Remaining unallocated: {max_qty - total_split_qty:.0f}")
+            elif total_split_qty > 0:
+                st.success(f"✅ Total: {total_split_qty:.0f} / {max_qty:.0f}")
+            
+            # Remove from simple adjustments if using splits
+            if len(st.session_state.split_allocations.get(ocd_id, [])) > 1:
                 if ocd_id in st.session_state.adjusted_allocations:
                     del st.session_state.adjusted_allocations[ocd_id]
-            
-            # Show summary of all splits
-            if st.session_state.split_allocations:
-                st.markdown("---")
-                st.markdown("**Active Splits:**")
-                for ocd_id, splits in st.session_state.split_allocations.items():
-                    oc_info = edit_df[edit_df['ocd_id'] == ocd_id].iloc[0] if len(edit_df[edit_df['ocd_id'] == ocd_id]) > 0 else None
-                    if oc_info is not None and len(splits) > 1:
-                        st.caption(f"• {oc_info['oc_number']}: {len(splits)} splits → {sum(s['qty'] for s in splits):.0f} total")
+        
+        # Show summary of all active splits
+        active_splits = {k: v for k, v in st.session_state.split_allocations.items() if len(v) > 1}
+        if active_splits:
+            st.markdown("---")
+            st.markdown("**Active Splits:**")
+            for ocd_id, splits in active_splits.items():
+                oc_match = edit_df[edit_df['ocd_id'] == ocd_id]
+                if len(oc_match) > 0:
+                    oc_info = oc_match.iloc[0]
+                    st.caption(f"• {oc_info['oc_number']}: {len(splits)} splits → {sum(s['qty'] for s in splits):.0f} total")
     
     # Recalculate metrics with adjustments (including splits)
     final_total = 0
@@ -1198,14 +1204,15 @@ def commit_bulk_allocation(edited_df: pd.DataFrame, original_df: pd.DataFrame, n
             'urgent_threshold_days': st.session_state.urgent_threshold_days
         }
         
-        # Commit
+        # Commit with split allocations
         result = services['service'].commit_bulk_allocation(
             allocation_results=allocation_results,
             demands_dict=demands_dict,
             scope=get_current_scope(),
             strategy_config=strategy_config,
             user_id=user.get('id'),
-            notes=notes
+            notes=notes,
+            split_allocations=st.session_state.split_allocations  # Pass split data
         )
         
         if result['success']:

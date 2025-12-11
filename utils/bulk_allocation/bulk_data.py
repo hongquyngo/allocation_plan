@@ -1,757 +1,771 @@
 """
-Bulk Allocation Data Repository
-===============================
-Handles all data queries for bulk allocation including:
-- Scope selection (brands, customers, products, ETD range)
-- Demand data (OCs pending delivery)
-- Supply data (Inventory, CAN, PO, WHT)
-- Committed calculation with MIN logic
-- Allocation status breakdown (NEW)
+Bulk Allocation Email Service
+Email notifications for bulk allocation operations.
+
+Email flow:
+1. Summary email to allocator (contains ALL OCs)
+2. Individual emails to each OC creator (only their OCs)
+   - CC: allocator + allocation@prostech.vn
 """
-import pandas as pd
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from datetime import datetime
 import logging
-from typing import Dict, List, Optional, Any, Tuple
-from decimal import Decimal
-import streamlit as st
+import os
+from typing import Dict, List, Tuple, Optional, Set
 from sqlalchemy import text
 
-from utils.db import get_db_engine
-from utils.config import config
+from ..db import get_db_engine
 
 logger = logging.getLogger(__name__)
 
 
-class BulkAllocationData:
-    """Repository for bulk allocation data access"""
+class BulkEmailService:
+    """Handle email notifications for bulk allocation operations"""
     
     def __init__(self):
-        self.engine = get_db_engine()
-        self.cache_ttl = config.get_app_setting('CACHE_TTL_SECONDS', 300)
+        self.smtp_host = os.getenv("SMTP_HOST", "smtp.gmail.com")
+        self.smtp_port = int(os.getenv("SMTP_PORT", "587"))
+        self.sender_email = os.getenv("OUTBOUND_EMAIL_SENDER", os.getenv("EMAIL_SENDER", "outbound@prostech.vn"))
+        self.sender_password = os.getenv("OUTBOUND_EMAIL_PASSWORD", os.getenv("EMAIL_PASSWORD", ""))
+        self.allocation_cc = "allocation@prostech.vn"
     
-    # ==================== FILTER OPTIONS ====================
+    # ============== DATA FETCHING METHODS ==============
     
-    @st.cache_data(ttl=300)
-    def get_brand_options(_self) -> List[Dict]:
-        """Get brands that have products with pending OCs"""
+    def get_user_info(self, user_id: int) -> Optional[Dict]:
+        """Get user information"""
         try:
-            query = """
-                SELECT DISTINCT
-                    b.id,
-                    b.brand_name,
-                    COUNT(DISTINCT ocpd.ocd_id) as oc_count,
-                    COUNT(DISTINCT ocpd.product_id) as product_count,
-                    SUM(ocpd.pending_standard_delivery_quantity) as total_pending_qty
-                FROM brands b
-                INNER JOIN products p ON p.brand_id = b.id
-                INNER JOIN outbound_oc_pending_delivery_view ocpd ON p.id = ocpd.product_id
-                WHERE b.delete_flag = 0
-                AND p.delete_flag = 0
-                AND ocpd.pending_standard_delivery_quantity > 0
-                GROUP BY b.id, b.brand_name
-                ORDER BY b.brand_name ASC
-            """
+            engine = get_db_engine()
+            query = text("""
+                SELECT 
+                    u.id,
+                    u.username,
+                    e.email,
+                    CONCAT(e.first_name, ' ', e.last_name) AS full_name
+                FROM users u
+                LEFT JOIN employees e ON u.employee_id = e.id
+                WHERE u.id = :user_id
+            """)
             
-            with _self.engine.connect() as conn:
-                result = conn.execute(text(query))
-                return [dict(row._mapping) for row in result]
-                
+            with engine.connect() as conn:
+                result = conn.execute(query, {'user_id': user_id}).fetchone()
+                if result:
+                    return dict(result._mapping)
         except Exception as e:
-            logger.error(f"Error loading brand options: {e}")
-            return []
+            logger.error(f"Error fetching user info: {e}")
+        return None
     
-    @st.cache_data(ttl=300)
-    def get_customer_options(_self) -> List[Dict]:
-        """Get customers that have pending OCs"""
-        try:
-            query = """
-                SELECT DISTINCT
-                    customer_code,
-                    customer,
-                    COUNT(DISTINCT ocd_id) as oc_count,
-                    COUNT(DISTINCT product_id) as product_count,
-                    SUM(pending_standard_delivery_quantity) as total_pending_qty
-                FROM outbound_oc_pending_delivery_view
-                WHERE pending_standard_delivery_quantity > 0
-                GROUP BY customer_code, customer
-                ORDER BY customer ASC
-            """
-            
-            with _self.engine.connect() as conn:
-                result = conn.execute(text(query))
-                return [dict(row._mapping) for row in result]
-                
-        except Exception as e:
-            logger.error(f"Error loading customer options: {e}")
-            return []
-    
-    @st.cache_data(ttl=300)
-    def get_legal_entity_options(_self) -> List[Dict]:
-        """Get legal entities that have pending OCs"""
-        try:
-            query = """
-                SELECT DISTINCT
-                    legal_entity,
-                    COUNT(DISTINCT ocd_id) as oc_count,
-                    SUM(pending_standard_delivery_quantity) as total_pending_qty
-                FROM outbound_oc_pending_delivery_view
-                WHERE pending_standard_delivery_quantity > 0
-                AND legal_entity IS NOT NULL
-                GROUP BY legal_entity
-                ORDER BY legal_entity ASC
-            """
-            
-            with _self.engine.connect() as conn:
-                result = conn.execute(text(query))
-                return [dict(row._mapping) for row in result]
-                
-        except Exception as e:
-            logger.error(f"Error loading legal entity options: {e}")
-            return []
-    
-    # ==================== SCOPE PREVIEW (UPDATED) ====================
-    
-    def get_scope_summary(self, scope: Dict) -> Dict[str, Any]:
+    def get_oc_creators_for_allocations(self, ocd_ids: List[int]) -> Dict[str, Dict]:
         """
-        Get summary statistics for selected scope with allocation status breakdown
-        
-        Args:
-            scope: Dict with keys: brand_ids, customer_codes, legal_entities, 
-                   etd_from, etd_to, include_partial_allocated,
-                   exclude_fully_allocated, only_unallocated
+        Get OC creator information grouped by email.
         
         Returns:
-            Dict with: 
-            - total_products, total_ocs
-            - Allocation status breakdown: not_allocated_count, partially_allocated_count, 
-              fully_allocated_count, need_allocation_count
-            - Demand metrics: total_demand, allocatable_demand, total_undelivered_allocated
-            - Supply metrics: total_supply, total_committed, available_supply
-            - coverage_percent
+            Dict[email] = {
+                'full_name': str,
+                'ocd_ids': List[int]
+            }
         """
+        creators = {}
+        
+        if not ocd_ids:
+            return creators
+        
         try:
-            # Build conditions WITHOUT allocation status filters for summary
-            # We want to see ALL OCs first, then filter
-            base_conditions, params = self._build_base_scope_conditions(scope)
-            where_clause = f"WHERE {' AND '.join(base_conditions)}" if base_conditions else ""
-            
-            query = f"""
-                WITH scope_ocs AS (
-                    SELECT 
-                        ocpd.ocd_id,
-                        ocpd.product_id,
-                        ocpd.pending_standard_delivery_quantity as pending_qty,
-                        ocpd.standard_quantity as effective_qty,
-                        COALESCE(ocpd.total_effective_allocated_qty_standard, 0) as current_allocated,
-                        COALESCE(ocpd.undelivered_allocated_qty_standard, 0) as undelivered_allocated,
-                        
-                        -- Calculate max allocatable for each OC
-                        GREATEST(0, LEAST(
-                            ocpd.standard_quantity - COALESCE(ocpd.total_effective_allocated_qty_standard, 0),
-                            ocpd.pending_standard_delivery_quantity - COALESCE(ocpd.undelivered_allocated_qty_standard, 0)
-                        )) as max_allocatable,
-                        
-                        -- Allocation status
-                        CASE 
-                            WHEN COALESCE(ocpd.undelivered_allocated_qty_standard, 0) = 0 
-                                AND COALESCE(ocpd.total_effective_allocated_qty_standard, 0) = 0
-                            THEN 'NOT_ALLOCATED'
-                            WHEN GREATEST(0, LEAST(
-                                    ocpd.standard_quantity - COALESCE(ocpd.total_effective_allocated_qty_standard, 0),
-                                    ocpd.pending_standard_delivery_quantity - COALESCE(ocpd.undelivered_allocated_qty_standard, 0)
-                                 )) <= 0
-                            THEN 'FULLY_ALLOCATED'
-                            ELSE 'PARTIALLY_ALLOCATED'
-                        END as allocation_status
-                        
-                    FROM outbound_oc_pending_delivery_view ocpd
-                    INNER JOIN products p ON p.id = ocpd.product_id
-                    LEFT JOIN brands b ON p.brand_id = b.id
-                    {where_clause}
-                ),
-                -- Get unique products for supply calculation
-                scope_products AS (
-                    SELECT DISTINCT product_id FROM scope_ocs
-                ),
-                -- Supply calculation
-                product_supply AS (
-                    SELECT 
-                        sp.product_id,
-                        COALESCE(inv.qty, 0) + COALESCE(can.qty, 0) + 
-                        COALESCE(po.qty, 0) + COALESCE(wht.qty, 0) as total_supply
-                    FROM scope_products sp
-                    LEFT JOIN (
-                        SELECT product_id, SUM(remaining_quantity) as qty
-                        FROM inventory_detailed_view
-                        WHERE remaining_quantity > 0
-                        GROUP BY product_id
-                    ) inv ON sp.product_id = inv.product_id
-                    LEFT JOIN (
-                        SELECT product_id, SUM(pending_quantity) as qty
-                        FROM can_pending_stockin_view
-                        WHERE pending_quantity > 0
-                        GROUP BY product_id
-                    ) can ON sp.product_id = can.product_id
-                    LEFT JOIN (
-                        SELECT product_id, SUM(pending_standard_arrival_quantity) as qty
-                        FROM purchase_order_full_view
-                        WHERE pending_standard_arrival_quantity > 0
-                        GROUP BY product_id
-                    ) po ON sp.product_id = po.product_id
-                    LEFT JOIN (
-                        SELECT product_id, SUM(transfer_quantity) as qty
-                        FROM warehouse_transfer_details_view
-                        WHERE is_completed = 0 AND transfer_quantity > 0
-                        GROUP BY product_id
-                    ) wht ON sp.product_id = wht.product_id
-                ),
-                -- Committed calculation using MIN logic
-                product_committed AS (
-                    SELECT 
-                        product_id,
-                        SUM(
-                            GREATEST(0,
-                                LEAST(
-                                    COALESCE(pending_standard_delivery_quantity, 0),
-                                    COALESCE(undelivered_allocated_qty_standard, 0)
-                                )
-                            )
-                        ) as total_committed
-                    FROM outbound_oc_pending_delivery_view
-                    WHERE product_id IN (SELECT product_id FROM scope_products)
-                    AND pending_standard_delivery_quantity > 0
-                    AND undelivered_allocated_qty_standard > 0
-                    GROUP BY product_id
-                ),
-                -- Aggregate supply
-                supply_totals AS (
-                    SELECT 
-                        COALESCE(SUM(ps.total_supply), 0) as total_supply,
-                        COALESCE(SUM(pc.total_committed), 0) as total_committed
-                    FROM product_supply ps
-                    LEFT JOIN product_committed pc ON ps.product_id = pc.product_id
-                ),
-                -- OC summary with allocation status breakdown
-                oc_summary AS (
-                    SELECT
-                        COUNT(DISTINCT product_id) as total_products,
-                        COUNT(*) as total_ocs,
-                        
-                        -- Allocation status breakdown
-                        SUM(CASE WHEN allocation_status = 'NOT_ALLOCATED' THEN 1 ELSE 0 END) as not_allocated_count,
-                        SUM(CASE WHEN allocation_status = 'PARTIALLY_ALLOCATED' THEN 1 ELSE 0 END) as partially_allocated_count,
-                        SUM(CASE WHEN allocation_status = 'FULLY_ALLOCATED' THEN 1 ELSE 0 END) as fully_allocated_count,
-                        SUM(CASE WHEN max_allocatable > 0 THEN 1 ELSE 0 END) as need_allocation_count,
-                        
-                        -- Demand breakdown
-                        COALESCE(SUM(pending_qty), 0) as total_demand,
-                        COALESCE(SUM(CASE WHEN max_allocatable > 0 THEN pending_qty ELSE 0 END), 0) as need_allocation_demand,
-                        COALESCE(SUM(max_allocatable), 0) as total_allocatable,
-                        COALESCE(SUM(undelivered_allocated), 0) as total_undelivered_allocated
-                    FROM scope_ocs
-                )
+            engine = get_db_engine()
+            query = text("""
                 SELECT 
-                    os.*,
-                    st.total_supply,
-                    st.total_committed,
-                    st.total_supply - st.total_committed as available_supply
-                FROM oc_summary os
-                CROSS JOIN supply_totals st
-            """
+                    ocd.id AS ocd_id,
+                    e.email,
+                    CONCAT(e.first_name, ' ', e.last_name) AS full_name
+                FROM order_comfirmation_details ocd
+                INNER JOIN order_confirmations oc ON ocd.order_confirmation_id = oc.id
+                INNER JOIN employees e ON oc.created_by = e.keycloak_id
+                WHERE ocd.id IN :ocd_ids
+                AND e.email IS NOT NULL
+                AND e.email != ''
+                AND e.delete_flag = 0
+            """)
             
-            with self.engine.connect() as conn:
-                result = conn.execute(text(query), params).fetchone()
-                
-                if result:
-                    data = dict(result._mapping)
-                    
-                    # Calculate coverage percentages
-                    total_demand = float(data.get('total_demand', 0) or 0)
-                    total_allocatable = float(data.get('total_allocatable', 0) or 0)
-                    available_supply = float(data.get('available_supply', 0) or 0)
-                    total_ocs = int(data.get('total_ocs', 0) or 0)
-                    need_allocation_count = int(data.get('need_allocation_count', 0) or 0)
-                    
-                    return {
-                        # Counts
-                        'total_products': int(data.get('total_products', 0) or 0),
-                        'total_ocs': total_ocs,
-                        
-                        # Allocation status breakdown
-                        'not_allocated_count': int(data.get('not_allocated_count', 0) or 0),
-                        'partially_allocated_count': int(data.get('partially_allocated_count', 0) or 0),
-                        'fully_allocated_count': int(data.get('fully_allocated_count', 0) or 0),
-                        'need_allocation_count': need_allocation_count,
-                        
-                        # Percentages
-                        'need_allocation_percent': (need_allocation_count / total_ocs * 100) if total_ocs > 0 else 0,
-                        'fully_allocated_percent': (int(data.get('fully_allocated_count', 0) or 0) / total_ocs * 100) if total_ocs > 0 else 0,
-                        
-                        # Demand metrics
-                        'total_demand': total_demand,
-                        'need_allocation_demand': float(data.get('need_allocation_demand', 0) or 0),
-                        'total_allocatable': total_allocatable,
-                        'total_undelivered_allocated': float(data.get('total_undelivered_allocated', 0) or 0),
-                        
-                        # Supply metrics
-                        'total_supply': float(data.get('total_supply', 0) or 0),
-                        'total_committed': float(data.get('total_committed', 0) or 0),
-                        'available_supply': available_supply,
-                        
-                        # Coverage
-                        'coverage_percent': (available_supply / total_demand * 100) if total_demand > 0 else 0,
-                        'allocatable_coverage_percent': (available_supply / total_allocatable * 100) if total_allocatable > 0 else 0
-                    }
+            with engine.connect() as conn:
+                result = conn.execute(query, {'ocd_ids': tuple(ocd_ids)})
+                for row in result:
+                    email = row.email
+                    if email not in creators:
+                        creators[email] = {
+                            'full_name': row.full_name or 'Sales',
+                            'ocd_ids': []
+                        }
+                    creators[email]['ocd_ids'].append(row.ocd_id)
             
-            # Return empty result
-            return self._empty_scope_summary()
+            logger.info(f"Found {len(creators)} unique OC creators for {len(ocd_ids)} OCs")
             
         except Exception as e:
-            logger.error(f"Error getting scope summary: {e}")
-            return self._empty_scope_summary()
+            logger.error(f"Error getting OC creators: {e}")
+        
+        return creators
     
-    def _empty_scope_summary(self) -> Dict[str, Any]:
-        """Return empty scope summary structure"""
-        return {
-            'total_products': 0,
-            'total_ocs': 0,
-            'not_allocated_count': 0,
-            'partially_allocated_count': 0,
-            'fully_allocated_count': 0,
-            'need_allocation_count': 0,
-            'need_allocation_percent': 0,
-            'fully_allocated_percent': 0,
-            'total_demand': 0,
-            'need_allocation_demand': 0,
-            'total_allocatable': 0,
-            'total_undelivered_allocated': 0,
-            'total_supply': 0,
-            'total_committed': 0,
-            'available_supply': 0,
-            'coverage_percent': 0,
-            'allocatable_coverage_percent': 0
+    # ============== EMAIL SENDING ==============
+    
+    def _send_email(self, to_email: str, cc_emails: List[str], reply_to: str,
+                    subject: str, html_content: str) -> Tuple[bool, str]:
+        """Send email using SMTP"""
+        try:
+            if not self.sender_email or not self.sender_password:
+                return False, "Email configuration missing"
+            
+            msg = MIMEMultipart('alternative')
+            msg['Subject'] = subject
+            msg['From'] = self.sender_email
+            msg['To'] = to_email
+            msg['Reply-To'] = reply_to
+            
+            if cc_emails:
+                msg['Cc'] = ', '.join(cc_emails)
+            
+            html_part = MIMEText(html_content, 'html')
+            msg.attach(html_part)
+            
+            with smtplib.SMTP(self.smtp_host, self.smtp_port) as server:
+                server.starttls()
+                server.login(self.sender_email, self.sender_password)
+                
+                recipients = [to_email] + cc_emails
+                server.sendmail(self.sender_email, recipients, msg.as_string())
+            
+            logger.info(f"Bulk allocation email sent to {to_email}")
+            return True, "Email sent successfully"
+            
+        except smtplib.SMTPAuthenticationError:
+            return False, "Email authentication failed"
+        except Exception as e:
+            logger.error(f"Error sending email: {e}")
+            return False, str(e)
+    
+    # ============== EMAIL TEMPLATES ==============
+    
+    def _format_number(self, value) -> str:
+        """Format number with thousand separators"""
+        try:
+            return "{:,.0f}".format(float(value))
+        except:
+            return str(value)
+    
+    def _format_date(self, date_value) -> str:
+        """Format date as DD MMM YYYY"""
+        try:
+            if date_value is None:
+                return 'N/A'
+            if isinstance(date_value, str):
+                date_value = datetime.strptime(date_value[:10], '%Y-%m-%d')
+            return date_value.strftime('%d %b %Y')
+        except:
+            return str(date_value) if date_value else 'N/A'
+    
+    def _build_base_style(self) -> str:
+        """Base CSS styles for emails"""
+        return """
+        <style>
+            body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; margin: 0; padding: 0; }
+            .header { padding: 25px; text-align: center; color: white; }
+            .header-green { background: linear-gradient(135deg, #2e7d32 0%, #1b5e20 100%); }
+            .header-blue { background: linear-gradient(135deg, #1976d2 0%, #1565c0 100%); }
+            .header h1 { margin: 0 0 5px 0; font-size: 24px; }
+            .header p { margin: 0; opacity: 0.9; }
+            .content { padding: 25px; background: #f9f9f9; }
+            .info-box { background-color: #fff; border-radius: 8px; padding: 15px; margin: 15px 0; border-left: 4px solid #1976d2; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+            .label { color: #666; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 3px; }
+            .value { font-weight: bold; font-size: 14px; color: #333; }
+            .summary-grid { display: flex; justify-content: space-around; margin: 20px 0; }
+            .summary-item { text-align: center; padding: 15px; background: #fff; border-radius: 8px; min-width: 100px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+            .summary-value { font-size: 28px; font-weight: bold; color: #1976d2; }
+            .summary-label { font-size: 11px; color: #666; text-transform: uppercase; }
+            table { width: 100%; border-collapse: collapse; margin: 15px 0; background: #fff; }
+            th { background-color: #1976d2; color: white; padding: 10px 8px; text-align: left; font-size: 12px; }
+            td { padding: 8px; border-bottom: 1px solid #eee; font-size: 13px; }
+            tr:hover { background-color: #f5f5f5; }
+            .coverage-high { color: #2e7d32; font-weight: bold; }
+            .coverage-mid { color: #f57c00; font-weight: bold; }
+            .coverage-low { color: #c62828; font-weight: bold; }
+            .etd-delay { color: #c62828; }
+            .badge { display: inline-block; padding: 3px 8px; border-radius: 12px; font-size: 11px; }
+            .badge-strategy { background-color: #e3f2fd; color: #1976d2; }
+            .badge-mode { background-color: #f3e5f5; color: #7b1fa2; }
+            .warning-box { background: #fff3e0; border-left: 4px solid #ff9800; padding: 12px; margin: 15px 0; border-radius: 0 8px 8px 0; }
+            .footer { margin-top: 20px; padding: 20px; background-color: #f0f0f0; text-align: center; font-size: 12px; color: #666; border-radius: 0 0 8px 8px; }
+        </style>
+        """
+    
+    # ============== MAIN PUBLIC METHODS ==============
+    
+    def send_bulk_allocation_emails(
+        self,
+        commit_result: Dict,
+        allocation_results: List[Dict],
+        scope: Dict,
+        strategy_config: Dict,
+        allocator_user_id: int,
+        split_allocations: Dict = None
+    ) -> Dict[str, any]:
+        """
+        Main method to send all bulk allocation emails.
+        
+        1. Summary email to allocator
+        2. Individual emails to each OC creator
+        
+        Returns:
+            Dict with summary_sent, individual_sent, errors
+        """
+        results = {
+            'success': False,
+            'summary_sent': False,
+            'individual_sent': 0,
+            'individual_total': 0,
+            'errors': []
         }
-    
-    # ==================== DEMAND DATA ====================
-    
-    def get_demands_in_scope(self, scope: Dict) -> pd.DataFrame:
-        """
-        Get all OCs matching the scope filters
         
-        Returns DataFrame with columns needed for allocation:
-        - ocd_id, oc_number, oc_date, customer_code, customer, legal_entity
-        - product_id, pt_code, product_name, brand_id, brand_name
-        - etd, pending_qty, effective_qty, allocated_qty, undelivered_allocated
-        - standard_uom, selling_uom, uom_conversion
-        - outstanding_amount_usd (for revenue priority)
-        - allocation_status (NEW)
-        - max_allocatable (NEW)
-        """
-        try:
-            where_conditions, params = self._build_scope_conditions(scope)
-            where_clause = f"WHERE {' AND '.join(where_conditions)}" if where_conditions else ""
-            
-            query = f"""
-                SELECT 
-                    ocpd.ocd_id,
-                    ocpd.oc_number,
-                    ocpd.oc_date,
-                    ocpd.customer_code,
-                    ocpd.customer,
-                    ocpd.legal_entity,
-                    ocpd.product_id,
-                    ocpd.pt_code,
-                    ocpd.product_name,
-                    COALESCE(p.package_size, '') as package_size,
-                    CONCAT(
-                        ocpd.pt_code, 
-                        CASE WHEN ocpd.product_name IS NOT NULL AND ocpd.product_name != '' 
-                             THEN CONCAT(' | ', ocpd.product_name) ELSE '' END,
-                        CASE WHEN p.package_size IS NOT NULL AND p.package_size != '' 
-                             THEN CONCAT(' | ', p.package_size) ELSE '' END,
-                        CASE WHEN b.brand_name IS NOT NULL AND b.brand_name != '' 
-                             THEN CONCAT(' (', b.brand_name, ')') ELSE '' END
-                    ) as product_display,
-                    p.brand_id,
-                    b.brand_name,
-                    ocpd.etd,
-                    ocpd.pending_standard_delivery_quantity as pending_qty,
-                    ocpd.standard_quantity as effective_qty,
-                    COALESCE(ocpd.total_effective_allocated_qty_standard, 0) as allocated_qty,
-                    COALESCE(ocpd.undelivered_allocated_qty_standard, 0) as undelivered_allocated,
-                    ocpd.standard_uom,
-                    ocpd.selling_uom,
-                    COALESCE(ocpd.uom_conversion, 1) as uom_conversion,
-                    COALESCE(ocpd.outstanding_amount_usd, 0) as outstanding_amount_usd,
-                    ocpd.over_allocation_type,
-                    
-                    -- Calculate max allocatable
-                    GREATEST(0, LEAST(
-                        ocpd.standard_quantity - COALESCE(ocpd.total_effective_allocated_qty_standard, 0),
-                        ocpd.pending_standard_delivery_quantity - COALESCE(ocpd.undelivered_allocated_qty_standard, 0)
-                    )) as max_allocatable,
-                    
-                    -- Allocation status
-                    CASE 
-                        WHEN COALESCE(ocpd.undelivered_allocated_qty_standard, 0) = 0 
-                            AND COALESCE(ocpd.total_effective_allocated_qty_standard, 0) = 0
-                        THEN 'NOT_ALLOCATED'
-                        WHEN GREATEST(0, LEAST(
-                                ocpd.standard_quantity - COALESCE(ocpd.total_effective_allocated_qty_standard, 0),
-                                ocpd.pending_standard_delivery_quantity - COALESCE(ocpd.undelivered_allocated_qty_standard, 0)
-                             )) <= 0
-                        THEN 'FULLY_ALLOCATED'
-                        ELSE 'PARTIALLY_ALLOCATED'
-                    END as allocation_status,
-                    
-                    -- Legacy columns for compatibility
-                    GREATEST(0, 
-                        ocpd.standard_quantity - COALESCE(ocpd.total_effective_allocated_qty_standard, 0)
-                    ) as remaining_allocatable,
-                    GREATEST(0,
-                        ocpd.pending_standard_delivery_quantity - COALESCE(ocpd.undelivered_allocated_qty_standard, 0)
-                    ) as topup_needed
-                    
-                FROM outbound_oc_pending_delivery_view ocpd
-                INNER JOIN products p ON p.id = ocpd.product_id
-                LEFT JOIN brands b ON p.brand_id = b.id
-                {where_clause}
-                ORDER BY 
-                    ocpd.product_id,
-                    ocpd.etd ASC,
-                    ocpd.oc_date ASC
-            """
-            
-            with self.engine.connect() as conn:
-                df = pd.read_sql(text(query), conn, params=params)
-            
-            return df
-            
-        except Exception as e:
-            logger.error(f"Error getting demands in scope: {e}")
-            return pd.DataFrame()
-    
-    # ==================== SUPPLY DATA ====================
-    
-    def get_supply_by_products(self, product_ids: List[int]) -> pd.DataFrame:
-        """
-        Get supply data for multiple products
+        # Get allocator info
+        allocator = self.get_user_info(allocator_user_id)
+        allocator_email = allocator.get('email', '') if allocator else ''
+        allocator_name = allocator.get('full_name', 'Unknown') if allocator else 'Unknown'
         
-        Returns DataFrame with:
-        - product_id, total_supply, total_committed, available
-        """
-        if not product_ids:
-            return pd.DataFrame()
+        if not allocator_email:
+            logger.warning(f"Allocator email not found for user_id={allocator_user_id}")
+            results['errors'].append(f"Allocator email not found for user_id={allocator_user_id}")
         
-        try:
-            placeholders = ', '.join([f':pid_{i}' for i in range(len(product_ids))])
-            params = {f'pid_{i}': pid for i, pid in enumerate(product_ids)}
-            
-            query = f"""
-                WITH product_supply AS (
-                    SELECT 
-                        product_id,
-                        SUM(quantity) as total_supply
-                    FROM (
-                        SELECT product_id, SUM(remaining_quantity) as quantity
-                        FROM inventory_detailed_view
-                        WHERE product_id IN ({placeholders}) AND remaining_quantity > 0
-                        GROUP BY product_id
-                        
-                        UNION ALL
-                        
-                        SELECT product_id, SUM(pending_quantity) as quantity
-                        FROM can_pending_stockin_view
-                        WHERE product_id IN ({placeholders}) AND pending_quantity > 0
-                        GROUP BY product_id
-                        
-                        UNION ALL
-                        
-                        SELECT product_id, SUM(pending_standard_arrival_quantity) as quantity
-                        FROM purchase_order_full_view
-                        WHERE product_id IN ({placeholders}) AND pending_standard_arrival_quantity > 0
-                        GROUP BY product_id
-                        
-                        UNION ALL
-                        
-                        SELECT product_id, SUM(transfer_quantity) as quantity
-                        FROM warehouse_transfer_details_view
-                        WHERE product_id IN ({placeholders}) AND is_completed = 0 AND transfer_quantity > 0
-                        GROUP BY product_id
-                    ) supply_union
-                    GROUP BY product_id
-                ),
-                -- Committed using MIN logic
-                product_committed AS (
-                    SELECT 
-                        product_id,
-                        SUM(
-                            GREATEST(0,
-                                LEAST(
-                                    COALESCE(pending_standard_delivery_quantity, 0),
-                                    COALESCE(undelivered_allocated_qty_standard, 0)
-                                )
-                            )
-                        ) as total_committed
-                    FROM outbound_oc_pending_delivery_view
-                    WHERE product_id IN ({placeholders})
-                    AND pending_standard_delivery_quantity > 0
-                    AND undelivered_allocated_qty_standard > 0
-                    GROUP BY product_id
+        # 1. Send summary email to allocator
+        if allocator_email:
+            try:
+                success, msg = self.send_summary_email_to_allocator(
+                    commit_result=commit_result,
+                    allocation_results=allocation_results,
+                    scope=scope,
+                    strategy_config=strategy_config,
+                    allocator_email=allocator_email,
+                    allocator_name=allocator_name,
+                    split_allocations=split_allocations or {}
                 )
-                SELECT 
-                    ps.product_id,
-                    ps.total_supply,
-                    COALESCE(pc.total_committed, 0) as total_committed,
-                    ps.total_supply - COALESCE(pc.total_committed, 0) as available
-                FROM product_supply ps
-                LEFT JOIN product_committed pc ON ps.product_id = pc.product_id
+                results['summary_sent'] = success
+                if not success:
+                    results['errors'].append(f"Summary email: {msg}")
+            except Exception as e:
+                logger.error(f"Summary email error: {e}", exc_info=True)
+                results['errors'].append(f"Summary email error: {str(e)}")
+        
+        # 2. Send individual emails to OC creators
+        try:
+            individual_result = self.send_individual_creator_emails(
+                commit_result=commit_result,
+                allocation_results=allocation_results,
+                allocator_email=allocator_email,
+                allocator_name=allocator_name
+            )
+            results['individual_sent'] = individual_result.get('sent_count', 0)
+            results['individual_total'] = individual_result.get('total_creators', 0)
+            if individual_result.get('errors'):
+                results['errors'].extend(individual_result['errors'])
+        except Exception as e:
+            logger.error(f"Individual emails error: {e}", exc_info=True)
+            results['errors'].append(f"Individual emails error: {str(e)}")
+        
+        results['success'] = results['summary_sent'] or results['individual_sent'] > 0
+        return results
+    
+    def send_summary_email_to_allocator(
+        self,
+        commit_result: Dict,
+        allocation_results: List[Dict],
+        scope: Dict,
+        strategy_config: Dict,
+        allocator_email: str,
+        allocator_name: str,
+        split_allocations: Dict
+    ) -> Tuple[bool, str]:
+        """
+        Send comprehensive summary email to the person who created the bulk allocation.
+        Contains ALL allocated OCs.
+        """
+        if not allocator_email:
+            return False, "No allocator email provided"
+        
+        allocation_number = commit_result.get('allocation_number', 'N/A')
+        detail_count = commit_result.get('detail_count', 0)
+        total_allocated = commit_result.get('total_allocated', 0)
+        products_affected = commit_result.get('products_affected', 0)
+        customers_affected = commit_result.get('customers_affected', 0)
+        
+        # Build scope summary
+        scope_parts = []
+        if scope.get('brand_ids'):
+            scope_parts.append(f"Brands: {len(scope['brand_ids'])}")
+        if scope.get('customer_codes'):
+            scope_parts.append(f"Customers: {len(scope['customer_codes'])}")
+        if scope.get('etd_from') or scope.get('etd_to'):
+            scope_parts.append(f"ETD: {scope.get('etd_from', 'Any')} → {scope.get('etd_to', 'Any')}")
+        scope_summary = ' | '.join(scope_parts) if scope_parts else 'All'
+        
+        # Strategy info
+        strategy_type = strategy_config.get('strategy_type', 'HYBRID')
+        allocation_mode = strategy_config.get('allocation_mode', 'SOFT')
+        
+        # Count warnings
+        etd_delay_count = 0
+        split_count = len([k for k, v in split_allocations.items() if len(v) > 1])
+        
+        for alloc in allocation_results:
+            oc_etd = alloc.get('oc_etd')
+            allocated_etd = alloc.get('allocated_etd')
+            if oc_etd and allocated_etd:
+                try:
+                    if self._compare_dates(allocated_etd, oc_etd) > 0:
+                        etd_delay_count += 1
+                except:
+                    pass
+        
+        # Build allocation table (top 30)
+        rows_html = self._build_allocation_table_rows(allocation_results, split_allocations, max_rows=30)
+        
+        # Build warnings section
+        warnings_html = ""
+        if etd_delay_count > 0 or split_count > 0:
+            warning_items = []
+            if etd_delay_count > 0:
+                warning_items.append(f"⚠️ {etd_delay_count} OCs have allocated ETD later than requested")
+            if split_count > 0:
+                warning_items.append(f"✂️ {split_count} OCs have split allocations")
+            warnings_html = f"""
+            <div class="warning-box">
+                <strong>Attention:</strong><br>
+                {'<br>'.join(warning_items)}
+            </div>
             """
-            
-            with self.engine.connect() as conn:
-                df = pd.read_sql(text(query), conn, params=params)
-            
-            return df
-            
-        except Exception as e:
-            logger.error(f"Error getting supply by products: {e}")
-            return pd.DataFrame()
-    
-    def get_product_supply_detail(self, product_id: int) -> Dict[str, Any]:
-        """
-        Get detailed supply information for a single product
         
-        Returns:
-            Dict with total_supply, total_committed, available, coverage_ratio
+        subject = f"📦 [Bulk Allocation] {allocation_number} - {detail_count} OCs Allocated"
+        
+        html_content = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>{self._build_base_style()}</head>
+        <body>
+            <div class="header header-green">
+                <h1>📦 Bulk Allocation Completed</h1>
+                <p>{allocation_number}</p>
+            </div>
+            
+            <div class="content">
+                <div class="info-box">
+                    <table style="border: none; box-shadow: none;">
+                        <tr>
+                            <td style="border: none; width: 50%;">
+                                <div class="label">Created By</div>
+                                <div class="value">{allocator_name}</div>
+                            </td>
+                            <td style="border: none;">
+                                <div class="label">Date</div>
+                                <div class="value">{datetime.now().strftime('%d %b %Y %H:%M')}</div>
+                            </td>
+                        </tr>
+                        <tr>
+                            <td style="border: none;">
+                                <div class="label">Strategy</div>
+                                <div class="value">
+                                    <span class="badge badge-strategy">{strategy_type}</span>
+                                    <span class="badge badge-mode">{allocation_mode}</span>
+                                </div>
+                            </td>
+                            <td style="border: none;">
+                                <div class="label">Scope</div>
+                                <div class="value">{scope_summary}</div>
+                            </td>
+                        </tr>
+                    </table>
+                </div>
+                
+                <div class="summary-grid">
+                    <div class="summary-item">
+                        <div class="summary-value">{detail_count}</div>
+                        <div class="summary-label">OCs Allocated</div>
+                    </div>
+                    <div class="summary-item">
+                        <div class="summary-value">{self._format_number(total_allocated)}</div>
+                        <div class="summary-label">Total Qty</div>
+                    </div>
+                    <div class="summary-item">
+                        <div class="summary-value">{products_affected}</div>
+                        <div class="summary-label">Products</div>
+                    </div>
+                    <div class="summary-item">
+                        <div class="summary-value">{customers_affected}</div>
+                        <div class="summary-label">Customers</div>
+                    </div>
+                </div>
+                
+                {warnings_html}
+                
+                <h3>📋 Allocation Details {f'(Top 30 of {len(allocation_results)})' if len(allocation_results) > 30 else ''}</h3>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>OC Number</th>
+                            <th>Customer</th>
+                            <th>Product</th>
+                            <th style="text-align: right;">Allocated</th>
+                            <th style="text-align: center;">ETD</th>
+                            <th style="text-align: right;">Coverage</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {rows_html}
+                    </tbody>
+                </table>
+                
+                <div class="footer">
+                    <p>This is an automated notification from the Allocation Planning System.</p>
+                    <p>Please do not reply to this email.</p>
+                </div>
+            </div>
+        </body>
+        </html>
         """
-        try:
-            query = text("""
-                WITH supply_summary AS (
-                    SELECT 
-                        'total_supply' as metric,
-                        COALESCE(SUM(total_supply), 0) as value
-                    FROM (
-                        SELECT SUM(remaining_quantity) as total_supply
-                        FROM inventory_detailed_view
-                        WHERE product_id = :product_id AND remaining_quantity > 0
-                        
-                        UNION ALL
-                        
-                        SELECT SUM(pending_quantity) as total_supply
-                        FROM can_pending_stockin_view
-                        WHERE product_id = :product_id AND pending_quantity > 0
-                        
-                        UNION ALL
-                        
-                        SELECT SUM(pending_standard_arrival_quantity) as total_supply
-                        FROM purchase_order_full_view
-                        WHERE product_id = :product_id AND pending_standard_arrival_quantity > 0
-                        
-                        UNION ALL
-                        
-                        SELECT SUM(transfer_quantity) as total_supply
-                        FROM warehouse_transfer_details_view
-                        WHERE product_id = :product_id AND is_completed = 0 AND transfer_quantity > 0
-                    ) supply_union
-                    
-                    UNION ALL
-                    
-                    SELECT 
-                        'total_committed' as metric,
-                        COALESCE(
-                            SUM(
-                                GREATEST(0,
-                                    LEAST(
-                                        COALESCE(pending_standard_delivery_quantity, 0),
-                                        COALESCE(undelivered_allocated_qty_standard, 0)
-                                    )
-                                )
-                            ), 
-                        0) as value
-                    FROM outbound_oc_pending_delivery_view
-                    WHERE product_id = :product_id
-                    AND pending_standard_delivery_quantity > 0
-                    AND undelivered_allocated_qty_standard > 0
+        
+        # Send to allocator only, CC allocation group
+        return self._send_email(
+            to_email=allocator_email,
+            cc_emails=[self.allocation_cc],
+            reply_to=allocator_email,
+            subject=subject,
+            html_content=html_content
+        )
+    
+    def send_individual_creator_emails(
+        self,
+        commit_result: Dict,
+        allocation_results: List[Dict],
+        allocator_email: str,
+        allocator_name: str
+    ) -> Dict[str, any]:
+        """
+        Send individual emails to each OC creator.
+        Each creator receives email containing only their OCs.
+        CC: allocator + allocation@prostech.vn
+        """
+        result = {
+            'sent_count': 0,
+            'total_creators': 0,
+            'errors': []
+        }
+        
+        if not allocation_results:
+            return result
+        
+        allocation_number = commit_result.get('allocation_number', 'N/A')
+        
+        # Get OC creators grouped by email
+        ocd_ids = [a.get('ocd_id') for a in allocation_results if a.get('ocd_id') and float(a.get('final_qty', 0)) > 0]
+        creators = self.get_oc_creators_for_allocations(ocd_ids)
+        
+        result['total_creators'] = len(creators)
+        
+        # Build lookup: ocd_id -> allocation data
+        alloc_by_ocd = {a.get('ocd_id'): a for a in allocation_results}
+        
+        # Send email to each creator
+        for creator_email, creator_info in creators.items():
+            # Skip if creator is the allocator (they already got summary email)
+            if creator_email == allocator_email:
+                continue
+            
+            try:
+                # Get allocations for this creator
+                creator_allocations = [
+                    alloc_by_ocd[ocd_id] 
+                    for ocd_id in creator_info['ocd_ids'] 
+                    if ocd_id in alloc_by_ocd
+                ]
+                
+                if not creator_allocations:
+                    continue
+                
+                success, msg = self._send_creator_notification(
+                    creator_email=creator_email,
+                    creator_name=creator_info['full_name'],
+                    allocations=creator_allocations,
+                    allocation_number=allocation_number,
+                    allocator_email=allocator_email,
+                    allocator_name=allocator_name
                 )
-                SELECT 
-                    MAX(CASE WHEN metric = 'total_supply' THEN value END) as total_supply,
-                    MAX(CASE WHEN metric = 'total_committed' THEN value END) as total_committed
-                FROM supply_summary
-            """)
-            
-            with self.engine.connect() as conn:
-                result = conn.execute(query, {'product_id': product_id}).fetchone()
                 
-                if result:
-                    total_supply = float(result[0] or 0)
-                    total_committed = float(result[1] or 0)
-                    available = total_supply - total_committed
+                if success:
+                    result['sent_count'] += 1
+                else:
+                    result['errors'].append(f"{creator_email}: {msg}")
                     
-                    return {
-                        'total_supply': total_supply,
-                        'total_committed': total_committed,
-                        'available': available,
-                        'coverage_ratio': (available / total_supply * 100) if total_supply > 0 else 0
-                    }
-            
-            return {
-                'total_supply': 0,
-                'total_committed': 0,
-                'available': 0,
-                'coverage_ratio': 0
-            }
-            
-        except Exception as e:
-            logger.error(f"Error getting product supply detail: {e}")
-            return {
-                'total_supply': 0,
-                'total_committed': 0,
-                'available': 0,
-                'coverage_ratio': 0
-            }
-    
-    # ==================== ALLOCATION SUMMARY ====================
-    
-    def get_oc_allocation_summary(self, ocd_id: int) -> Dict[str, Decimal]:
-        """
-        Get current allocation summary for an OC
+            except Exception as e:
+                result['errors'].append(f"{creator_email}: {str(e)}")
         
-        Returns:
-            Dict with total_allocated, total_cancelled, total_delivered,
-                   total_effective_allocated, undelivered_allocated
-        """
-        try:
-            query = text("""
-                SELECT 
-                    CAST(COALESCE(SUM(ad.allocated_qty), 0) AS DECIMAL(15,2)) as total_allocated,
-                    CAST(COALESCE(SUM(CASE WHEN ac.status = 'ACTIVE' THEN ac.cancelled_qty ELSE 0 END), 0) AS DECIMAL(15,2)) as total_cancelled,
-                    CAST(COALESCE(SUM(adl.delivered_qty), 0) AS DECIMAL(15,2)) as total_delivered,
-                    CAST(COALESCE(SUM(ad.allocated_qty - COALESCE(CASE WHEN ac.status = 'ACTIVE' THEN ac.cancelled_qty ELSE 0 END, 0)), 0) AS DECIMAL(15,2)) as total_effective_allocated,
-                    CAST(COALESCE(SUM(ad.allocated_qty - 
-                                COALESCE(CASE WHEN ac.status = 'ACTIVE' THEN ac.cancelled_qty ELSE 0 END, 0) - 
-                                COALESCE(adl.delivered_qty, 0)), 0) AS DECIMAL(15,2)) as undelivered_allocated
-                FROM allocation_details ad
-                LEFT JOIN (
-                    SELECT allocation_detail_id, SUM(cancelled_qty) as cancelled_qty, status
-                    FROM allocation_cancellations
-                    WHERE status = 'ACTIVE'
-                    GROUP BY allocation_detail_id, status
-                ) ac ON ad.id = ac.allocation_detail_id
-                LEFT JOIN (
-                    SELECT allocation_detail_id, SUM(delivered_qty) as delivered_qty
-                    FROM allocation_delivery_links
-                    GROUP BY allocation_detail_id
-                ) adl ON ad.id = adl.allocation_detail_id
-                WHERE ad.demand_reference_id = :ocd_id
-                AND ad.demand_type = 'OC'
-                AND ad.status = 'ALLOCATED'
-            """)
+        logger.info(f"Sent {result['sent_count']}/{result['total_creators']} individual creator emails")
+        return result
+    
+    def _send_creator_notification(
+        self,
+        creator_email: str,
+        creator_name: str,
+        allocations: List[Dict],
+        allocation_number: str,
+        allocator_email: str,
+        allocator_name: str
+    ) -> Tuple[bool, str]:
+        """Send notification to individual OC creator"""
+        
+        total_qty = sum(float(a.get('final_qty', 0)) for a in allocations)
+        oc_count = len(allocations)
+        
+        subject = f"✅ [Allocation] {oc_count} of your OCs allocated - {allocation_number}"
+        
+        # Build table rows
+        rows_html = ""
+        for alloc in sorted(allocations, key=lambda x: float(x.get('final_qty', 0)), reverse=True):
+            coverage = float(alloc.get('coverage_percent', 0))
+            coverage_class = 'coverage-high' if coverage >= 80 else 'coverage-mid' if coverage >= 50 else 'coverage-low'
             
-            with self.engine.connect() as conn:
-                result = conn.execute(query, {'ocd_id': ocd_id}).fetchone()
+            # Product display
+            product = alloc.get('product_display') or alloc.get('pt_code', 'N/A')
+            if len(product) > 40:
+                product = product[:37] + '...'
+            
+            # ETD display
+            allocated_etd = alloc.get('allocated_etd')
+            oc_etd = alloc.get('oc_etd')
+            etd_display = self._format_date(allocated_etd or oc_etd)
+            
+            if oc_etd and allocated_etd:
+                try:
+                    days_diff = self._compare_dates(allocated_etd, oc_etd)
+                    if days_diff > 0:
+                        etd_display = f"{self._format_date(allocated_etd)} <span class='etd-delay'>(+{days_diff}d)</span>"
+                except:
+                    pass
+            
+            rows_html += f"""
+            <tr>
+                <td>{alloc.get('oc_number', 'N/A')}</td>
+                <td>{alloc.get('customer_code', 'N/A')}</td>
+                <td title="{alloc.get('product_display', '')}">{product}</td>
+                <td style="text-align: right;">{self._format_number(alloc.get('final_qty', 0))}</td>
+                <td style="text-align: center;">{etd_display}</td>
+                <td style="text-align: right;" class="{coverage_class}">{coverage:.0f}%</td>
+            </tr>
+            """
+        
+        html_content = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>{self._build_base_style()}</head>
+        <body>
+            <div class="header header-blue">
+                <h1>✅ Your OCs Have Been Allocated</h1>
+                <p>{allocation_number}</p>
+            </div>
+            
+            <div class="content">
+                <p>Hi <strong>{creator_name}</strong>,</p>
+                <p>Your Order Confirmations have been allocated in bulk allocation <strong>{allocation_number}</strong>.</p>
                 
-                if result:
-                    return {
-                        'total_allocated': Decimal(str(result._mapping['total_allocated'])),
-                        'total_cancelled': Decimal(str(result._mapping['total_cancelled'])),
-                        'total_delivered': Decimal(str(result._mapping['total_delivered'])),
-                        'total_effective_allocated': Decimal(str(result._mapping['total_effective_allocated'])),
-                        'undelivered_allocated': Decimal(str(result._mapping['undelivered_allocated']))
-                    }
+                <div class="summary-grid">
+                    <div class="summary-item">
+                        <div class="summary-value">{oc_count}</div>
+                        <div class="summary-label">Your OCs</div>
+                    </div>
+                    <div class="summary-item">
+                        <div class="summary-value">{self._format_number(total_qty)}</div>
+                        <div class="summary-label">Total Allocated</div>
+                    </div>
+                </div>
+                
+                <h3>📋 Allocation Details</h3>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>OC Number</th>
+                            <th>Customer</th>
+                            <th>Product</th>
+                            <th style="text-align: right;">Allocated</th>
+                            <th style="text-align: center;">ETD</th>
+                            <th style="text-align: right;">Coverage</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {rows_html}
+                    </tbody>
+                </table>
+                
+                <div class="footer">
+                    <p>Allocated by: <strong>{allocator_name}</strong></p>
+                    <p>Date: {datetime.now().strftime('%d %b %Y %H:%M')}</p>
+                    <p style="margin-top: 10px; font-size: 11px;">
+                        This is an automated notification. Reply to this email to contact the allocator.
+                    </p>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+        
+        # CC: allocator + allocation group
+        cc_emails = [self.allocation_cc]
+        if allocator_email:
+            cc_emails.append(allocator_email)
+        
+        return self._send_email(
+            to_email=creator_email,
+            cc_emails=cc_emails,
+            reply_to=allocator_email or self.sender_email,
+            subject=subject,
+            html_content=html_content
+        )
+    
+    # ============== HELPER METHODS ==============
+    
+    def _build_allocation_table_rows(
+        self, 
+        allocation_results: List[Dict], 
+        split_allocations: Dict,
+        max_rows: int = 30
+    ) -> str:
+        """Build HTML table rows for allocation details"""
+        rows_html = ""
+        
+        # Sort by final_qty descending
+        sorted_results = sorted(
+            [a for a in allocation_results if float(a.get('final_qty', 0)) > 0],
+            key=lambda x: float(x.get('final_qty', 0)),
+            reverse=True
+        )[:max_rows]
+        
+        for alloc in sorted_results:
+            coverage = float(alloc.get('coverage_percent', 0))
+            coverage_class = 'coverage-high' if coverage >= 80 else 'coverage-mid' if coverage >= 50 else 'coverage-low'
             
-            return {
-                'total_allocated': Decimal('0'),
-                'total_cancelled': Decimal('0'),
-                'total_delivered': Decimal('0'),
-                'total_effective_allocated': Decimal('0'),
-                'undelivered_allocated': Decimal('0')
-            }
+            # Product display (truncate if long)
+            product = alloc.get('product_display') or alloc.get('pt_code', 'N/A')
+            if len(product) > 45:
+                product = product[:42] + '...'
             
-        except Exception as e:
-            logger.error(f"Error getting OC allocation summary: {e}")
-            return {
-                'total_allocated': Decimal('0'),
-                'total_cancelled': Decimal('0'),
-                'total_delivered': Decimal('0'),
-                'total_effective_allocated': Decimal('0'),
-                'undelivered_allocated': Decimal('0')
-            }
+            # ETD display with delay indicator
+            allocated_etd = alloc.get('allocated_etd')
+            oc_etd = alloc.get('oc_etd')
+            etd_display = self._format_date(allocated_etd or oc_etd)
+            
+            if oc_etd and allocated_etd:
+                try:
+                    days_diff = self._compare_dates(allocated_etd, oc_etd)
+                    if days_diff > 0:
+                        etd_display = f"<span class='etd-delay'>{self._format_date(allocated_etd)} (+{days_diff}d)</span>"
+                except:
+                    pass
+            
+            # Check for splits
+            ocd_id = alloc.get('ocd_id')
+            split_indicator = ""
+            if ocd_id and split_allocations.get(ocd_id) and len(split_allocations[ocd_id]) > 1:
+                split_indicator = f" <span style='color: #666; font-size: 10px;'>({len(split_allocations[ocd_id])} splits)</span>"
+            
+            rows_html += f"""
+            <tr>
+                <td>{alloc.get('oc_number', 'N/A')}{split_indicator}</td>
+                <td>{alloc.get('customer_code', 'N/A')}</td>
+                <td title="{alloc.get('product_display', '')}">{product}</td>
+                <td style="text-align: right; font-weight: bold;">{self._format_number(alloc.get('final_qty', 0))}</td>
+                <td style="text-align: center;">{etd_display}</td>
+                <td style="text-align: right;" class="{coverage_class}">{coverage:.0f}%</td>
+            </tr>
+            """
+        
+        # Show "and X more" if truncated
+        remaining = len([a for a in allocation_results if float(a.get('final_qty', 0)) > 0]) - max_rows
+        if remaining > 0:
+            rows_html += f"""
+            <tr>
+                <td colspan="6" style="text-align: center; font-style: italic; background: #f9f9f9;">
+                    ... and {remaining} more allocations
+                </td>
+            </tr>
+            """
+        
+        return rows_html
     
-    # ==================== HELPER METHODS ====================
+    def _compare_dates(self, date1, date2) -> int:
+        """Compare two dates, return difference in days (date1 - date2)"""
+        try:
+            from datetime import date as date_type
+            
+            def to_date(d):
+                if d is None:
+                    return None
+                if isinstance(d, str):
+                    return datetime.strptime(d[:10], '%Y-%m-%d').date()
+                if hasattr(d, 'date') and callable(d.date):
+                    return d.date()
+                if isinstance(d, date_type):
+                    return d
+                return d
+            
+            d1 = to_date(date1)
+            d2 = to_date(date2)
+            
+            if d1 and d2:
+                return (d1 - d2).days
+        except:
+            pass
+        return 0
     
-    def _build_base_scope_conditions(self, scope: Dict) -> Tuple[List[str], Dict]:
-        """
-        Build WHERE conditions from scope filters WITHOUT allocation status filters.
-        Used for getting summary statistics.
-        """
-        conditions = [
-            "p.delete_flag = 0",
-            "ocpd.pending_standard_delivery_quantity > 0"
-        ]
-        params = {}
-        
-        # Brand filter
-        if scope.get('brand_ids') and len(scope['brand_ids']) > 0:
-            placeholders = ', '.join([f':brand_{i}' for i in range(len(scope['brand_ids']))])
-            conditions.append(f"p.brand_id IN ({placeholders})")
-            for i, bid in enumerate(scope['brand_ids']):
-                params[f'brand_{i}'] = bid
-        
-        # Customer filter
-        if scope.get('customer_codes') and len(scope['customer_codes']) > 0:
-            placeholders = ', '.join([f':cust_{i}' for i in range(len(scope['customer_codes']))])
-            conditions.append(f"ocpd.customer_code IN ({placeholders})")
-            for i, code in enumerate(scope['customer_codes']):
-                params[f'cust_{i}'] = code
-        
-        # Legal entity filter
-        if scope.get('legal_entities') and len(scope['legal_entities']) > 0:
-            placeholders = ', '.join([f':le_{i}' for i in range(len(scope['legal_entities']))])
-            conditions.append(f"ocpd.legal_entity IN ({placeholders})")
-            for i, le in enumerate(scope['legal_entities']):
-                params[f'le_{i}'] = le
-        
-        # ETD range filter
-        if scope.get('etd_from'):
-            conditions.append("ocpd.etd >= :etd_from")
-            params['etd_from'] = scope['etd_from']
-        
-        if scope.get('etd_to'):
-            conditions.append("ocpd.etd <= :etd_to")
-            params['etd_to'] = scope['etd_to']
-        
-        return conditions, params
+    # ============== BACKWARD COMPATIBILITY ==============
     
-    def _build_scope_conditions(self, scope: Dict) -> Tuple[List[str], Dict]:
+    def get_recipients_for_scope(
+        self, 
+        scope: Dict, 
+        creator_email: str = None,
+        allocation_results: List[Dict] = None
+    ) -> List[str]:
         """
-        Build WHERE conditions from scope filters INCLUDING allocation status filters.
-        Used for getting demands to allocate.
+        Get email recipients (backward compatible method).
+        For bulk emails, use send_bulk_allocation_emails() instead.
         """
-        # Start with base conditions
-        conditions, params = self._build_base_scope_conditions(scope)
+        recipients = set()
         
-        # NEW: Exclude fully allocated OCs (default: True)
-        if scope.get('exclude_fully_allocated', True):
-            # Only include OCs that still need allocation (max_allocatable > 0)
-            conditions.append("""
-                GREATEST(0, LEAST(
-                    ocpd.standard_quantity - COALESCE(ocpd.total_effective_allocated_qty_standard, 0),
-                    ocpd.pending_standard_delivery_quantity - COALESCE(ocpd.undelivered_allocated_qty_standard, 0)
-                )) > 0
-            """)
+        if creator_email:
+            recipients.add(creator_email)
         
-        # NEW: Only unallocated OCs
-        if scope.get('only_unallocated', False):
-            # Only OCs with zero allocation
-            conditions.append("COALESCE(ocpd.total_effective_allocated_qty_standard, 0) = 0")
-            conditions.append("COALESCE(ocpd.undelivered_allocated_qty_standard, 0) = 0")
+        if self.allocation_cc:
+            recipients.add(self.allocation_cc)
         
-        # Include/exclude partial allocated (legacy - for backward compatibility)
-        elif not scope.get('include_partial_allocated', True):
-            # Only include OCs that have not been allocated yet
-            conditions.append("COALESCE(ocpd.total_effective_allocated_qty_standard, 0) = 0")
+        return [email for email in recipients if email]
+    
+    def send_bulk_allocation_email(
+        self,
+        commit_result: Dict,
+        allocation_results: List[Dict],
+        scope: Dict,
+        strategy_config: Dict,
+        recipients: List[str],
+        split_allocations: Dict = None
+    ) -> Dict[str, any]:
+        """
+        Backward compatible method.
+        Use send_bulk_allocation_emails() for full functionality.
+        """
+        # Just send summary to first recipient
+        if not recipients:
+            return {'success': False, 'message': 'No recipients'}
         
-        # Exclude over-committed OCs
-        if scope.get('exclude_over_committed', False):
-            conditions.append("ocpd.over_allocation_type IS NULL")
+        success, msg = self.send_summary_email_to_allocator(
+            commit_result=commit_result,
+            allocation_results=allocation_results,
+            scope=scope,
+            strategy_config=strategy_config,
+            allocator_email=recipients[0],
+            allocator_name='Allocator',
+            split_allocations=split_allocations or {}
+        )
         
-        return conditions, params
+        return {'success': success, 'message': msg}
