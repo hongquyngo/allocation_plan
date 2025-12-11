@@ -385,6 +385,9 @@ def render_step1_scope():
     
     scope = get_current_scope()
     
+    # Initialize variables for navigation logic
+    has_new_fields = False
+    
     # Validate scope
     scope_errors = services['validator'].validate_scope(scope)
     if scope_errors:
@@ -396,92 +399,119 @@ def render_step1_scope():
         with st.spinner("Loading scope summary..."):
             summary = services['data'].get_scope_summary(scope)
         
-        if summary['total_ocs'] == 0:
+        # Check if new fields exist (backward compatibility)
+        has_new_fields = 'need_allocation_count' in summary
+        
+        if summary.get('total_ocs', 0) == 0:
             st.info("No OCs found matching the selected scope. Please adjust your filters.")
         else:
-            # ===== ROW 1: OC Status Breakdown =====
-            st.markdown("###### 📋 OC Allocation Status")
+            if has_new_fields:
+                # ===== NEW UI: OC Status Breakdown =====
+                st.markdown("###### 📋 OC Allocation Status")
+                
+                c1, c2, c3, c4 = st.columns(4)
+                
+                c1.metric(
+                    "Total OCs in Scope",
+                    format_number(summary.get('total_ocs', 0)),
+                    help=SCOPE_TOOLTIPS.get('total_ocs', '')
+                )
+                c2.metric(
+                    "Need Allocation",
+                    format_number(summary.get('need_allocation_count', 0)),
+                    delta=f"{summary.get('need_allocation_percent', 0):.1f}%",
+                    help=SCOPE_TOOLTIPS.get('need_allocation', '')
+                )
+                c3.metric(
+                    "Fully Allocated",
+                    format_number(summary.get('fully_allocated_count', 0)),
+                    delta=f"{summary.get('fully_allocated_percent', 0):.1f}%",
+                    delta_color="off",
+                    help=SCOPE_TOOLTIPS.get('fully_allocated', '')
+                )
+                c4.metric(
+                    "Not Allocated",
+                    format_number(summary.get('not_allocated_count', 0)),
+                    help=SCOPE_TOOLTIPS.get('not_allocated', '')
+                )
+                
+                # Visual chart
+                render_allocation_status_chart(summary)
+                
+                # ===== ROW 2: Demand & Supply =====
+                st.markdown("###### 📦 Demand & Supply")
+                
+                m1, m2, m3, m4, m5 = st.columns(5)
+                
+                m1.metric(
+                    "Products",
+                    format_number(summary.get('total_products', 0)),
+                    help=SCOPE_TOOLTIPS.get('products', '')
+                )
+                m2.metric(
+                    "Total Demand",
+                    format_number(summary.get('total_demand', 0)),
+                    help=SCOPE_TOOLTIPS.get('total_demand', '')
+                )
+                m3.metric(
+                    "Allocatable Demand",
+                    format_number(summary.get('total_allocatable', 0)),
+                    help=SCOPE_TOOLTIPS.get('allocatable_demand', '')
+                )
+                m4.metric(
+                    "Available Supply",
+                    format_number(summary.get('available_supply', 0)),
+                    help=SCOPE_TOOLTIPS.get('available_supply', '')
+                )
+                
+                # Coverage based on allocatable demand
+                allocatable_coverage = summary.get('allocatable_coverage_percent', 0)
+                coverage_delta = "Sufficient" if allocatable_coverage >= 100 else "Shortage"
+                m5.metric(
+                    "Coverage",
+                    format_percentage(allocatable_coverage),
+                    delta=coverage_delta,
+                    delta_color="normal" if allocatable_coverage >= 100 else "inverse",
+                    help=SCOPE_TOOLTIPS.get('coverage', '')
+                )
+                
+                # Info box for filter effect
+                if st.session_state.scope_exclude_fully_allocated:
+                    filtered_count = summary.get('fully_allocated_count', 0)
+                    st.info(f"ℹ️ **{filtered_count}** fully allocated OCs will be excluded from allocation.")
             
-            c1, c2, c3, c4 = st.columns(4)
-            
-            c1.metric(
-                "Total OCs in Scope",
-                format_number(summary['total_ocs']),
-                help=SCOPE_TOOLTIPS['total_ocs']
-            )
-            c2.metric(
-                "Need Allocation",
-                format_number(summary['need_allocation_count']),
-                delta=f"{summary['need_allocation_percent']:.1f}%",
-                help=SCOPE_TOOLTIPS['need_allocation']
-            )
-            c3.metric(
-                "Fully Allocated",
-                format_number(summary['fully_allocated_count']),
-                delta=f"{summary['fully_allocated_percent']:.1f}%",
-                delta_color="off",
-                help=SCOPE_TOOLTIPS['fully_allocated']
-            )
-            c4.metric(
-                "Not Allocated",
-                format_number(summary['not_allocated_count']),
-                help=SCOPE_TOOLTIPS['not_allocated']
-            )
-            
-            # Visual chart
-            render_allocation_status_chart(summary)
-            
-            # ===== ROW 2: Demand & Supply =====
-            st.markdown("###### 📦 Demand & Supply")
-            
-            m1, m2, m3, m4, m5 = st.columns(5)
-            
-            m1.metric(
-                "Products",
-                format_number(summary['total_products']),
-                help=SCOPE_TOOLTIPS['products']
-            )
-            m2.metric(
-                "Total Demand",
-                format_number(summary['total_demand']),
-                help=SCOPE_TOOLTIPS['total_demand']
-            )
-            m3.metric(
-                "Allocatable Demand",
-                format_number(summary['total_allocatable']),
-                help=SCOPE_TOOLTIPS['allocatable_demand']
-            )
-            m4.metric(
-                "Available Supply",
-                format_number(summary['available_supply']),
-                help=SCOPE_TOOLTIPS['available_supply']
-            )
-            
-            # Coverage based on allocatable demand
-            allocatable_coverage = summary.get('allocatable_coverage_percent', 0)
-            coverage_delta = "Sufficient" if allocatable_coverage >= 100 else "Shortage"
-            m5.metric(
-                "Coverage",
-                format_percentage(allocatable_coverage),
-                delta=coverage_delta,
-                delta_color="normal" if allocatable_coverage >= 100 else "inverse",
-                help=SCOPE_TOOLTIPS['coverage']
-            )
-            
-            # Info box for filter effect
-            if st.session_state.scope_exclude_fully_allocated:
-                filtered_count = summary['fully_allocated_count']
-                st.info(f"ℹ️ **{filtered_count}** fully allocated OCs will be excluded from allocation.")
+            else:
+                # ===== FALLBACK: Old UI (backward compatible) =====
+                m1, m2, m3, m4, m5 = st.columns(5)
+                m1.metric("Products", format_number(summary.get('total_products', 0)))
+                m2.metric("OCs", format_number(summary.get('total_ocs', 0)))
+                m3.metric("Total Demand", format_number(summary.get('total_demand', 0)))
+                m4.metric("Available Supply", format_number(summary.get('available_supply', 0)))
+                m5.metric("Coverage", format_percentage(summary.get('coverage_percent', 0)))
     
     # Navigation
     st.divider()
     col1, col2, col3 = st.columns([1, 2, 1])
     with col3:
-        can_proceed = (
-            not bool(scope_errors) and 
-            summary.get('total_ocs', 0) > 0 and
-            summary.get('need_allocation_count', 0) > 0
-        )
+        # Determine if can proceed (backward compatible)
+        if has_new_fields:
+            can_proceed = (
+                not bool(scope_errors) and 
+                summary.get('total_ocs', 0) > 0 and
+                summary.get('need_allocation_count', 0) > 0
+            )
+            no_allocation_needed = (
+                summary.get('total_ocs', 0) > 0 and 
+                summary.get('need_allocation_count', 0) == 0
+            )
+        else:
+            # Fallback: just check total_ocs > 0
+            can_proceed = (
+                not bool(scope_errors) and 
+                summary.get('total_ocs', 0) > 0
+            )
+            no_allocation_needed = False
+        
         if st.button(
             "Next: Choose Strategy →", 
             type="primary", 
@@ -492,7 +522,7 @@ def render_step1_scope():
             st.session_state.bulk_step = 2
             st.rerun()
         
-        if not can_proceed and summary.get('total_ocs', 0) > 0 and summary.get('need_allocation_count', 0) == 0:
+        if no_allocation_needed:
             st.warning("⚠️ All OCs are fully allocated. Nothing to allocate.")
 
 
