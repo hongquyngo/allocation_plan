@@ -10,6 +10,12 @@ Handles all data queries for bulk allocation including:
 
 REFACTORED: 2024-12 - Added OC creator info (oc_creator_email, oc_creator_name) 
                       from outbound_oc_pending_delivery_view for email notifications
+
+BUGFIX: 2024-12 - Fixed HIGH VALUE FILTER: Changed unit_price_usd (non-existent) 
+                  to outstanding_amount_usd (line 670)
+
+FEATURE: 2024-12 - Implemented STOCK AVAILABLE FILTER that was missing (lines 643-663)
+                   Now filters OCs to only show products with available supply
 """
 import pandas as pd
 import logging
@@ -640,12 +646,35 @@ class BulkAllocationData:
                  NULLIF(ocpd.pending_standard_delivery_quantity, 0) * 100) < {threshold}
             """)
         
+        # ========== STOCK AVAILABLE FILTER (NEW) ==========
+        if scope.get('stock_available_only', False):
+            # Only include OCs for products that have available supply
+            # Check across all 4 supply sources: Inventory, CAN, PO, WHT
+            conditions.append("""
+                ocpd.product_id IN (
+                    SELECT DISTINCT product_id FROM (
+                        SELECT product_id FROM inventory_detailed_view 
+                        WHERE remaining_quantity > 0
+                        UNION
+                        SELECT product_id FROM can_pending_stockin_view 
+                        WHERE pending_quantity > 0
+                        UNION
+                        SELECT product_id FROM purchase_order_full_view 
+                        WHERE pending_standard_arrival_quantity > 0
+                        UNION
+                        SELECT product_id FROM warehouse_transfer_details_view 
+                        WHERE is_completed = 0 AND transfer_quantity > 0
+                    ) products_with_supply
+                )
+            """)
+        
         # ========== HIGH VALUE FILTER ==========
         if scope.get('high_value_only', False):
             threshold = scope.get('high_value_threshold', 10000)
-            # Order value = qty * unit_price (assuming oc has order_value or can calculate)
+            # FIX: Use outstanding_amount_usd (pre-calculated in view)
+            # BUG FIXED: unit_price_usd column does not exist in view
             conditions.append(f"""
-                COALESCE(ocpd.pending_standard_delivery_quantity * ocpd.unit_price_usd, 0) >= {threshold}
+                COALESCE(ocpd.outstanding_amount_usd, 0) >= {threshold}
             """)
         
         # ========== OVER-ALLOCATION EXCLUSION ==========

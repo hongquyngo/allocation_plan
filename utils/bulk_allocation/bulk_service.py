@@ -9,6 +9,11 @@ Business logic for bulk allocation operations including:
 - Split allocation support (multiple ETDs per OC)
 
 REFACTORED: 2024-12 - Fixed allocation number race condition with SELECT FOR UPDATE
+
+BUGFIX: 2024-12 - Fixed FK constraint violations in _insert_allocation_detail():
+  - product_id: Validate before insert, no default 0 (FK to products.id)
+  - customer_code: Use None instead of '' (FK to companies.company_code)
+  - Other varchar fields: Use None instead of '' for consistency
 """
 import logging
 from datetime import datetime
@@ -465,7 +470,25 @@ class BulkAllocationService:
         split_index: int = None,
         total_splits: int = None
     ) -> Optional[int]:
-        """Insert a single allocation detail record"""
+        """
+        Insert a single allocation detail record
+        
+        FIXED 2024-12:
+        - Validate product_id before insert (FK constraint)
+        - Use None instead of '' for nullable FK fields (customer_code)
+        - Use None instead of '' for other varchar fields for consistency
+        """
+        
+        # ===== VALIDATION: product_id is required (FK + NOT NULL) =====
+        product_id = oc_info.get('product_id')
+        if not product_id:
+            logger.error(f"Cannot insert allocation: missing product_id for ocd_id {ocd_id}")
+            return None
+        
+        # ===== VALIDATION: customer_code (FK allows NULL but not empty string) =====
+        customer_code = oc_info.get('customer_code')
+        if not customer_code:
+            logger.warning(f"Missing customer_code for ocd_id {ocd_id}, setting to NULL")
         
         etd = oc_info.get('etd')
         allocation_mode = strategy_config.get('allocation_mode', 'SOFT')
@@ -500,12 +523,12 @@ class BulkAllocationService:
                 'allocation_plan_id': allocation_plan_id,
                 'allocation_mode': allocation_mode,
                 'demand_reference_id': ocd_id,
-                'demand_number': oc_info.get('oc_number', ''),
-                'product_id': int(oc_info.get('product_id', 0)),
-                'pt_code': oc_info.get('pt_code', ''),
-                'customer_code': oc_info.get('customer_code', ''),
-                'customer_name': oc_info.get('customer', ''),
-                'legal_entity_name': oc_info.get('legal_entity', ''),
+                'demand_number': oc_info.get('oc_number') or None,  # FIX: None instead of ''
+                'product_id': int(product_id),  # FIX: Validated above, no default 0
+                'pt_code': oc_info.get('pt_code') or None,  # FIX: None instead of ''
+                'customer_code': customer_code or None,  # FIX: None instead of '' (FK!)
+                'customer_name': oc_info.get('customer') or None,  # FIX: None instead of ''
+                'legal_entity_name': oc_info.get('legal_entity') or None,  # FIX: None instead of ''
                 'requested_qty': self._to_decimal(oc_info.get('pending_qty', 0)),
                 'allocated_qty': allocated_qty,
                 'etd': etd,
