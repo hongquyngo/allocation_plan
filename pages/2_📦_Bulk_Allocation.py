@@ -13,6 +13,12 @@ Features:
 REFACTORED: 2024-12 - Added customer name display, deduplicated product display logic
 REFACTORED: 2024-12 - Fixed CSS leak in allocation status chart
 REFACTORED: 2024-12 - Added demands_dict to email notification for OC creator lookup
+REFACTORED: 2024-12 - Improved email notification UI:
+    - Separate spinner for email sending (vs DB commit)
+    - Preview recipients before sending
+    - Email metrics (Summary/Individual/Errors) in columns
+    - Detailed success/warning/error messages
+    - Expander for error details
 """
 import streamlit as st
 import pandas as pd
@@ -1459,24 +1465,38 @@ def render_step3_commit():
     st.divider()
     st.markdown("##### 💾 Commit Allocation")
     
+    # Check if already committed
+    already_committed = st.session_state.get('commit_result') is not None
+    
     notes = st.text_area(
         "Notes (optional)",
         placeholder="Add any notes about this bulk allocation...",
-        key="commit_notes"
+        key="commit_notes",
+        disabled=already_committed  # Disable notes input after commit
     )
     
     nav_col1, nav_col2, nav_col3 = st.columns([1, 1, 1])
     
     with nav_col1:
-        if st.button("← Back to Strategy", key="back_to_step2"):
+        if st.button("← Back to Strategy", key="back_to_step2", disabled=already_committed):
             st.session_state.bulk_step = 2
             st.rerun()
     
     with nav_col3:
-        if st.button("💾 Commit Allocation", type="primary", 
-                    disabled=not validation_result['valid'] or allocated_count == 0,
-                    key="commit_btn"):
-            commit_bulk_allocation(edited_df, base_df, notes)
+        # Disable button if: validation failed, no allocations, OR already committed
+        commit_disabled = (
+            not validation_result['valid'] or 
+            allocated_count == 0 or 
+            already_committed
+        )
+        
+        if already_committed:
+            st.button("✅ Already Committed", type="secondary", disabled=True, key="commit_btn_disabled")
+        else:
+            if st.button("💾 Commit Allocation", type="primary", 
+                        disabled=commit_disabled,
+                        key="commit_btn"):
+                commit_bulk_allocation(edited_df, base_df, notes)
 
 
 def commit_bulk_allocation(edited_df: pd.DataFrame, original_df: pd.DataFrame, notes: str):
@@ -1554,52 +1574,147 @@ def commit_bulk_allocation(edited_df: pd.DataFrame, original_df: pd.DataFrame, n
         
         if result['success']:
             st.session_state.commit_result = result
+            
+            # ===== COMMIT SUCCESS SECTION =====
             st.success(f"✅ Bulk allocation committed successfully!")
             st.info(f"Allocation Number: **{result['allocation_number']}**")
             
-            col_r1, col_r2, col_r3 = st.columns(3)
+            # Commit metrics - 4 columns
+            col_r1, col_r2, col_r3, col_r4 = st.columns(4)
             col_r1.metric("OCs Allocated", result['detail_count'])
             col_r2.metric("Total Quantity", format_number(result['total_allocated']))
-            if excluded_ocs:
-                col_r3.metric("OCs Excluded", len(excluded_ocs))
+            col_r3.metric("Products", result.get('products_affected', 0))
+            col_r4.metric("Customers", result.get('customers_affected', 0))
             
+            # Show excluded OCs if any
+            if excluded_ocs:
+                excluded_display = ', '.join(excluded_ocs[:5])
+                if len(excluded_ocs) > 5:
+                    excluded_display += f"... (+{len(excluded_ocs) - 5} more)"
+                st.warning(f"⚠️ {len(excluded_ocs)} OC(s) excluded from allocation: {excluded_display}")
+            
+            # Show split count if any
+            if result.get('split_count', 0) > 0:
+                st.info(f"✂️ {result['split_count']} OC(s) have split allocations (multiple ETDs)")
+            
+            # ===== EMAIL NOTIFICATION SECTION =====
+            st.divider()
+            st.markdown("##### 📧 Email Notifications")
+            
+            # Preview recipients before sending
             try:
-                email_result = services['email'].send_bulk_allocation_emails(
-                    commit_result=result,
-                    allocation_results=allocation_results,
-                    scope=get_current_scope(),
-                    strategy_config=strategy_config,
-                    allocator_user_id=user.get('id'),
-                    demands_dict=demands_dict,
-                    split_allocations=filtered_split_allocations  # Use filtered splits
+                allocator_info = services['email'].get_user_info(user.get('id'))
+                allocator_email = allocator_info.get('email', 'N/A') if allocator_info else 'N/A'
+            except:
+                allocator_email = user.get('email', 'N/A')
+            
+            # Count unique OC creators (excluding allocator)
+            creator_emails = set()
+            for alloc in allocation_results:
+                ocd_id = int(alloc['ocd_id'])
+                oc_info = demands_dict.get(ocd_id, {})
+                email = oc_info.get('oc_creator_email', '')
+                if email and email.strip().lower() != allocator_email.lower():
+                    creator_emails.add(email.strip().lower())
+            
+            st.caption(f"📤 Recipients: **{allocator_email}** (summary) + **{len(creator_emails)}** OC creator(s)")
+            
+            # Send emails with separate spinner
+            email_result = None
+            with st.spinner("📧 Sending email notifications..."):
+                try:
+                    email_result = services['email'].send_bulk_allocation_emails(
+                        commit_result=result,
+                        allocation_results=allocation_results,
+                        scope=get_current_scope(),
+                        strategy_config=strategy_config,
+                        allocator_user_id=user.get('id'),
+                        demands_dict=demands_dict,
+                        split_allocations=filtered_split_allocations
+                    )
+                except Exception as e:
+                    logger.warning(f"Email notification failed: {e}")
+                    email_result = {'success': False, 'errors': [str(e)]}
+            
+            # Display email results with metrics
+            if email_result and email_result.get('success'):
+                em1, em2, em3 = st.columns(3)
+                
+                summary_sent = email_result.get('summary_sent', False)
+                em1.metric(
+                    "Summary Email",
+                    "✓ Sent" if summary_sent else "✗ Failed",
+                    help="Email to allocator with all OCs"
                 )
                 
-                if email_result.get('success'):
-                    summary_status = "✓" if email_result.get('summary_sent') else "✗"
-                    individual_sent = email_result.get('individual_sent', 0)
-                    individual_total = email_result.get('individual_total', 0)
-                    
-                    st.success(f"📧 Emails sent: Summary {summary_status} | Individual: {individual_sent}/{individual_total} OC creators")
-                    
-                    if email_result.get('errors'):
-                        with st.expander("⚠️ Email errors", expanded=False):
-                            for err in email_result['errors']:
-                                st.caption(f"• {err}")
+                individual_sent = email_result.get('individual_sent', 0)
+                individual_total = email_result.get('individual_total', 0)
+                em2.metric(
+                    "Individual Emails",
+                    f"{individual_sent}/{individual_total}",
+                    help="Emails to OC creators with their specific OCs"
+                )
+                
+                error_count = len(email_result.get('errors', []))
+                if error_count > 0:
+                    em3.metric("Errors", error_count, delta="failed", delta_color="inverse")
                 else:
-                    st.warning(f"📧 Email: {email_result.get('message', 'Failed')}")
-                    
-            except Exception as e:
-                logger.warning(f"Email notification failed: {e}")
-                st.warning(f"Email notification failed: {e}")
+                    em3.metric("Status", "✓ Complete", delta="all sent", delta_color="off")
+                
+                # Success/warning message based on results
+                total_expected = individual_total + 1  # +1 for summary
+                total_sent = individual_sent + (1 if summary_sent else 0)
+                
+                if total_sent == total_expected and total_expected > 0:
+                    st.success("✅ All email notifications sent successfully!")
+                elif total_sent > 0:
+                    st.warning(f"⚠️ Partial success: {total_sent}/{total_expected} emails sent")
+                elif total_expected == 0:
+                    st.info("ℹ️ No email recipients found")
+                
+                # Error details in expander
+                if email_result.get('errors'):
+                    with st.expander(f"⚠️ Email errors ({error_count})", expanded=False):
+                        for err in email_result['errors']:
+                            st.caption(f"• {err}")
             
-            if st.button("🔄 Start New Bulk Allocation", key="new_allocation_btn"):
+            elif email_result:
+                st.error("❌ Email notifications failed")
+                if email_result.get('errors'):
+                    with st.expander("Error details", expanded=True):
+                        for err in email_result['errors'][:5]:
+                            st.caption(f"• {err}")
+                        if len(email_result.get('errors', [])) > 5:
+                            st.caption(f"... and {len(email_result['errors']) - 5} more errors")
+            else:
+                st.warning("⚠️ Email service unavailable")
+            
+            # ===== NEW ALLOCATION BUTTON =====
+            st.divider()
+            if st.button("🔄 Start New Bulk Allocation", key="new_allocation_btn", type="primary"):
+                # Reset all bulk allocation related session state
+                keys_to_delete = [
+                    'commit_result', 'is_committing',  # Commit state
+                    'simulation_results', 'demands_df', 'supply_df',  # Data
+                    'adjusted_allocations', 'split_allocations',  # Fine-tuning
+                ]
+                for key in keys_to_delete:
+                    if key in st.session_state:
+                        del st.session_state[key]
+                
+                # Delete prefixed keys
                 for key in list(st.session_state.keys()):
                     if key.startswith('bulk_') or key.startswith('scope_') or key.startswith('strategy_'):
                         del st.session_state[key]
+                
                 init_session_state()
                 st.rerun()
+        
         else:
             st.error(f"❌ Failed to commit: {result.get('error', 'Unknown error')}")
+            if result.get('technical_error'):
+                with st.expander("Technical details", expanded=False):
+                    st.code(result['technical_error'])
 
 
 
