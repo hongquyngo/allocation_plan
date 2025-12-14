@@ -1768,7 +1768,8 @@ def render_step3_commit():
             ocd_id = base_df.iloc[i]['ocd_id']
             oc_number = base_df.iloc[i]['oc_number']
             product = base_df.iloc[i]['product_display'][:50]
-            customer = base_df.iloc[i].get('customer_name', 'N/A')[:30]
+            # BUGFIX: Changed 'customer_name' to 'customer_display' - field name mismatch
+            customer = base_df.iloc[i].get('customer_display', 'N/A')[:30]
             
             if ocd_id in st.session_state.split_allocations and len(st.session_state.split_allocations[ocd_id]) > 1:
                 # Split allocation
