@@ -85,8 +85,7 @@ if not user or not user.get('id'):
     st.error("Please login to access this page")
     st.stop()
 
-# Initialize services
-@st.cache_resource
+# Initialize services (no caching to avoid stale data after code updates)
 def get_services():
     return {
         'data': BulkAllocationData(),
@@ -97,6 +96,16 @@ def get_services():
     }
 
 services = get_services()
+
+# Developer option: Clear all caches (in sidebar)
+with st.sidebar:
+    if user.get('role') in ['admin', 'GM', 'MD']:
+        with st.expander("🔧 Developer Tools", expanded=False):
+            if st.button("🗑️ Clear Cache", help="Clear all cached data. Use after code updates."):
+                st.cache_data.clear()
+                st.cache_resource.clear()
+                st.success("✅ Cache cleared!")
+                st.rerun()
 
 # ==================== SESSION STATE INITIALIZATION ====================
 
