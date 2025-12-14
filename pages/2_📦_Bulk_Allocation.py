@@ -10,6 +10,47 @@ Features:
 - Simulation preview with fine-tuning
 - Bulk commit with summary email
 
+REFACTORED: 2024-12 - Added customer name display, deduplicated product display logic
+REFACTORED: 2024-12 - Fixed CSS leak in allocation status chart
+REFACTORED: 2024-12 - Added demands_dict to email notification for OC creator lookup
+REFACTORED: 2024-12 - Improved email notification UI:
+    - Separate spinner for email sending (vs DB commit)
+    - Preview recipients before sending
+    - Email metrics (Summary/Individual/Errors) in columns
+    - Detailed success/warning/error messages
+    - Expander for error details
+FEATURE: 2024-12 - Added Supply Context UI in Step 3:
+    - Supply summary panel showing Total/Committed/Available
+    - Available supply column in fine-tuning table
+    - Product supply detail expander
+BUGFIX: 2024-12 - Fixed "Select All" button not re-selecting unchecked rows
+FEATURE: 2024-12 - Added "Clear All" button to deselect all rows
+    - Renamed "Include All" → "Select All" for clarity
+    - Added force_include_all / force_clear_all session state flags
+FEATURE: 2024-12 - Added navigation buttons after commit:
+    - New Allocation (go home), Same Scope, Adjust Scope
+    - Separate navigation for commit fail scenario
+FEATURE: 2024-12 - Added Developer Tools (Clear Cache) for admin/GM/MD
+BUGFIX: 2024-12 - Fixed checkbox edits resetting on rerun:
+    - Store include states in allocation_include_states session state
+    - Sync from widget state BEFORE building base_df
+BUGFIX: 2024-12 - Fixed Split Allocation ETD not updating:
+    - Root cause: Form widgets don't commit to session_state until submit
+    - Buttons outside form couldn't read edited values
+    - Solution: Replaced form with regular widgets (sync immediately)
+    - Kept Save button for explicit save action
+REFACTORED: 2024-12 - Split Allocation pending/saved separation:
+    - Added pending_split_edits for unsaved changes
+    - Add/Remove only updates pending state
+    - Save button commits pending to split_allocations
+    - Active Splits only shows saved configurations
+    - Unsaved changes indicator
+FEATURE: 2024-12 - Split Allocation UX improvements:
+    - Added ocd_id column to allocation editor for easy reference
+    - Full product display in dropdown (no truncation)
+    - Dropdown shows [ID:xxx] prefix for quick identification
+    - @st.fragment wrapper to prevent full page rerun on qty/etd changes
+    - Note: Requires Streamlit >= 1.33.0 for fragment support
 """
 import streamlit as st
 import pandas as pd
@@ -1225,6 +1266,27 @@ def render_step3_commit():
         # Get include value from stored states (preserves user edits)
         include_row = st.session_state.allocation_include_states.get(r.ocd_id, r.suggested_qty > 0)
         
+        # ========== SYNC FROM SAVED SPLITS ==========
+        # Check if this OC has saved split allocations
+        saved_splits = st.session_state.split_allocations.get(r.ocd_id, [])
+        has_saved_split = len(saved_splits) > 1
+        
+        if has_saved_split:
+            # Sync final_qty from saved splits total
+            split_total_qty = sum(s['qty'] for s in saved_splits)
+            # Build split_info string: "✂️ 2026-01-05 (2), 2026-01-07 (2)"
+            split_etd_parts = [f"{s['etd']} ({s['qty']:.0f})" for s in saved_splits]
+            split_info = "✂️ " + ", ".join(split_etd_parts)
+            # Use first ETD for allocated_etd column (for date sorting)
+            first_split_etd = saved_splits[0]['etd'] if saved_splits else oc_etd
+            # Coverage based on split total
+            coverage_pct = (split_total_qty / r.demand_qty * 100) if r.demand_qty > 0 else 0
+        else:
+            split_total_qty = r.suggested_qty
+            split_info = ""
+            first_split_etd = oc_etd
+            coverage_pct = (r.suggested_qty / r.demand_qty * 100) if r.demand_qty > 0 else 0
+        
         base_data.append({
             'ocd_id': r.ocd_id,
             'product_id': r.product_id,  # NEW: needed for supply detail
@@ -1239,13 +1301,16 @@ def render_step3_commit():
             'package_size': oc_info.get('package_size', ''),
             'allocation_status': oc_info.get('allocation_status', ''),
             'oc_etd': oc_etd,
-            'allocated_etd': oc_etd,
+            'allocated_etd': first_split_etd,  # Use first split ETD if has splits
             'demand_qty': r.demand_qty,
             'current_allocated': r.current_allocated,
             'suggested_qty': r.suggested_qty,
-            'final_qty': r.suggested_qty,
-            'coverage_pct': (r.suggested_qty / r.demand_qty * 100) if r.demand_qty > 0 else 0,
-            # NEW: Supply context fields
+            'final_qty': split_total_qty,  # Sync from saved splits if exists
+            'coverage_pct': coverage_pct,
+            # NEW: Split info column
+            'split_info': split_info,
+            'has_split': has_saved_split,
+            # Supply context fields
             'available_supply': available_supply,
             'supply_coverage': supply_coverage,
             'standard_uom': oc_info.get('standard_uom', '')
@@ -1297,12 +1362,12 @@ def render_step3_commit():
         show_supply_col = st.checkbox("📦 Show Supply", value=True, 
                                       help="Show available supply column")
     
-    # Build display columns - Added ocd_id for reference when selecting split
+    # Build display columns - Added ocd_id for reference when selecting split, split_info for split indicator
     display_columns = ['include', 'ocd_id', 'oc_number', 'customer_display', 'product_display']
     if show_supply_col:
         display_columns.append('available_supply')
     display_columns.extend(['allocation_status', 'oc_etd', 'demand_qty', 'current_allocated', 
-                           'suggested_qty', 'final_qty', 'allocated_etd', 'coverage_pct'])
+                           'suggested_qty', 'final_qty', 'split_info', 'allocated_etd', 'coverage_pct'])
     
     # Build column config
     column_config = {
@@ -1327,8 +1392,10 @@ def render_step3_commit():
             help=REVIEW_TOOLTIPS['suggested_qty']),
         'final_qty': st.column_config.NumberColumn('Final Qty ✏️', format="%.0f", width="small",
             help=REVIEW_TOOLTIPS['final_qty']),
+        'split_info': st.column_config.TextColumn('Split ETDs', disabled=True, width="medium",
+            help="✂️ Split allocation info: ETD (qty) for each split.\nEmpty = regular allocation (single ETD).\nEdit splits in the Split Allocation section below."),
         'allocated_etd': st.column_config.DateColumn('Alloc ETD ✏️', width="small",
-            help="Allocated ETD - defaults to OC ETD. Adjust if needed."),
+            help="Allocated ETD - defaults to OC ETD. For split allocations, this shows the first ETD."),
         'coverage_pct': st.column_config.NumberColumn('Coverage %', disabled=True, format="%.1f%%", width="small",
             help=REVIEW_TOOLTIPS['coverage_pct'])
     }
