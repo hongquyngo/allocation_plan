@@ -153,12 +153,16 @@ def show_cancel_allocation_modal():
     )
     
     # Validation
-    valid, error = validator.validate_cancel(
+    validation_errors = validator.validate_cancel_allocation(
         allocation,
         cancel_qty,
         reason,
+        reason_category,
         st.session_state.user['role']
     )
+    
+    valid = len(validation_errors) == 0
+    error = validation_errors[0] if validation_errors else None
     
     if not valid and error:
         st.warning(f"⚠️ {error}")
