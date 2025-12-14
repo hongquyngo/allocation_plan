@@ -1523,6 +1523,7 @@ def render_step3_commit():
                 st.session_state.split_allocations[ocd_id] = valid_splits if valid_splits else [{'qty': 0, 'etd': default_etd}]
                 st.session_state.split_save_success = ocd_id  # Flag for success message
                 st.session_state.split_expander_open = True  # Keep expander open
+                st.session_state.split_edit_target = ocd_id  # Keep same OC selected
                 st.rerun()
             
             # Show persistent success message
@@ -1535,11 +1536,13 @@ def render_step3_commit():
                 remaining = max(0, max_qty - total_so_far)
                 st.session_state.split_allocations[ocd_id] = form_splits + [{'qty': remaining, 'etd': default_etd}]
                 st.session_state.split_expander_open = True  # Keep expander open
+                st.session_state.split_edit_target = ocd_id  # Keep same OC selected
                 st.rerun()
             
             if remove_clicked and len(splits) > 1:
                 st.session_state.split_allocations[ocd_id] = form_splits[:-1] if len(form_splits) > 1 else [form_splits[0]]
                 st.session_state.split_expander_open = True  # Keep expander open
+                st.session_state.split_edit_target = ocd_id  # Keep same OC selected
                 st.rerun()
             
             # Total validation with visual feedback
