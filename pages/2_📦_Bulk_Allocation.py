@@ -315,6 +315,9 @@ def clear_simulation():
     # Clear split expander state
     if 'split_expander_open' in st.session_state:
         del st.session_state['split_expander_open']
+    # Clear commit confirmation state
+    if 'show_commit_confirmation' in st.session_state:
+        del st.session_state['show_commit_confirmation']
 
 # ==================== PAGE HEADER ====================
 
@@ -1473,6 +1476,46 @@ def render_step3_commit():
             
             splits = st.session_state.split_allocations[ocd_id]
             
+            # Add/Remove buttons OUTSIDE form - don't save current values
+            btn_col1, btn_col2, btn_col3 = st.columns([1, 1, 1])
+            with btn_col1:
+                add_clicked = st.button("➕ Add Split", key=f"add_split_{ocd_id}")
+            with btn_col3:
+                remove_clicked = st.button("🗑️ Remove Last", key=f"remove_last_{ocd_id}", 
+                                          disabled=len(splits) <= 1)
+            
+            # Handle Add/Remove BEFORE form renders
+            if add_clicked:
+                # Redistribute qty evenly across all splits (including new one)
+                current_total = sum(s['qty'] for s in splits)
+                new_count = len(splits) + 1
+                qty_per_split = current_total / new_count
+                
+                # Create new splits with even distribution, keeping original ETDs
+                new_splits = []
+                for i, s in enumerate(splits):
+                    new_splits.append({'qty': qty_per_split, 'etd': s['etd']})
+                # Add new entry with remaining qty and default ETD
+                new_splits.append({'qty': qty_per_split, 'etd': default_etd})
+                
+                st.session_state.split_allocations[ocd_id] = new_splits
+                st.session_state.split_expander_open = True
+                st.session_state.split_edit_target = ocd_id
+                st.rerun()
+            
+            if remove_clicked and len(splits) > 1:
+                # Remove last entry, redistribute its qty to remaining splits
+                removed_qty = splits[-1]['qty']
+                remaining_splits = splits[:-1]
+                if remaining_splits and removed_qty > 0:
+                    add_per_split = removed_qty / len(remaining_splits)
+                    for s in remaining_splits:
+                        s['qty'] += add_per_split
+                st.session_state.split_allocations[ocd_id] = remaining_splits
+                st.session_state.split_expander_open = True
+                st.session_state.split_edit_target = ocd_id
+                st.rerun()
+            
             with st.form(key=f"split_form_{ocd_id}"):
                 st.markdown("**Split Entries:**")
                 
@@ -1510,13 +1553,7 @@ def render_step3_commit():
                 if max_qty <= 0:
                     st.warning("⚠️ This OC has no remaining allocatable quantity.")
                 
-                col_save, col_add, col_remove = st.columns([1, 1, 1])
-                with col_save:
-                    save_clicked = st.form_submit_button("💾 Save Splits", type="primary")
-                with col_add:
-                    add_clicked = st.form_submit_button("➕ Add Split")
-                with col_remove:
-                    remove_clicked = st.form_submit_button("🗑️ Remove Last")
+                save_clicked = st.form_submit_button("💾 Save Splits", type="primary")
             
             if save_clicked:
                 valid_splits = [s for s in form_splits if s['qty'] > 0]
@@ -1530,20 +1567,6 @@ def render_step3_commit():
             if st.session_state.get('split_save_success') == ocd_id:
                 st.success("✅ Splits saved successfully!")
                 del st.session_state['split_save_success']
-            
-            if add_clicked:
-                total_so_far = sum(s['qty'] for s in form_splits)
-                remaining = max(0, max_qty - total_so_far)
-                st.session_state.split_allocations[ocd_id] = form_splits + [{'qty': remaining, 'etd': default_etd}]
-                st.session_state.split_expander_open = True  # Keep expander open
-                st.session_state.split_edit_target = ocd_id  # Keep same OC selected
-                st.rerun()
-            
-            if remove_clicked and len(splits) > 1:
-                st.session_state.split_allocations[ocd_id] = form_splits[:-1] if len(form_splits) > 1 else [form_splits[0]]
-                st.session_state.split_expander_open = True  # Keep expander open
-                st.session_state.split_edit_target = ocd_id  # Keep same OC selected
-                st.rerun()
             
             # Total validation with visual feedback
             total_split_qty = sum(s['qty'] for s in st.session_state.split_allocations[ocd_id])
@@ -1719,36 +1742,125 @@ def render_step3_commit():
     
     # Check if already committed
     already_committed = st.session_state.get('commit_result') is not None
+    show_confirmation = st.session_state.get('show_commit_confirmation', False)
     
     notes = st.text_area(
         "Notes (optional)",
         placeholder="Add any notes about this bulk allocation...",
         key="commit_notes",
-        disabled=already_committed  # Disable notes input after commit
+        disabled=already_committed or show_confirmation
     )
     
-    nav_col1, nav_col2, nav_col3 = st.columns([1, 1, 1])
-    
-    with nav_col1:
-        if st.button("← Back to Strategy", key="back_to_step2", disabled=already_committed):
-            st.session_state.bulk_step = 2
-            st.rerun()
-    
-    with nav_col3:
-        # Disable button if: validation failed, no allocations, OR already committed
-        commit_disabled = (
-            not validation_result['valid'] or 
-            allocated_count == 0 or 
-            already_committed
-        )
+    # ==================== CONFIRMATION DIALOG ====================
+    if show_confirmation and not already_committed:
+        st.markdown("---")
+        st.markdown("### 📋 Review Allocation Plan")
+        st.info("Please review the allocation details below before confirming.")
         
-        if already_committed:
-            st.button("✅ Already Committed", type="secondary", disabled=True, key="commit_btn_disabled")
-        else:
-            if st.button("💾 Commit Allocation", type="primary", 
-                        disabled=commit_disabled,
-                        key="commit_btn"):
+        # Build allocation details for confirmation
+        regular_allocations = []
+        split_allocation_details = []
+        
+        for i, row in edited_df.iterrows():
+            if not row.get('include', True):
+                continue
+            
+            ocd_id = base_df.iloc[i]['ocd_id']
+            oc_number = base_df.iloc[i]['oc_number']
+            product = base_df.iloc[i]['product_display'][:50]
+            customer = base_df.iloc[i].get('customer_name', 'N/A')[:30]
+            
+            if ocd_id in st.session_state.split_allocations and len(st.session_state.split_allocations[ocd_id]) > 1:
+                # Split allocation
+                splits = st.session_state.split_allocations[ocd_id]
+                split_allocation_details.append({
+                    'oc_number': oc_number,
+                    'product': product,
+                    'customer': customer,
+                    'splits': splits,
+                    'total_qty': sum(s['qty'] for s in splits)
+                })
+            else:
+                # Regular allocation
+                regular_allocations.append({
+                    'oc_number': oc_number,
+                    'product': product,
+                    'customer': customer,
+                    'qty': row['final_qty'],
+                    'etd': row['allocated_etd']
+                })
+        
+        # Summary metrics in confirmation
+        conf_col1, conf_col2, conf_col3, conf_col4 = st.columns(4)
+        conf_col1.metric("🎯 Total Quantity", format_number(final_total))
+        conf_col2.metric("📦 Regular Allocations", len(regular_allocations))
+        conf_col3.metric("✂️ Split Allocations", len(split_allocation_details))
+        conf_col4.metric("❌ Excluded OCs", excluded_count)
+        
+        # Regular allocations table
+        if regular_allocations:
+            with st.expander(f"📦 Regular Allocations ({len(regular_allocations)} OCs)", expanded=True):
+                reg_df = pd.DataFrame(regular_allocations)
+                reg_df.columns = ['OC Number', 'Product', 'Customer', 'Qty', 'ETD']
+                st.dataframe(reg_df, use_container_width=True, hide_index=True)
+        
+        # Split allocations detail
+        if split_allocation_details:
+            with st.expander(f"✂️ Split Allocations ({len(split_allocation_details)} OCs)", expanded=True):
+                for detail in split_allocation_details:
+                    st.markdown(f"**{detail['oc_number']}** - {detail['product']}")
+                    st.caption(f"Customer: {detail['customer']} | Total: {detail['total_qty']:.0f}")
+                    
+                    split_rows = []
+                    for idx, s in enumerate(detail['splits'], 1):
+                        split_rows.append({
+                            'Split #': idx,
+                            'Quantity': f"{s['qty']:.2f}",
+                            'ETD': str(s['etd'])
+                        })
+                    st.dataframe(pd.DataFrame(split_rows), use_container_width=True, hide_index=True)
+                    st.markdown("---")
+        
+        # Warnings reminder
+        if validation_result.get('warnings') or (included_count > 0 and 'etd_delay_warnings' in dir() and etd_delay_warnings):
+            st.warning("⚠️ There are warnings for this allocation. Please review them above.")
+        
+        # Confirmation buttons
+        st.markdown("---")
+        conf_btn_col1, conf_btn_col2, conf_btn_col3 = st.columns([1, 1, 1])
+        
+        with conf_btn_col1:
+            if st.button("❌ Cancel", key="cancel_commit", type="secondary"):
+                st.session_state.show_commit_confirmation = False
+                st.rerun()
+        
+        with conf_btn_col3:
+            if st.button("✅ Confirm & Commit", key="confirm_commit", type="primary"):
+                st.session_state.show_commit_confirmation = False
                 commit_bulk_allocation(edited_df, base_df, notes)
+    
+    # ==================== MAIN BUTTONS ====================
+    elif not already_committed:
+        nav_col1, nav_col2, nav_col3 = st.columns([1, 1, 1])
+        
+        with nav_col1:
+            if st.button("← Back to Strategy", key="back_to_step2"):
+                st.session_state.bulk_step = 2
+                st.rerun()
+        
+        with nav_col3:
+            # Disable button if: validation failed or no allocations
+            commit_disabled = (
+                not validation_result['valid'] or 
+                allocated_count == 0
+            )
+            
+            if st.button("📋 Review & Commit", type="primary", 
+                        disabled=commit_disabled,
+                        key="review_commit_btn",
+                        help="Review allocation plan before committing"):
+                st.session_state.show_commit_confirmation = True
+                st.rerun()
     
     # ==================== DISPLAY COMMIT RESULT (after rerun) ====================
     if already_committed:
@@ -1819,6 +1931,7 @@ def render_step3_commit():
                     'simulation_results', 'demands_df', 'supply_df',
                     'adjusted_allocations', 'split_allocations',
                     'allocation_include_states', 'split_expander_open', 'split_save_success',
+                    'show_commit_confirmation',
                 ]
                 for key in keys_to_delete:
                     if key in st.session_state:
@@ -1845,6 +1958,8 @@ def render_step3_commit():
                     del st.session_state['bulk_allocation_editor']
                 if 'split_expander_open' in st.session_state:
                     del st.session_state['split_expander_open']
+                if 'show_commit_confirmation' in st.session_state:
+                    del st.session_state['show_commit_confirmation']
                 st.session_state.bulk_step = 2
                 st.rerun()
         
@@ -1863,6 +1978,8 @@ def render_step3_commit():
                     del st.session_state['bulk_allocation_editor']
                 if 'split_expander_open' in st.session_state:
                     del st.session_state['split_expander_open']
+                if 'show_commit_confirmation' in st.session_state:
+                    del st.session_state['show_commit_confirmation']
                 st.session_state.bulk_step = 1
                 st.rerun()
 
@@ -1992,6 +2109,7 @@ def commit_bulk_allocation(edited_df: pd.DataFrame, original_df: pd.DataFrame, n
                         'simulation_results', 'demands_df', 'supply_df',
                         'adjusted_allocations', 'split_allocations',
                         'allocation_include_states', 'split_expander_open', 'split_save_success',
+                        'show_commit_confirmation',
                     ]
                     for key in keys_to_delete:
                         if key in st.session_state:
