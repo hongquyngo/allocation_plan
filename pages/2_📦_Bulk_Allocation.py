@@ -10,47 +10,6 @@ Features:
 - Simulation preview with fine-tuning
 - Bulk commit with summary email
 
-REFACTORED: 2024-12 - Added customer name display, deduplicated product display logic
-REFACTORED: 2024-12 - Fixed CSS leak in allocation status chart
-REFACTORED: 2024-12 - Added demands_dict to email notification for OC creator lookup
-REFACTORED: 2024-12 - Improved email notification UI:
-    - Separate spinner for email sending (vs DB commit)
-    - Preview recipients before sending
-    - Email metrics (Summary/Individual/Errors) in columns
-    - Detailed success/warning/error messages
-    - Expander for error details
-FEATURE: 2024-12 - Added Supply Context UI in Step 3:
-    - Supply summary panel showing Total/Committed/Available
-    - Available supply column in fine-tuning table
-    - Product supply detail expander
-BUGFIX: 2024-12 - Fixed "Select All" button not re-selecting unchecked rows
-FEATURE: 2024-12 - Added "Clear All" button to deselect all rows
-    - Renamed "Include All" → "Select All" for clarity
-    - Added force_include_all / force_clear_all session state flags
-FEATURE: 2024-12 - Added navigation buttons after commit:
-    - New Allocation (go home), Same Scope, Adjust Scope
-    - Separate navigation for commit fail scenario
-FEATURE: 2024-12 - Added Developer Tools (Clear Cache) for admin/GM/MD
-BUGFIX: 2024-12 - Fixed checkbox edits resetting on rerun:
-    - Store include states in allocation_include_states session state
-    - Sync from widget state BEFORE building base_df
-BUGFIX: 2024-12 - Fixed Split Allocation ETD not updating:
-    - Root cause: Form widgets don't commit to session_state until submit
-    - Buttons outside form couldn't read edited values
-    - Solution: Replaced form with regular widgets (sync immediately)
-    - Kept Save button for explicit save action
-REFACTORED: 2024-12 - Split Allocation pending/saved separation:
-    - Added pending_split_edits for unsaved changes
-    - Add/Remove only updates pending state
-    - Save button commits pending to split_allocations
-    - Active Splits only shows saved configurations
-    - Unsaved changes indicator
-FEATURE: 2024-12 - Split Allocation UX improvements:
-    - Added ocd_id column to allocation editor for easy reference
-    - Full product display in dropdown (no truncation)
-    - Dropdown shows [ID:xxx] prefix for quick identification
-    - @st.fragment wrapper to prevent full page rerun on qty/etd changes
-    - Note: Requires Streamlit >= 1.33.0 for fragment support
 """
 import streamlit as st
 import pandas as pd
