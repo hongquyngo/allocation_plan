@@ -10,6 +10,7 @@ Features:
 4. Supply tooltips and indicators
 
 CREATED: 2024-12 - Improve UX for allocation fine-tuning decisions
+UPDATED: 2024-12 - Show all items in Supply Sources Breakdown (removed 3-item limit)
 LOCATION: utils/bulk_allocation/bulk_supply_context.py
 """
 import streamlit as st
@@ -328,14 +329,12 @@ def render_product_supply_detail(
             if inv_list:
                 inv_total = sum(i.get('remaining_quantity', 0) for i in inv_list)
                 st.metric("Total", f"{inv_total:,.0f} {uom}")
-                for batch in inv_list[:3]:
+                for batch in inv_list:
                     exp = batch.get('expiry_date', 'N/A')
                     qty = batch.get('remaining_quantity', 0)
-                    batch_no = str(batch.get('batch_number', 'N/A'))[:10]
+                    batch_no = str(batch.get('batch_number', 'N/A'))[:12]
                     st.caption(f"• {batch_no}: {qty:,.0f}")
                     st.caption(f"  Exp: {exp}")
-                if len(inv_list) > 3:
-                    st.caption(f"  +{len(inv_list)-3} more batches")
             else:
                 st.caption("No stock on hand")
         
@@ -346,13 +345,11 @@ def render_product_supply_detail(
             if can_list:
                 can_total = sum(c.get('pending_quantity', 0) for c in can_list)
                 st.metric("Total", f"{can_total:,.0f} {uom}")
-                for can in can_list[:3]:
+                for can in can_list:
                     qty = can.get('pending_quantity', 0)
-                    can_no = str(can.get('arrival_note_number', 'N/A'))[:12]
+                    can_no = str(can.get('arrival_note_number', 'N/A'))[:15]
                     st.caption(f"• {can_no}")
                     st.caption(f"  {qty:,.0f} {uom}")
-                if len(can_list) > 3:
-                    st.caption(f"  +{len(can_list)-3} more")
             else:
                 st.caption("No pending CAN")
         
@@ -363,14 +360,12 @@ def render_product_supply_detail(
             if po_list:
                 po_total = sum(p.get('pending_standard_arrival_quantity', 0) for p in po_list)
                 st.metric("Total", f"{po_total:,.0f} {uom}")
-                for po in po_list[:3]:
+                for po in po_list:
                     qty = po.get('pending_standard_arrival_quantity', 0)
                     eta = po.get('eta', 'N/A')
-                    po_no = str(po.get('po_number', 'N/A'))[:12]
+                    po_no = str(po.get('po_number', 'N/A'))[:15]
                     st.caption(f"• {po_no}")
                     st.caption(f"  {qty:,.0f} | ETA: {eta}")
-                if len(po_list) > 3:
-                    st.caption(f"  +{len(po_list)-3} more")
             else:
                 st.caption("No pending PO")
         
@@ -381,14 +376,12 @@ def render_product_supply_detail(
             if wht_list:
                 wht_total = sum(w.get('transfer_quantity', 0) for w in wht_list)
                 st.metric("Total", f"{wht_total:,.0f} {uom}")
-                for wht in wht_list[:3]:
+                for wht in wht_list:
                     qty = wht.get('transfer_quantity', 0)
-                    from_wh = str(wht.get('from_warehouse', ''))[:8]
-                    to_wh = str(wht.get('to_warehouse', ''))[:8]
+                    from_wh = str(wht.get('from_warehouse', ''))[:10]
+                    to_wh = str(wht.get('to_warehouse', ''))[:10]
                     st.caption(f"• {from_wh} → {to_wh}")
                     st.caption(f"  {qty:,.0f} {uom}")
-                if len(wht_list) > 3:
-                    st.caption(f"  +{len(wht_list)-3} more")
             else:
                 st.caption("No transfers")
     

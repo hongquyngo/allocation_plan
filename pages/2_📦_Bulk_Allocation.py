@@ -23,6 +23,10 @@ FEATURE: 2024-12 - Added Supply Context UI in Step 3:
     - Supply summary panel showing Total/Committed/Available
     - Available supply column in fine-tuning table
     - Product supply detail expander
+BUGFIX: 2024-12 - Fixed "Select All" button not re-selecting unchecked rows
+FEATURE: 2024-12 - Added "Clear All" button to deselect all rows
+    - Renamed "Include All" → "Select All" for clarity
+    - Added force_include_all / force_clear_all session state flags
 """
 import streamlit as st
 import pandas as pd
@@ -153,7 +157,11 @@ def init_session_state():
         
         # Commit state
         'is_committing': False,
-        'commit_result': None
+        'commit_result': None,
+        
+        # Fine-tuning quick actions
+        'force_include_all': False,
+        'force_clear_all': False
     }
     
     for key, value in defaults.items():
@@ -1151,6 +1159,14 @@ def render_step3_commit():
     st.markdown("##### ✏️ Fine-tune Allocations")
     st.caption("Uncheck rows to exclude from allocation. Adjust quantities and ETDs as needed.")
     
+    # Check and consume force_include_all / force_clear_all flags
+    force_include_all = st.session_state.get('force_include_all', False)
+    force_clear_all = st.session_state.get('force_clear_all', False)
+    if force_include_all:
+        st.session_state.force_include_all = False  # Reset flag after consuming
+    if force_clear_all:
+        st.session_state.force_clear_all = False  # Reset flag after consuming
+    
     # Build BASE data from simulation results
     base_data = []
     for r in results:
@@ -1169,10 +1185,18 @@ def render_step3_commit():
         available_supply = product_supply_info.get('available', 0)
         supply_coverage = product_supply_info.get('coverage_pct', 0)
         
+        # Determine include value: flags override default logic
+        if force_include_all:
+            include_row = True
+        elif force_clear_all:
+            include_row = False
+        else:
+            include_row = r.suggested_qty > 0
+        
         base_data.append({
             'ocd_id': r.ocd_id,
             'product_id': r.product_id,  # NEW: needed for supply detail
-            'include': r.suggested_qty > 0,
+            'include': include_row,
             'oc_number': oc_info.get('oc_number', ''),
             'customer_code': r.customer_code,
             'customer': oc_info.get('customer', ''),
@@ -1221,13 +1245,21 @@ def render_step3_commit():
     # Quick actions
     action_col1, action_col2, action_col3, action_col4 = st.columns([1, 1, 1, 3])
     with action_col1:
-        if st.button("✅ Include All", key="include_all_btn", help="Include all rows for allocation"):
+        if st.button("☑️ Select All", key="select_all_btn", help="Select all rows for allocation"):
+            # Set flag to force include all rows
+            st.session_state.force_include_all = True
+            st.session_state.force_clear_all = False
             if 'bulk_allocation_editor' in st.session_state:
                 del st.session_state['bulk_allocation_editor']
             st.rerun()
     with action_col2:
-        if st.button("❌ Exclude Zero", key="exclude_zero_btn", help="Exclude rows with suggested qty = 0"):
-            st.info("💡 Rows with suggested qty = 0 are already excluded by default")
+        if st.button("☐ Clear All", key="clear_all_btn", help="Deselect all rows"):
+            # Set flag to force exclude all rows
+            st.session_state.force_clear_all = True
+            st.session_state.force_include_all = False
+            if 'bulk_allocation_editor' in st.session_state:
+                del st.session_state['bulk_allocation_editor']
+            st.rerun()
     with action_col3:
         # NEW: Toggle supply column visibility
         show_supply_col = st.checkbox("📦 Show Supply", value=True, 
@@ -1768,32 +1800,93 @@ def commit_bulk_allocation(edited_df: pd.DataFrame, original_df: pd.DataFrame, n
             else:
                 st.warning("⚠️ Email service unavailable")
             
-            # ===== NEW ALLOCATION BUTTON =====
+            # ===== NAVIGATION BUTTONS =====
             st.divider()
-            if st.button("🔄 Start New Bulk Allocation", key="new_allocation_btn", type="primary"):
-                # Reset all bulk allocation related session state
-                keys_to_delete = [
-                    'commit_result', 'is_committing',  # Commit state
-                    'simulation_results', 'demands_df', 'supply_df',  # Data
-                    'adjusted_allocations', 'split_allocations',  # Fine-tuning
-                ]
-                for key in keys_to_delete:
-                    if key in st.session_state:
-                        del st.session_state[key]
-                
-                # Delete prefixed keys
-                for key in list(st.session_state.keys()):
-                    if key.startswith('bulk_') or key.startswith('scope_') or key.startswith('strategy_'):
-                        del st.session_state[key]
-                
-                init_session_state()
-                st.rerun()
+            st.markdown("##### 🧭 What's next?")
+            nav_col1, nav_col2, nav_col3 = st.columns(3)
+            
+            with nav_col1:
+                if st.button("🔄 New Allocation", key="new_allocation_btn", type="primary", 
+                            help="Go back to home page and start fresh"):
+                    # Reset all bulk allocation related session state
+                    keys_to_delete = [
+                        'commit_result', 'is_committing',  # Commit state
+                        'simulation_results', 'demands_df', 'supply_df',  # Data
+                        'adjusted_allocations', 'split_allocations',  # Fine-tuning
+                    ]
+                    for key in keys_to_delete:
+                        if key in st.session_state:
+                            del st.session_state[key]
+                    
+                    # Delete prefixed keys
+                    for key in list(st.session_state.keys()):
+                        if key.startswith('bulk_') or key.startswith('scope_') or key.startswith('strategy_') or key.startswith('force_'):
+                            del st.session_state[key]
+                    
+                    init_session_state()
+                    st.rerun()
+            
+            with nav_col2:
+                if st.button("📋 Same Scope", key="same_scope_btn",
+                            help="Re-run with same filters, choose new strategy"):
+                    # Keep scope but clear simulation and commit result
+                    st.session_state.commit_result = None
+                    st.session_state.simulation_results = None
+                    st.session_state.demands_df = None
+                    st.session_state.supply_df = None
+                    st.session_state.adjusted_allocations = {}
+                    st.session_state.split_allocations = {}
+                    st.session_state.bulk_step = 2  # Go to strategy selection
+                    st.rerun()
+            
+            with nav_col3:
+                if st.button("🔧 Adjust Scope", key="adjust_scope_btn",
+                            help="Modify filters before allocating more"):
+                    # Keep scope settings but clear commit result
+                    st.session_state.commit_result = None
+                    st.session_state.simulation_results = None
+                    st.session_state.demands_df = None
+                    st.session_state.supply_df = None
+                    st.session_state.adjusted_allocations = {}
+                    st.session_state.split_allocations = {}
+                    st.session_state.bulk_step = 1  # Go to scope selection
+                    st.rerun()
         
         else:
             st.error(f"❌ Failed to commit: {result.get('error', 'Unknown error')}")
             if result.get('technical_error'):
                 with st.expander("Technical details", expanded=False):
                     st.code(result['technical_error'])
+            
+            # Navigation after failed commit
+            st.divider()
+            fail_col1, fail_col2, fail_col3 = st.columns(3)
+            with fail_col1:
+                if st.button("🔄 Retry Commit", key="retry_commit_btn", type="primary",
+                            help="Try committing again"):
+                    st.rerun()
+            with fail_col2:
+                if st.button("✏️ Review & Edit", key="review_edit_btn",
+                            help="Go back to fine-tuning table"):
+                    st.session_state.commit_result = None
+                    st.rerun()
+            with fail_col3:
+                if st.button("🏠 Back to Home", key="back_home_btn",
+                            help="Go back to home page and start fresh"):
+                    # Reset all state
+                    keys_to_delete = [
+                        'commit_result', 'is_committing',
+                        'simulation_results', 'demands_df', 'supply_df',
+                        'adjusted_allocations', 'split_allocations',
+                    ]
+                    for key in keys_to_delete:
+                        if key in st.session_state:
+                            del st.session_state[key]
+                    for key in list(st.session_state.keys()):
+                        if key.startswith('bulk_') or key.startswith('scope_') or key.startswith('strategy_') or key.startswith('force_'):
+                            del st.session_state[key]
+                    init_session_state()
+                    st.rerun()
 
 
 
