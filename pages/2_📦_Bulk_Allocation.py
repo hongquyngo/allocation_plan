@@ -1431,9 +1431,23 @@ def render_step3_commit():
                     splits_info = f" [{len(splits)} splits]"
                 return f"{indicator}{oc['oc_number']} | {oc['product']} | Qty: {oc['final_qty']:.0f}{splits_info}"
             
+            # Check if we need to auto-select an OC (from Edit button)
+            default_idx = 0
+            if 'split_edit_target' in st.session_state:
+                target_ocd_id = st.session_state.split_edit_target
+                for idx, candidate in enumerate(split_candidates):
+                    if candidate['ocd_id'] == target_ocd_id:
+                        default_idx = idx
+                        break
+                del st.session_state['split_edit_target']
+                # Force recreate selectbox with new index
+                if 'split_oc_selector' in st.session_state:
+                    del st.session_state['split_oc_selector']
+            
             selected_idx = st.selectbox(
                 "Select OC to split",
                 options=range(len(split_candidates)),
+                index=default_idx,
                 format_func=format_split_option,
                 key="split_oc_selector"
             )
@@ -1545,6 +1559,7 @@ def render_step3_commit():
         if active_splits:
             st.markdown("---")
             st.markdown(f"**📋 Active Splits ({len(active_splits)} OCs):**")
+            st.caption("Click ✏️ to edit or 🗑️ to remove split configuration")
             
             for ocd_id, splits in active_splits.items():
                 oc_match = base_df[base_df['ocd_id'] == ocd_id]
@@ -1552,16 +1567,36 @@ def render_step3_commit():
                     oc_info = oc_match.iloc[0]
                     total_qty = sum(s['qty'] for s in splits)
                     
-                    # Display as a styled card
-                    st.markdown(f"""
-                    <div style="background: #e8f5e9; padding: 8px 12px; border-radius: 6px; border-left: 4px solid #4caf50; margin-bottom: 8px;">
-                        <strong>✅ {oc_info['oc_number']}</strong><br/>
-                        <span style="color: #666; font-size: 0.85em;">
-                            {len(splits)} splits → Total: {total_qty:.0f} | 
-                            ETDs: {', '.join(str(s['etd']) for s in splits)}
-                        </span>
-                    </div>
-                    """, unsafe_allow_html=True)
+                    # Display as a card with action buttons
+                    card_col, edit_col, remove_col = st.columns([6, 1, 1])
+                    
+                    with card_col:
+                        st.markdown(f"""
+                        <div style="background: #e8f5e9; padding: 8px 12px; border-radius: 6px; border-left: 4px solid #4caf50;">
+                            <strong>✅ {oc_info['oc_number']}</strong><br/>
+                            <span style="color: #666; font-size: 0.85em;">
+                                {len(splits)} splits → Total: {total_qty:.0f} | 
+                                ETDs: {', '.join(str(s['etd']) for s in splits)}
+                            </span>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    
+                    with edit_col:
+                        if st.button("✏️", key=f"edit_split_{ocd_id}", 
+                                    help=f"Edit split for {oc_info['oc_number']}"):
+                            # Set target to auto-select this OC in the selectbox
+                            st.session_state.split_edit_target = ocd_id
+                            st.session_state.split_expander_open = True
+                            st.rerun()
+                    
+                    with remove_col:
+                        if st.button("🗑️", key=f"remove_split_{ocd_id}", 
+                                    help=f"Remove split for {oc_info['oc_number']}"):
+                            # Reset to single allocation with total qty
+                            default_etd = oc_info.get('oc_etd')
+                            st.session_state.split_allocations[ocd_id] = [{'qty': total_qty, 'etd': default_etd}]
+                            st.session_state.split_expander_open = True
+                            st.rerun()
     
     # ==================== SUMMARY METRICS ====================
     # Only count rows where include = True
