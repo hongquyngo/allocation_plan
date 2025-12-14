@@ -220,10 +220,10 @@ def render_supply_summary_panel(
             
             product_data.append({
                 'product_id': pid,
-                'Product': _truncate(pinfo.get('product_display', pinfo.get('pt_code', '')), 50),
+                'Product': pinfo.get('product_display', pinfo.get('pt_code', '')),
                 'OCs': pinfo.get('oc_count', 0),
                 'Allocatable': pinfo.get('total_max_allocatable', 0),
-                'Supply': pinfo.get('total_supply', 0),
+                'Total Supply': pinfo.get('total_supply', 0),
                 'Committed': pinfo.get('committed', 0),
                 'Available': pinfo.get('available', 0),
                 'Coverage': f"{status_icon} {cov:.0f}%",
@@ -234,12 +234,12 @@ def render_supply_summary_panel(
             df = pd.DataFrame(product_data)
             
             st.dataframe(
-                df[['Product', 'OCs', 'Allocatable', 'Supply', 'Committed', 'Available', 'Coverage', 'UOM']],
+                df[['Product', 'OCs', 'Allocatable', 'Total Supply', 'Committed', 'Available', 'Coverage', 'UOM']],
                 column_config={
                     'Product': st.column_config.TextColumn('Product', width="large"),
                     'OCs': st.column_config.NumberColumn('OCs', width="small"),
                     'Allocatable': st.column_config.NumberColumn('Allocatable', format="%.0f"),
-                    'Supply': st.column_config.NumberColumn('Total Supply', format="%.0f"),
+                    'Total Supply': st.column_config.NumberColumn('Total Supply', format="%.0f"),
                     'Committed': st.column_config.NumberColumn('Committed', format="%.0f"),
                     'Available': st.column_config.NumberColumn('Available', format="%.0f"),
                     'Coverage': st.column_config.TextColumn('Coverage', width="small"),

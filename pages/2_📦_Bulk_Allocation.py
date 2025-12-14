@@ -27,6 +27,13 @@ BUGFIX: 2024-12 - Fixed "Select All" button not re-selecting unchecked rows
 FEATURE: 2024-12 - Added "Clear All" button to deselect all rows
     - Renamed "Include All" → "Select All" for clarity
     - Added force_include_all / force_clear_all session state flags
+FEATURE: 2024-12 - Added navigation buttons after commit:
+    - New Allocation (go home), Same Scope, Adjust Scope
+    - Separate navigation for commit fail scenario
+FEATURE: 2024-12 - Added Developer Tools (Clear Cache) for admin/GM/MD
+BUGFIX: 2024-12 - Fixed checkbox edits resetting on rerun:
+    - Store include states in allocation_include_states session state
+    - Sync from widget state BEFORE building base_df
 """
 import streamlit as st
 import pandas as pd
@@ -302,6 +309,9 @@ def clear_simulation():
     # Clear data_editor widget state to prevent stale edits from applying to new simulation
     if 'bulk_allocation_editor' in st.session_state:
         del st.session_state['bulk_allocation_editor']
+    # Clear include states to reset checkboxes for new simulation
+    if 'allocation_include_states' in st.session_state:
+        del st.session_state['allocation_include_states']
 
 # ==================== PAGE HEADER ====================
 
@@ -1168,15 +1178,43 @@ def render_step3_commit():
     st.markdown("##### ✏️ Fine-tune Allocations")
     st.caption("Uncheck rows to exclude from allocation. Adjust quantities and ETDs as needed.")
     
-    # Check and consume force_include_all / force_clear_all flags
+    # ==================== INCLUDE STATES MANAGEMENT ====================
+    # Store include states separately to preserve user edits across reruns
+    
+    # Initialize include_states if not exists (first time or after new simulation)
+    if 'allocation_include_states' not in st.session_state:
+        st.session_state.allocation_include_states = {
+            r.ocd_id: r.suggested_qty > 0 for r in results
+        }
+    
+    # Build ocd_id lookup for syncing from widget edits
+    ocd_id_by_idx = {idx: r.ocd_id for idx, r in enumerate(results)}
+    
+    # ===== CRITICAL: Sync from widget state BEFORE building base_df =====
+    # This ensures user's checkbox edits are preserved across reruns
+    if 'bulk_allocation_editor' in st.session_state:
+        widget_edits = st.session_state.bulk_allocation_editor
+        edited_rows = widget_edits.get('edited_rows', {})
+        for row_idx_str, changes in edited_rows.items():
+            row_idx = int(row_idx_str) if isinstance(row_idx_str, str) else row_idx_str
+            if 'include' in changes and row_idx in ocd_id_by_idx:
+                ocd_id = ocd_id_by_idx[row_idx]
+                st.session_state.allocation_include_states[ocd_id] = changes['include']
+    
+    # Handle Select All / Clear All flags
     force_include_all = st.session_state.get('force_include_all', False)
     force_clear_all = st.session_state.get('force_clear_all', False)
-    if force_include_all:
-        st.session_state.force_include_all = False  # Reset flag after consuming
-    if force_clear_all:
-        st.session_state.force_clear_all = False  # Reset flag after consuming
     
-    # Build BASE data from simulation results
+    if force_include_all:
+        # Update all include states to True
+        st.session_state.allocation_include_states = {r.ocd_id: True for r in results}
+        st.session_state.force_include_all = False
+    elif force_clear_all:
+        # Update all include states to False
+        st.session_state.allocation_include_states = {r.ocd_id: False for r in results}
+        st.session_state.force_clear_all = False
+    
+    # Build BASE data from simulation results using stored include states
     base_data = []
     for r in results:
         oc_info = demands_df[demands_df['ocd_id'] == r.ocd_id].iloc[0].to_dict() if not demands_df[demands_df['ocd_id'] == r.ocd_id].empty else {}
@@ -1194,13 +1232,8 @@ def render_step3_commit():
         available_supply = product_supply_info.get('available', 0)
         supply_coverage = product_supply_info.get('coverage_pct', 0)
         
-        # Determine include value: flags override default logic
-        if force_include_all:
-            include_row = True
-        elif force_clear_all:
-            include_row = False
-        else:
-            include_row = r.suggested_qty > 0
+        # Get include value from stored states (preserves user edits)
+        include_row = st.session_state.allocation_include_states.get(r.ocd_id, r.suggested_qty > 0)
         
         base_data.append({
             'ocd_id': r.ocd_id,
@@ -1822,6 +1855,7 @@ def commit_bulk_allocation(edited_df: pd.DataFrame, original_df: pd.DataFrame, n
                         'commit_result', 'is_committing',  # Commit state
                         'simulation_results', 'demands_df', 'supply_df',  # Data
                         'adjusted_allocations', 'split_allocations',  # Fine-tuning
+                        'allocation_include_states',  # Include checkbox states
                     ]
                     for key in keys_to_delete:
                         if key in st.session_state:
@@ -1845,6 +1879,10 @@ def commit_bulk_allocation(edited_df: pd.DataFrame, original_df: pd.DataFrame, n
                     st.session_state.supply_df = None
                     st.session_state.adjusted_allocations = {}
                     st.session_state.split_allocations = {}
+                    if 'allocation_include_states' in st.session_state:
+                        del st.session_state['allocation_include_states']
+                    if 'bulk_allocation_editor' in st.session_state:
+                        del st.session_state['bulk_allocation_editor']
                     st.session_state.bulk_step = 2  # Go to strategy selection
                     st.rerun()
             
@@ -1858,6 +1896,10 @@ def commit_bulk_allocation(edited_df: pd.DataFrame, original_df: pd.DataFrame, n
                     st.session_state.supply_df = None
                     st.session_state.adjusted_allocations = {}
                     st.session_state.split_allocations = {}
+                    if 'allocation_include_states' in st.session_state:
+                        del st.session_state['allocation_include_states']
+                    if 'bulk_allocation_editor' in st.session_state:
+                        del st.session_state['bulk_allocation_editor']
                     st.session_state.bulk_step = 1  # Go to scope selection
                     st.rerun()
         
@@ -1887,6 +1929,7 @@ def commit_bulk_allocation(edited_df: pd.DataFrame, original_df: pd.DataFrame, n
                         'commit_result', 'is_committing',
                         'simulation_results', 'demands_df', 'supply_df',
                         'adjusted_allocations', 'split_allocations',
+                        'allocation_include_states',  # Include checkbox states
                     ]
                     for key in keys_to_delete:
                         if key in st.session_state:
