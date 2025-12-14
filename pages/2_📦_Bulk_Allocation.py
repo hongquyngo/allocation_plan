@@ -170,8 +170,6 @@ def init_session_state():
         # Fine-tuning
         'adjusted_allocations': {},
         'split_allocations': {},  # {ocd_id: [{'qty': X, 'etd': Y}, ...]} for multi-ETD splits
-        'split_draft': {},  # Draft state for split editing - only saved when clicking "Save Splits"
-        'split_draft_ocd_id': None,  # Currently editing OC ID for split
         
         # Commit state
         'is_committing': False,
@@ -308,8 +306,6 @@ def clear_simulation():
     st.session_state.supply_df = None
     st.session_state.adjusted_allocations = {}
     st.session_state.split_allocations = {}
-    st.session_state.split_draft = {}  # Clear draft state
-    st.session_state.split_draft_ocd_id = None  # Clear draft OC ID
     # Clear data_editor widget state to prevent stale edits from applying to new simulation
     if 'bulk_allocation_editor' in st.session_state:
         del st.session_state['bulk_allocation_editor']
@@ -1464,37 +1460,19 @@ def render_step3_commit():
             max_qty = selected_oc['max_allocatable']
             default_etd = selected_oc['oc_etd']
             
-            # ===== DRAFT STATE MANAGEMENT =====
-            # Initialize or switch draft when OC changes
-            current_draft_ocd = st.session_state.get('split_draft_ocd_id')
-            
-            if current_draft_ocd != ocd_id:
-                # Switching to different OC - initialize draft from saved state or default
-                if ocd_id in st.session_state.split_allocations:
-                    # Copy from saved state
-                    st.session_state.split_draft = [
-                        {'qty': s['qty'], 'etd': s['etd']} 
-                        for s in st.session_state.split_allocations[ocd_id]
-                    ]
-                else:
-                    # Initialize with single entry from final_qty
-                    st.session_state.split_draft = [
-                        {'qty': selected_oc['final_qty'], 'etd': default_etd}
-                    ]
-                st.session_state.split_draft_ocd_id = ocd_id
-            
-            # Use draft for editing (not split_allocations directly)
-            draft_splits = st.session_state.split_draft
-            
-            # Check if draft differs from saved (has unsaved changes)
-            saved_splits = st.session_state.split_allocations.get(ocd_id, [])
-            has_unsaved_changes = (
-                len(draft_splits) != len(saved_splits) or
-                any(
-                    d['qty'] != s.get('qty') or str(d['etd']) != str(s.get('etd'))
-                    for d, s in zip(draft_splits, saved_splits)
-                ) if saved_splits else len(draft_splits) > 1
-            )
+            # Track previously selected OC and clear its widget states when switching
+            prev_split_ocd = st.session_state.get('_prev_split_ocd_id')
+            if prev_split_ocd and prev_split_ocd != ocd_id:
+                # Clear widget states from previous OC to avoid stale data
+                prev_splits = st.session_state.split_allocations.get(prev_split_ocd, [])
+                for idx in range(len(prev_splits) + 2):  # +2 buffer for safety
+                    qty_key = f"form_split_qty_{prev_split_ocd}_{idx}"
+                    etd_key = f"form_split_etd_{prev_split_ocd}_{idx}"
+                    if qty_key in st.session_state:
+                        del st.session_state[qty_key]
+                    if etd_key in st.session_state:
+                        del st.session_state[etd_key]
+            st.session_state._prev_split_ocd_id = ocd_id
             
             # Show current status with visual indicator
             status_col1, status_col2 = st.columns([2, 1])
@@ -1503,59 +1481,80 @@ def render_step3_commit():
             with status_col2:
                 if selected_oc['has_splits']:
                     splits = st.session_state.split_allocations.get(ocd_id, [])
-                    st.success(f"✅ {len(splits)} splits saved")
-                if has_unsaved_changes:
-                    st.warning(f"⚠️ Unsaved: {len(draft_splits)} splits")
+                    st.success(f"✅ {len(splits)} splits configured")
             
-            # Add/Remove buttons - UPDATE DRAFT ONLY (not split_allocations)
+            if ocd_id not in st.session_state.split_allocations:
+                st.session_state.split_allocations[ocd_id] = [
+                    {'qty': selected_oc['final_qty'], 'etd': default_etd}
+                ]
+            
+            splits = st.session_state.split_allocations[ocd_id]
+            
+            # Add/Remove buttons OUTSIDE form - don't save current values
             btn_col1, btn_col2, btn_col3 = st.columns([1, 1, 1])
             with btn_col1:
                 add_clicked = st.button("➕ Add Split", key=f"add_split_{ocd_id}")
             with btn_col3:
                 remove_clicked = st.button("🗑️ Remove Last", key=f"remove_last_{ocd_id}", 
-                                          disabled=len(draft_splits) <= 1)
+                                          disabled=len(splits) <= 1)
             
-            # Handle Add/Remove - UPDATE DRAFT ONLY
+            # Handle Add/Remove BEFORE form renders
             if add_clicked:
                 # Redistribute qty evenly across all splits (including new one)
-                current_total = sum(s['qty'] for s in draft_splits)
-                new_count = len(draft_splits) + 1
+                current_total = sum(s['qty'] for s in splits)
+                new_count = len(splits) + 1
                 qty_per_split = current_total / new_count
                 
                 # Create new splits with even distribution, keeping original ETDs
                 new_splits = []
-                for i, s in enumerate(draft_splits):
+                for i, s in enumerate(splits):
                     new_splits.append({'qty': qty_per_split, 'etd': s['etd']})
                 # Add new entry with remaining qty and default ETD
                 new_splits.append({'qty': qty_per_split, 'etd': default_etd})
                 
-                # UPDATE DRAFT ONLY - NOT split_allocations
-                st.session_state.split_draft = new_splits
+                st.session_state.split_allocations[ocd_id] = new_splits
+                
+                # Clear old form widget states to force reload
+                for idx in range(len(splits) + 1):  # +1 for new entry
+                    qty_key = f"form_split_qty_{ocd_id}_{idx}"
+                    etd_key = f"form_split_etd_{ocd_id}_{idx}"
+                    if qty_key in st.session_state:
+                        del st.session_state[qty_key]
+                    if etd_key in st.session_state:
+                        del st.session_state[etd_key]
+                
                 st.session_state.split_expander_open = True
                 st.session_state.split_edit_target = ocd_id
                 st.rerun()
             
-            if remove_clicked and len(draft_splits) > 1:
+            if remove_clicked and len(splits) > 1:
                 # Remove last entry, redistribute its qty to remaining splits
-                removed_qty = draft_splits[-1]['qty']
-                remaining_splits = [{'qty': s['qty'], 'etd': s['etd']} for s in draft_splits[:-1]]
+                removed_qty = splits[-1]['qty']
+                remaining_splits = splits[:-1]
                 if remaining_splits and removed_qty > 0:
                     add_per_split = removed_qty / len(remaining_splits)
                     for s in remaining_splits:
                         s['qty'] += add_per_split
+                st.session_state.split_allocations[ocd_id] = remaining_splits
                 
-                # UPDATE DRAFT ONLY - NOT split_allocations
-                st.session_state.split_draft = remaining_splits
+                # Clear old form widget states to force reload
+                for idx in range(len(splits)):  # Clear all old entries
+                    qty_key = f"form_split_qty_{ocd_id}_{idx}"
+                    etd_key = f"form_split_etd_{ocd_id}_{idx}"
+                    if qty_key in st.session_state:
+                        del st.session_state[qty_key]
+                    if etd_key in st.session_state:
+                        del st.session_state[etd_key]
+                
                 st.session_state.split_expander_open = True
                 st.session_state.split_edit_target = ocd_id
                 st.rerun()
             
-            # Use draft_splits for form display
             with st.form(key=f"split_form_{ocd_id}"):
                 st.markdown("**Split Entries:**")
                 
                 form_splits = []
-                for idx, split in enumerate(draft_splits):
+                for idx, split in enumerate(splits):
                     col1, col2 = st.columns([2, 2])
                     
                     with col1:
@@ -1592,10 +1591,18 @@ def render_step3_commit():
             
             if save_clicked:
                 valid_splits = [s for s in form_splits if s['qty'] > 0]
-                saved_data = valid_splits if valid_splits else [{'qty': 0, 'etd': default_etd}]
-                # Save to both split_allocations (permanent) AND update draft to sync
-                st.session_state.split_allocations[ocd_id] = saved_data
-                st.session_state.split_draft = [{'qty': s['qty'], 'etd': s['etd']} for s in saved_data]
+                st.session_state.split_allocations[ocd_id] = valid_splits if valid_splits else [{'qty': 0, 'etd': default_etd}]
+                
+                # BUGFIX: Clear form widget states to force reload from saved session state
+                # Without this, Streamlit reuses old widget state values instead of new saved values
+                for idx in range(len(splits)):
+                    qty_key = f"form_split_qty_{ocd_id}_{idx}"
+                    etd_key = f"form_split_etd_{ocd_id}_{idx}"
+                    if qty_key in st.session_state:
+                        del st.session_state[qty_key]
+                    if etd_key in st.session_state:
+                        del st.session_state[etd_key]
+                
                 st.session_state.split_save_success = ocd_id  # Flag for success message
                 st.session_state.split_expander_open = True  # Keep expander open
                 st.session_state.split_edit_target = ocd_id  # Keep same OC selected
@@ -1606,8 +1613,8 @@ def render_step3_commit():
                 st.success("✅ Splits saved successfully!")
                 del st.session_state['split_save_success']
             
-            # Total validation with visual feedback - use draft_splits for current editing state
-            total_split_qty = sum(s['qty'] for s in draft_splits)
+            # Total validation with visual feedback
+            total_split_qty = sum(s['qty'] for s in st.session_state.split_allocations[ocd_id])
             if max_qty <= 0:
                 if total_split_qty > 0:
                     st.error(f"⚠️ No allocatable quantity available for this OC")
@@ -1648,6 +1655,15 @@ def render_step3_commit():
                     with edit_col:
                         if st.button("✏️", key=f"edit_split_{ocd_id}", 
                                     help=f"Edit split for {oc_info['oc_number']}"):
+                            # Clear form widget states to force reload from session state
+                            for idx in range(len(splits)):
+                                qty_key = f"form_split_qty_{ocd_id}_{idx}"
+                                etd_key = f"form_split_etd_{ocd_id}_{idx}"
+                                if qty_key in st.session_state:
+                                    del st.session_state[qty_key]
+                                if etd_key in st.session_state:
+                                    del st.session_state[etd_key]
+                            
                             # Set target to auto-select this OC in the selectbox
                             st.session_state.split_edit_target = ocd_id
                             st.session_state.split_expander_open = True
@@ -1658,10 +1674,17 @@ def render_step3_commit():
                                     help=f"Remove split for {oc_info['oc_number']}"):
                             # Reset to single allocation with total qty
                             default_etd = oc_info.get('oc_etd')
+                            
+                            # Clear old form widget states before reset
+                            for idx in range(len(splits)):
+                                qty_key = f"form_split_qty_{ocd_id}_{idx}"
+                                etd_key = f"form_split_etd_{ocd_id}_{idx}"
+                                if qty_key in st.session_state:
+                                    del st.session_state[qty_key]
+                                if etd_key in st.session_state:
+                                    del st.session_state[etd_key]
+                            
                             st.session_state.split_allocations[ocd_id] = [{'qty': total_qty, 'etd': default_etd}]
-                            # Also clear draft if editing this OC
-                            if st.session_state.get('split_draft_ocd_id') == ocd_id:
-                                st.session_state.split_draft = [{'qty': total_qty, 'etd': default_etd}]
                             st.session_state.split_expander_open = True
                             st.rerun()
     
