@@ -1385,7 +1385,14 @@ def render_step3_commit():
     
     # ==================== SPLIT ALLOCATION FEATURE ====================
     st.divider()
-    with st.expander("✂️ Advanced: Split Allocation (Multiple ETDs)", expanded=False):
+    
+    # Count active splits for header
+    active_split_count = sum(1 for v in st.session_state.split_allocations.values() if len(v) > 1)
+    split_header = "✂️ Advanced: Split Allocation (Multiple ETDs)"
+    if active_split_count > 0:
+        split_header += f" — **{active_split_count} configured**"
+    
+    with st.expander(split_header, expanded=False):
         st.caption("Split one OC into multiple allocation records with different delivery dates")
         
         # Get OCs with allocation > 0 for split options
@@ -1396,7 +1403,8 @@ def render_step3_commit():
                 'product': base_df.iloc[i]['product_display'][:40] + '...' if len(base_df.iloc[i]['product_display']) > 40 else base_df.iloc[i]['product_display'],
                 'final_qty': edited_df.iloc[i]['final_qty'],
                 'oc_etd': base_df.iloc[i]['oc_etd'],
-                'max_allocatable': results[i].demand_qty - results[i].current_allocated
+                'max_allocatable': results[i].demand_qty - results[i].current_allocated,
+                'has_splits': base_df.iloc[i]['ocd_id'] in st.session_state.split_allocations and len(st.session_state.split_allocations.get(base_df.iloc[i]['ocd_id'], [])) > 1
             }
             for i in range(len(results))
             if edited_df.iloc[i]['final_qty'] > 0 
@@ -1407,10 +1415,20 @@ def render_step3_commit():
         if not split_candidates:
             st.info("No OCs with allocation to split. Adjust quantities above first.")
         else:
+            # Format function with visual indicator for configured splits
+            def format_split_option(i):
+                oc = split_candidates[i]
+                indicator = "✅ " if oc['has_splits'] else ""
+                splits_info = ""
+                if oc['has_splits']:
+                    splits = st.session_state.split_allocations.get(oc['ocd_id'], [])
+                    splits_info = f" [{len(splits)} splits]"
+                return f"{indicator}{oc['oc_number']} | {oc['product']} | Qty: {oc['final_qty']:.0f}{splits_info}"
+            
             selected_idx = st.selectbox(
                 "Select OC to split",
                 options=range(len(split_candidates)),
-                format_func=lambda i: f"{split_candidates[i]['oc_number']} | {split_candidates[i]['product']} | Qty: {split_candidates[i]['final_qty']:.0f}",
+                format_func=format_split_option,
                 key="split_oc_selector"
             )
             
@@ -1419,7 +1437,14 @@ def render_step3_commit():
             max_qty = selected_oc['max_allocatable']
             default_etd = selected_oc['oc_etd']
             
-            st.markdown(f"**Max allocatable:** {max_qty:.0f} | **OC ETD:** {default_etd}")
+            # Show current status with visual indicator
+            status_col1, status_col2 = st.columns([2, 1])
+            with status_col1:
+                st.markdown(f"**Max allocatable:** {max_qty:.0f} | **OC ETD:** {default_etd}")
+            with status_col2:
+                if selected_oc['has_splits']:
+                    splits = st.session_state.split_allocations.get(ocd_id, [])
+                    st.success(f"✅ {len(splits)} splits configured")
             
             if ocd_id not in st.session_state.split_allocations:
                 st.session_state.split_allocations[ocd_id] = [
@@ -1476,8 +1501,13 @@ def render_step3_commit():
             if save_clicked:
                 valid_splits = [s for s in form_splits if s['qty'] > 0]
                 st.session_state.split_allocations[ocd_id] = valid_splits if valid_splits else [{'qty': 0, 'etd': default_etd}]
-                st.success("Splits saved!")
+                st.session_state.split_save_success = ocd_id  # Flag for success message
                 st.rerun()
+            
+            # Show persistent success message
+            if st.session_state.get('split_save_success') == ocd_id:
+                st.success("✅ Splits saved successfully!")
+                del st.session_state['split_save_success']
             
             if add_clicked:
                 total_so_far = sum(s['qty'] for s in form_splits)
@@ -1489,6 +1519,7 @@ def render_step3_commit():
                 st.session_state.split_allocations[ocd_id] = form_splits[:-1] if len(form_splits) > 1 else [form_splits[0]]
                 st.rerun()
             
+            # Total validation with visual feedback
             total_split_qty = sum(s['qty'] for s in st.session_state.split_allocations[ocd_id])
             if max_qty <= 0:
                 if total_split_qty > 0:
@@ -1500,15 +1531,28 @@ def render_step3_commit():
             elif total_split_qty > 0:
                 st.success(f"✅ Total: {total_split_qty:.0f} / {max_qty:.0f}")
         
+        # ==================== ACTIVE SPLITS SUMMARY ====================
         active_splits = {k: v for k, v in st.session_state.split_allocations.items() if len(v) > 1}
         if active_splits:
             st.markdown("---")
-            st.markdown("**Active Splits:**")
+            st.markdown(f"**📋 Active Splits ({len(active_splits)} OCs):**")
+            
             for ocd_id, splits in active_splits.items():
                 oc_match = base_df[base_df['ocd_id'] == ocd_id]
                 if len(oc_match) > 0:
                     oc_info = oc_match.iloc[0]
-                    st.caption(f"• {oc_info['oc_number']}: {len(splits)} splits → {sum(s['qty'] for s in splits):.0f} total")
+                    total_qty = sum(s['qty'] for s in splits)
+                    
+                    # Display as a styled card
+                    st.markdown(f"""
+                    <div style="background: #e8f5e9; padding: 8px 12px; border-radius: 6px; border-left: 4px solid #4caf50; margin-bottom: 8px;">
+                        <strong>✅ {oc_info['oc_number']}</strong><br/>
+                        <span style="color: #666; font-size: 0.85em;">
+                            {len(splits)} splits → Total: {total_qty:.0f} | 
+                            ETDs: {', '.join(str(s['etd']) for s in splits)}
+                        </span>
+                    </div>
+                    """, unsafe_allow_html=True)
     
     # ==================== SUMMARY METRICS ====================
     # Only count rows where include = True
