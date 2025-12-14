@@ -1553,8 +1553,8 @@ def render_step3_commit():
     
     st.divider()
     
-    # Show excluded warning if any
-    if excluded_count > 0:
+    # Show excluded warning only if some (but not all) are excluded
+    if excluded_count > 0 and allocated_count > 0:
         st.warning(f"⚠️ **{excluded_count}** OC(s) excluded from allocation (unchecked)")
     
     st.markdown("##### 📊 Final Summary")
@@ -1568,51 +1568,59 @@ def render_step3_commit():
     m7.metric("Split Allocations", split_count, help="OCs split into multiple allocation records")
     
     # ==================== VALIDATION ====================
-    # Only validate included rows
-    validation_data = [
-        {
-            'ocd_id': base_df.iloc[i]['ocd_id'], 
-            'product_id': results[i].product_id, 
-            'final_qty': edited_df.iloc[i]['final_qty'],
-            'allocated_etd': edited_df.iloc[i]['allocated_etd'],
-            'oc_etd': base_df.iloc[i]['oc_etd']
-        } 
-        for i in range(len(results))
-        if edited_df.iloc[i].get('include', True)  # Only validate included rows
-    ]
+    # Check if any rows are selected
+    included_count = sum(1 for i in range(len(edited_df)) if edited_df.iloc[i].get('include', True))
     
-    validation_result = services['validator'].validate_bulk_allocation(
-        validation_data,
-        demands_df,
-        supply_df,
-        user.get('role', '')
-    )
-    
-    etd_delay_warnings = []
-    for i, row in edited_df.iterrows():
-        # Skip excluded rows
-        if not row.get('include', True):
-            continue
-        oc_etd = base_df.iloc[i]['oc_etd']
-        alloc_etd = row['allocated_etd']
-        if oc_etd and alloc_etd and alloc_etd > oc_etd:
-            days_delay = (alloc_etd - oc_etd).days
-            oc_number = base_df.iloc[i]['oc_number']
-            etd_delay_warnings.append(f"{oc_number}: Allocated ETD is {days_delay} days after OC ETD")
-    
-    if not validation_result['valid']:
-        st.error("❌ Validation Failed")
-        st.text(services['validator'].generate_validation_summary(validation_result))
-    elif validation_result['warnings'] or etd_delay_warnings:
-        st.warning("⚠️ Warnings")
-        for warning in validation_result['warnings']:
-            st.caption(f"  • {warning}")
-        if etd_delay_warnings:
-            with st.expander(f"📅 ETD Delay Warnings ({len(etd_delay_warnings)})", expanded=False):
-                for warning in etd_delay_warnings[:10]:
-                    st.caption(f"  • {warning}")
-                if len(etd_delay_warnings) > 10:
-                    st.caption(f"  ... and {len(etd_delay_warnings) - 10} more")
+    if included_count == 0:
+        # No rows selected - show info instead of validation error
+        st.info("ℹ️ No OCs selected for allocation. Use **☑️ Select All** or tick individual rows to include them.")
+        validation_result = {'valid': False, 'errors': [], 'warnings': []}
+    else:
+        # Only validate included rows
+        validation_data = [
+            {
+                'ocd_id': base_df.iloc[i]['ocd_id'], 
+                'product_id': results[i].product_id, 
+                'final_qty': edited_df.iloc[i]['final_qty'],
+                'allocated_etd': edited_df.iloc[i]['allocated_etd'],
+                'oc_etd': base_df.iloc[i]['oc_etd']
+            } 
+            for i in range(len(results))
+            if edited_df.iloc[i].get('include', True)  # Only validate included rows
+        ]
+        
+        validation_result = services['validator'].validate_bulk_allocation(
+            validation_data,
+            demands_df,
+            supply_df,
+            user.get('role', '')
+        )
+        
+        etd_delay_warnings = []
+        for i, row in edited_df.iterrows():
+            # Skip excluded rows
+            if not row.get('include', True):
+                continue
+            oc_etd = base_df.iloc[i]['oc_etd']
+            alloc_etd = row['allocated_etd']
+            if oc_etd and alloc_etd and alloc_etd > oc_etd:
+                days_delay = (alloc_etd - oc_etd).days
+                oc_number = base_df.iloc[i]['oc_number']
+                etd_delay_warnings.append(f"{oc_number}: Allocated ETD is {days_delay} days after OC ETD")
+        
+        if not validation_result['valid']:
+            st.error("❌ Validation Failed")
+            st.text(services['validator'].generate_validation_summary(validation_result))
+        elif validation_result['warnings'] or etd_delay_warnings:
+            st.warning("⚠️ Warnings")
+            for warning in validation_result['warnings']:
+                st.caption(f"  • {warning}")
+            if etd_delay_warnings:
+                with st.expander(f"📅 ETD Delay Warnings ({len(etd_delay_warnings)})", expanded=False):
+                    for warning in etd_delay_warnings[:10]:
+                        st.caption(f"  • {warning}")
+                    if len(etd_delay_warnings) > 10:
+                        st.caption(f"  ... and {len(etd_delay_warnings) - 10} more")
     
     # ==================== COMMIT SECTION ====================
     st.divider()
