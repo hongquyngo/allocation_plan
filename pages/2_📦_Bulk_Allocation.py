@@ -10,6 +10,47 @@ Features:
 - Simulation preview with fine-tuning
 - Bulk commit with summary email
 
+REFACTORED: 2024-12 - Added customer name display, deduplicated product display logic
+REFACTORED: 2024-12 - Fixed CSS leak in allocation status chart
+REFACTORED: 2024-12 - Added demands_dict to email notification for OC creator lookup
+REFACTORED: 2024-12 - Improved email notification UI:
+    - Separate spinner for email sending (vs DB commit)
+    - Preview recipients before sending
+    - Email metrics (Summary/Individual/Errors) in columns
+    - Detailed success/warning/error messages
+    - Expander for error details
+FEATURE: 2024-12 - Added Supply Context UI in Step 3:
+    - Supply summary panel showing Total/Committed/Available
+    - Available supply column in fine-tuning table
+    - Product supply detail expander
+BUGFIX: 2024-12 - Fixed "Select All" button not re-selecting unchecked rows
+FEATURE: 2024-12 - Added "Clear All" button to deselect all rows
+    - Renamed "Include All" → "Select All" for clarity
+    - Added force_include_all / force_clear_all session state flags
+FEATURE: 2024-12 - Added navigation buttons after commit:
+    - New Allocation (go home), Same Scope, Adjust Scope
+    - Separate navigation for commit fail scenario
+FEATURE: 2024-12 - Added Developer Tools (Clear Cache) for admin/GM/MD
+BUGFIX: 2024-12 - Fixed checkbox edits resetting on rerun:
+    - Store include states in allocation_include_states session state
+    - Sync from widget state BEFORE building base_df
+BUGFIX: 2024-12 - Fixed Split Allocation ETD not updating:
+    - Root cause: Form widgets don't commit to session_state until submit
+    - Buttons outside form couldn't read edited values
+    - Solution: Replaced form with regular widgets (sync immediately)
+    - Kept Save button for explicit save action
+REFACTORED: 2024-12 - Split Allocation pending/saved separation:
+    - Added pending_split_edits for unsaved changes
+    - Add/Remove only updates pending state
+    - Save button commits pending to split_allocations
+    - Active Splits only shows saved configurations
+    - Unsaved changes indicator
+FEATURE: 2024-12 - Split Allocation UX improvements:
+    - Added ocd_id column to allocation editor for easy reference
+    - Full product display in dropdown (no truncation)
+    - Dropdown shows [ID:xxx] prefix for quick identification
+    - @st.fragment wrapper to prevent full page rerun on qty/etd changes
+    - Note: Requires Streamlit >= 1.33.0 for fragment support
 """
 import streamlit as st
 import pandas as pd
@@ -145,7 +186,8 @@ def init_session_state():
         
         # Fine-tuning
         'adjusted_allocations': {},
-        'split_allocations': {},  # {ocd_id: [{'qty': X, 'etd': Y}, ...]} for multi-ETD splits
+        'split_allocations': {},  # {ocd_id: [{'qty': X, 'etd': Y}, ...]} for SAVED splits
+        'pending_split_edits': {},  # {ocd_id: [{'qty': X, 'etd': Y}, ...]} for UNSAVED edits
         'split_form_version': 0,  # Increment to force form widget recreation
         
         # Commit state
@@ -283,6 +325,7 @@ def clear_simulation():
     st.session_state.supply_df = None
     st.session_state.adjusted_allocations = {}
     st.session_state.split_allocations = {}
+    st.session_state.pending_split_edits = {}  # Clear pending edits too
     st.session_state.split_form_version = 0  # Reset form version
     # Clear data_editor widget state to prevent stale edits from applying to new simulation
     if 'bulk_allocation_editor' in st.session_state:
@@ -293,6 +336,9 @@ def clear_simulation():
     # Clear split expander state
     if 'split_expander_open' in st.session_state:
         del st.session_state['split_expander_open']
+    # Clear current split selection
+    if 'split_current_ocd_id' in st.session_state:
+        del st.session_state['split_current_ocd_id']
     # Clear commit confirmation state
     if 'show_commit_confirmation' in st.session_state:
         del st.session_state['show_commit_confirmation']
@@ -1132,6 +1178,7 @@ def render_step3_commit():
     2. Added "Available Supply" column in data editor
     3. Added product supply detail expander
     4. Supply indicators for low coverage products
+    5. REFACTORED: Split allocation pending/saved separation
     """
     st.subheader("Step 3: Review & Commit")
     
@@ -1291,8 +1338,8 @@ def render_step3_commit():
         show_supply_col = st.checkbox("📦 Show Supply", value=True, 
                                       help="Show available supply column")
     
-    # Build display columns
-    display_columns = ['include', 'oc_number', 'customer_display', 'product_display']
+    # Build display columns - Added ocd_id for reference when selecting split
+    display_columns = ['include', 'ocd_id', 'oc_number', 'customer_display', 'product_display']
     if show_supply_col:
         display_columns.append('available_supply')
     display_columns.extend(['allocation_status', 'oc_etd', 'demand_qty', 'current_allocated', 
@@ -1302,6 +1349,8 @@ def render_step3_commit():
     column_config = {
         'include': st.column_config.CheckboxColumn('✓', width="small", default=True,
             help="Uncheck to exclude this OC from allocation"),
+        'ocd_id': st.column_config.NumberColumn('ID', disabled=True, width="small",
+            help="OC Detail ID - use this to find OC in Split Allocation dropdown"),
         'oc_number': st.column_config.TextColumn('OC Number', disabled=True, width="medium"),
         'customer_display': st.column_config.TextColumn('Customer', disabled=True, width="medium",
             help="Customer Code - Customer Name"),
@@ -1367,31 +1416,282 @@ def render_step3_commit():
                     supply_details = None
                 render_product_supply_detail(selected_product, supply_context, supply_details)
     
-    # ==================== SPLIT ALLOCATION FEATURE ====================
+    # ==================== SPLIT ALLOCATION FEATURE (REFACTORED WITH FRAGMENT) ====================
     st.divider()
     
-    # Count active splits for header
+    # Count active (SAVED) splits for header
     active_split_count = sum(1 for v in st.session_state.split_allocations.values() if len(v) > 1)
     split_header = "✂️ Advanced: Split Allocation (Multiple ETDs)"
     if active_split_count > 0:
-        split_header += f" — **{active_split_count} configured**"
+        split_header += f" — **{active_split_count} saved**"
     
     # Track expander state - keep open after add/remove/save actions
     split_expander_open = st.session_state.get('split_expander_open', False)
     
+    # ========== FRAGMENT FUNCTION FOR SPLIT ALLOCATION ==========
+    # Using @st.fragment to prevent full page rerun when editing qty/etd
+    # Requires Streamlit >= 1.33.0
+    @st.fragment
+    def render_split_allocation_fragment(split_candidates_data, default_results):
+        """
+        Render split allocation UI in a fragment to prevent full page rerun.
+        Changes to qty/etd inputs only rerun this fragment, not the entire page.
+        """
+        if not split_candidates_data:
+            st.info("No OCs with allocation to split. Adjust quantities above first.")
+            return
+        
+        # Build lookup dict for quick access
+        candidates_by_ocd_id = {c['ocd_id']: c for c in split_candidates_data}
+        ocd_id_list = [c['ocd_id'] for c in split_candidates_data]
+        
+        # Format function with visual indicator - takes ocd_id as input
+        def format_split_option(oid):
+            oc = candidates_by_ocd_id.get(oid)
+            if not oc:
+                return f"[ID:{oid}] Unknown"
+            # Show different indicators for saved vs pending
+            if oc['has_saved_splits']:
+                indicator = "✅ "
+                splits = st.session_state.split_allocations.get(oc['ocd_id'], [])
+                splits_info = f" [{len(splits)} saved]"
+            elif oc['has_pending_edits']:
+                indicator = "⚠️ "
+                splits = st.session_state.pending_split_edits.get(oc['ocd_id'], [])
+                splits_info = f" [{len(splits)} unsaved]"
+            else:
+                indicator = ""
+                splits_info = ""
+            # Full display with ocd_id for easy reference
+            return f"{indicator}[ID:{oc['ocd_id']}] {oc['oc_number']} | {oc['product']} | Qty: {oc['final_qty']:.0f}{splits_info}"
+        
+        # ========== DETERMINE DEFAULT VALUE ==========
+        # Use ocd_id as value (not index) - this prevents wrong selection when list order changes
+        default_ocd_id = ocd_id_list[0] if ocd_id_list else None
+        
+        # Check if Edit button was clicked (highest priority)
+        if 'split_edit_target' in st.session_state:
+            target_ocd_id = st.session_state.split_edit_target
+            if target_ocd_id in candidates_by_ocd_id:
+                default_ocd_id = target_ocd_id
+            del st.session_state['split_edit_target']
+            # Force recreate selectbox with new value
+            if 'split_oc_selector' in st.session_state:
+                del st.session_state['split_oc_selector']
+        # Otherwise, try to restore current selection
+        elif 'split_current_ocd_id' in st.session_state:
+            current_ocd_id = st.session_state.split_current_ocd_id
+            if current_ocd_id in candidates_by_ocd_id:
+                default_ocd_id = current_ocd_id
+        
+        # Find index for default value
+        default_idx = 0
+        if default_ocd_id in ocd_id_list:
+            default_idx = ocd_id_list.index(default_ocd_id)
+        
+        # Selectbox with ocd_id as options (not index)
+        selected_ocd_id = st.selectbox(
+            "Select OC to split",
+            options=ocd_id_list,
+            index=default_idx,
+            format_func=format_split_option,
+            key="split_oc_selector"
+        )
+        
+        selected_oc = candidates_by_ocd_id[selected_ocd_id]
+        ocd_id = selected_ocd_id
+        max_qty = selected_oc['max_allocatable']
+        default_etd = selected_oc['oc_etd']
+        
+        # ========== SAVE CURRENT SELECTION ==========
+        # This preserves the selection when fragment reruns (e.g., when editing qty/etd)
+        st.session_state.split_current_ocd_id = ocd_id
+        
+        # Show current status with visual indicator
+        status_col1, status_col2 = st.columns([2, 1])
+        with status_col1:
+            st.markdown(f"**Max allocatable:** {max_qty:.0f} | **OC ETD:** {default_etd}")
+        with status_col2:
+            if selected_oc['has_saved_splits']:
+                splits = st.session_state.split_allocations.get(ocd_id, [])
+                st.success(f"✅ {len(splits)} splits saved")
+            elif selected_oc['has_pending_edits']:
+                splits = st.session_state.pending_split_edits.get(ocd_id, [])
+                st.warning(f"⚠️ {len(splits)} splits unsaved")
+        
+        # ========== INITIALIZE PENDING EDITS ==========
+        if ocd_id not in st.session_state.pending_split_edits:
+            if ocd_id in st.session_state.split_allocations:
+                st.session_state.pending_split_edits[ocd_id] = [
+                    {'qty': s['qty'], 'etd': s['etd']} 
+                    for s in st.session_state.split_allocations[ocd_id]
+                ]
+            else:
+                st.session_state.pending_split_edits[ocd_id] = [
+                    {'qty': selected_oc['final_qty'], 'etd': default_etd}
+                ]
+        
+        pending_splits = st.session_state.pending_split_edits[ocd_id]
+        
+        # Add/Remove buttons
+        btn_col1, btn_col2, btn_col3 = st.columns([1, 1, 1])
+        with btn_col1:
+            add_clicked = st.button("➕ Add Split", key=f"add_split_{ocd_id}")
+        with btn_col3:
+            remove_clicked = st.button("🗑️ Remove Last", key=f"remove_last_{ocd_id}", 
+                                      disabled=len(pending_splits) <= 1)
+        
+        # ========== SPLIT ENTRIES ==========
+        st.markdown("**Split Entries:**")
+        
+        for idx, split in enumerate(pending_splits):
+            col1, col2 = st.columns([2, 2])
+            
+            with col1:
+                split_value = float(split.get('qty', 0))
+                max_qty_float = float(max(max_qty, 0.0))
+                clamped_value = min(max(split_value, 0.0), max_qty_float) if max_qty_float > 0 else 0.0
+                
+                st.number_input(
+                    f"Qty #{idx+1}",
+                    min_value=0.0,
+                    max_value=max_qty_float if max_qty_float > 0 else 1.0,
+                    value=clamped_value,
+                    step=1.0,
+                    key=f"split_qty_{ocd_id}_{idx}",
+                    disabled=max_qty_float <= 0
+                )
+            
+            with col2:
+                split_etd_value = split.get('etd') if split.get('etd') else default_etd
+                st.date_input(
+                    f"ETD #{idx+1}",
+                    value=split_etd_value,
+                    key=f"split_etd_{ocd_id}_{idx}"
+                )
+        
+        if max_qty <= 0:
+            st.warning("⚠️ This OC has no remaining allocatable quantity.")
+        
+        # ========== SAVE BUTTON ==========
+        save_clicked = st.button("💾 Save Splits", key=f"save_split_{ocd_id}", type="primary")
+        
+        # ========== HELPER: Read current values from widget state ==========
+        def read_current_splits_from_widgets():
+            current = []
+            for idx in range(len(pending_splits)):
+                qty_key = f"split_qty_{ocd_id}_{idx}"
+                etd_key = f"split_etd_{ocd_id}_{idx}"
+                current_qty = st.session_state.get(qty_key, pending_splits[idx]['qty'])
+                current_etd = st.session_state.get(etd_key, pending_splits[idx]['etd'])
+                current.append({'qty': float(current_qty), 'etd': current_etd})
+            return current
+        
+        # ========== HANDLE SAVE ==========
+        if save_clicked:
+            current_splits = read_current_splits_from_widgets()
+            valid_splits = [s for s in current_splits if s['qty'] > 0]
+            
+            if valid_splits:
+                st.session_state.split_allocations[ocd_id] = valid_splits
+                if ocd_id in st.session_state.pending_split_edits:
+                    del st.session_state.pending_split_edits[ocd_id]
+                st.session_state.split_save_success = ocd_id
+            else:
+                if ocd_id in st.session_state.split_allocations:
+                    del st.session_state.split_allocations[ocd_id]
+                if ocd_id in st.session_state.pending_split_edits:
+                    del st.session_state.pending_split_edits[ocd_id]
+            
+            st.session_state.split_expander_open = True
+            st.session_state.split_edit_target = ocd_id
+            st.rerun()
+        
+        # ========== HANDLE ADD ==========
+        if add_clicked:
+            current_splits = read_current_splits_from_widgets()
+            current_total = sum(s['qty'] for s in current_splits)
+            new_count = len(current_splits) + 1
+            qty_per_split = current_total / new_count
+            
+            new_splits = []
+            for s in current_splits:
+                new_splits.append({'qty': qty_per_split, 'etd': s['etd']})
+            new_splits.append({'qty': qty_per_split, 'etd': default_etd})
+            
+            st.session_state.pending_split_edits[ocd_id] = new_splits
+            st.session_state.split_expander_open = True
+            st.session_state.split_edit_target = ocd_id
+            st.rerun()
+        
+        # ========== HANDLE REMOVE ==========
+        if remove_clicked and len(pending_splits) > 1:
+            current_splits = read_current_splits_from_widgets()
+            removed_qty = current_splits[-1]['qty']
+            remaining_splits = current_splits[:-1]
+            if remaining_splits and removed_qty > 0:
+                add_per_split = removed_qty / len(remaining_splits)
+                for s in remaining_splits:
+                    s['qty'] += add_per_split
+            
+            st.session_state.pending_split_edits[ocd_id] = remaining_splits
+            st.session_state.split_expander_open = True
+            st.session_state.split_edit_target = ocd_id
+            st.rerun()
+        
+        # Show persistent success message
+        if st.session_state.get('split_save_success') == ocd_id:
+            st.success("✅ Splits saved successfully!")
+            del st.session_state['split_save_success']
+        
+        # Total validation with visual feedback
+        current_total_qty = sum(
+            float(st.session_state.get(f"split_qty_{ocd_id}_{idx}", pending_splits[idx]['qty']))
+            for idx in range(len(pending_splits))
+        )
+        if max_qty <= 0:
+            if current_total_qty > 0:
+                st.error(f"⚠️ No allocatable quantity available for this OC")
+        elif current_total_qty > max_qty:
+            st.error(f"⚠️ Total split qty ({current_total_qty:.0f}) exceeds max allocatable ({max_qty:.0f})")
+        elif current_total_qty > 0 and current_total_qty < max_qty:
+            st.warning(f"ℹ️ Remaining unallocated: {max_qty - current_total_qty:.0f}")
+        elif current_total_qty > 0:
+            st.success(f"✅ Total: {current_total_qty:.0f} / {max_qty:.0f}")
+        
+        # ========== UNSAVED CHANGES WARNING ==========
+        saved_splits = st.session_state.split_allocations.get(ocd_id, [])
+        has_unsaved = False
+        
+        if len(pending_splits) != len(saved_splits):
+            has_unsaved = True
+        else:
+            for i, (p, s) in enumerate(zip(pending_splits, saved_splits)):
+                p_qty = float(st.session_state.get(f"split_qty_{ocd_id}_{i}", p['qty']))
+                p_etd = st.session_state.get(f"split_etd_{ocd_id}_{i}", p['etd'])
+                if abs(p_qty - s['qty']) > 0.01 or str(p_etd) != str(s['etd']):
+                    has_unsaved = True
+                    break
+        
+        if has_unsaved and len(pending_splits) > 1:
+            st.warning("⚠️ **Unsaved changes!** Click **Save Splits** to apply.")
+    
+    # ========== BUILD SPLIT CANDIDATES AND CALL FRAGMENT ==========
     with st.expander(split_header, expanded=split_expander_open):
         st.caption("Split one OC into multiple allocation records with different delivery dates")
         
-        # Get OCs with allocation > 0 for split options
+        # Get OCs with allocation > 0 for split options - NO TRUNCATION for full display
         split_candidates = [
             {
                 'ocd_id': base_df.iloc[i]['ocd_id'],
                 'oc_number': base_df.iloc[i]['oc_number'],
-                'product': base_df.iloc[i]['product_display'][:40] + '...' if len(base_df.iloc[i]['product_display']) > 40 else base_df.iloc[i]['product_display'],
+                'product': base_df.iloc[i]['product_display'],  # Full product display - no truncation
+                'pt_code': base_df.iloc[i]['pt_code'],
                 'final_qty': edited_df.iloc[i]['final_qty'],
                 'oc_etd': base_df.iloc[i]['oc_etd'],
                 'max_allocatable': results[i].demand_qty - results[i].current_allocated,
-                'has_splits': base_df.iloc[i]['ocd_id'] in st.session_state.split_allocations and len(st.session_state.split_allocations.get(base_df.iloc[i]['ocd_id'], [])) > 1
+                'has_saved_splits': base_df.iloc[i]['ocd_id'] in st.session_state.split_allocations and len(st.session_state.split_allocations.get(base_df.iloc[i]['ocd_id'], [])) > 1,
+                'has_pending_edits': base_df.iloc[i]['ocd_id'] in st.session_state.pending_split_edits
             }
             for i in range(len(results))
             if edited_df.iloc[i]['final_qty'] > 0 
@@ -1399,196 +1699,14 @@ def render_step3_commit():
                and (results[i].demand_qty - results[i].current_allocated) > 0
         ]
         
-        if not split_candidates:
-            st.info("No OCs with allocation to split. Adjust quantities above first.")
-        else:
-            # Format function with visual indicator for configured splits
-            def format_split_option(i):
-                oc = split_candidates[i]
-                indicator = "✅ " if oc['has_splits'] else ""
-                splits_info = ""
-                if oc['has_splits']:
-                    splits = st.session_state.split_allocations.get(oc['ocd_id'], [])
-                    splits_info = f" [{len(splits)} splits]"
-                return f"{indicator}{oc['oc_number']} | {oc['product']} | Qty: {oc['final_qty']:.0f}{splits_info}"
-            
-            # Check if we need to auto-select an OC (from Edit button)
-            default_idx = 0
-            if 'split_edit_target' in st.session_state:
-                target_ocd_id = st.session_state.split_edit_target
-                for idx, candidate in enumerate(split_candidates):
-                    if candidate['ocd_id'] == target_ocd_id:
-                        default_idx = idx
-                        break
-                del st.session_state['split_edit_target']
-                # Force recreate selectbox with new index
-                if 'split_oc_selector' in st.session_state:
-                    del st.session_state['split_oc_selector']
-            
-            selected_idx = st.selectbox(
-                "Select OC to split",
-                options=range(len(split_candidates)),
-                index=default_idx,
-                format_func=format_split_option,
-                key="split_oc_selector"
-            )
-            
-            selected_oc = split_candidates[selected_idx]
-            ocd_id = selected_oc['ocd_id']
-            max_qty = selected_oc['max_allocatable']
-            default_etd = selected_oc['oc_etd']
-            
-            # Show current status with visual indicator
-            status_col1, status_col2 = st.columns([2, 1])
-            with status_col1:
-                st.markdown(f"**Max allocatable:** {max_qty:.0f} | **OC ETD:** {default_etd}")
-            with status_col2:
-                if selected_oc['has_splits']:
-                    splits = st.session_state.split_allocations.get(ocd_id, [])
-                    st.success(f"✅ {len(splits)} splits configured")
-            
-            if ocd_id not in st.session_state.split_allocations:
-                st.session_state.split_allocations[ocd_id] = [
-                    {'qty': selected_oc['final_qty'], 'etd': default_etd}
-                ]
-            
-            splits = st.session_state.split_allocations[ocd_id]
-            
-            # Add/Remove buttons
-            btn_col1, btn_col2, btn_col3 = st.columns([1, 1, 1])
-            with btn_col1:
-                add_clicked = st.button("➕ Add Split", key=f"add_split_{ocd_id}")
-            with btn_col3:
-                remove_clicked = st.button("🗑️ Remove Last", key=f"remove_last_{ocd_id}", 
-                                          disabled=len(splits) <= 1)
-            
-            # ========== SPLIT ENTRIES - Regular widgets (NOT form) ==========
-            # Regular widgets commit to session_state immediately, unlike form widgets
-            # This allows Add/Remove buttons to read current values
-            st.markdown("**Split Entries:**")
-            
-            # Render split entries
-            for idx, split in enumerate(splits):
-                col1, col2 = st.columns([2, 2])
-                
-                with col1:
-                    # Ensure value is within valid range
-                    split_value = float(split.get('qty', 0))
-                    max_qty_float = float(max(max_qty, 0.0))
-                    clamped_value = min(max(split_value, 0.0), max_qty_float) if max_qty_float > 0 else 0.0
-                    
-                    st.number_input(
-                        f"Qty #{idx+1}",
-                        min_value=0.0,
-                        max_value=max_qty_float if max_qty_float > 0 else 1.0,
-                        value=clamped_value,
-                        step=1.0,
-                        key=f"split_qty_{ocd_id}_{idx}",
-                        disabled=max_qty_float <= 0
-                    )
-                
-                with col2:
-                    split_etd_value = split.get('etd') if split.get('etd') else default_etd
-                    st.date_input(
-                        f"ETD #{idx+1}",
-                        value=split_etd_value,
-                        key=f"split_etd_{ocd_id}_{idx}"
-                    )
-            
-            # Show warning if max_qty is 0
-            if max_qty <= 0:
-                st.warning("⚠️ This OC has no remaining allocatable quantity.")
-            
-            # ========== SAVE BUTTON ==========
-            save_clicked = st.button("💾 Save Splits", key=f"save_split_{ocd_id}", type="primary")
-            
-            # ========== HELPER: Read current values from widget state ==========
-            def read_current_splits_from_widgets():
-                """Read current split values from widget state (regular widgets sync immediately)"""
-                current = []
-                for idx in range(len(splits)):
-                    qty_key = f"split_qty_{ocd_id}_{idx}"
-                    etd_key = f"split_etd_{ocd_id}_{idx}"
-                    current_qty = st.session_state.get(qty_key, splits[idx]['qty'])
-                    current_etd = st.session_state.get(etd_key, splits[idx]['etd'])
-                    current.append({'qty': float(current_qty), 'etd': current_etd})
-                return current
-            
-            # ========== HANDLE SAVE ==========
-            if save_clicked:
-                current_splits = read_current_splits_from_widgets()
-                valid_splits = [s for s in current_splits if s['qty'] > 0]
-                st.session_state.split_allocations[ocd_id] = valid_splits if valid_splits else [{'qty': 0, 'etd': default_etd}]
-                st.session_state.split_save_success = ocd_id
-                st.session_state.split_expander_open = True
-                st.session_state.split_edit_target = ocd_id
-                st.rerun()
-            
-            # ========== HANDLE ADD ==========
-            if add_clicked:
-                # Read current values from widget state
-                current_splits = read_current_splits_from_widgets()
-                
-                # Redistribute qty evenly across all splits (including new one)
-                current_total = sum(s['qty'] for s in current_splits)
-                new_count = len(current_splits) + 1
-                qty_per_split = current_total / new_count
-                
-                # Create new splits with even distribution, keeping current ETDs
-                new_splits = []
-                for s in current_splits:
-                    new_splits.append({'qty': qty_per_split, 'etd': s['etd']})
-                # Add new entry with default ETD
-                new_splits.append({'qty': qty_per_split, 'etd': default_etd})
-                
-                st.session_state.split_allocations[ocd_id] = new_splits
-                st.session_state.split_expander_open = True
-                st.session_state.split_edit_target = ocd_id
-                st.rerun()
-            
-            # ========== HANDLE REMOVE ==========
-            if remove_clicked and len(splits) > 1:
-                # Read current values from widget state
-                current_splits = read_current_splits_from_widgets()
-                
-                # Remove last entry, redistribute its qty to remaining splits
-                removed_qty = current_splits[-1]['qty']
-                remaining_splits = current_splits[:-1]
-                if remaining_splits and removed_qty > 0:
-                    add_per_split = removed_qty / len(remaining_splits)
-                    for s in remaining_splits:
-                        s['qty'] += add_per_split
-                
-                st.session_state.split_allocations[ocd_id] = remaining_splits
-                st.session_state.split_expander_open = True
-                st.session_state.split_edit_target = ocd_id
-                st.rerun()
-            
-            # Show persistent success message
-            if st.session_state.get('split_save_success') == ocd_id:
-                st.success("✅ Splits saved successfully!")
-                del st.session_state['split_save_success']
-            
-            # Total validation with visual feedback (show current widget values)
-            current_total_qty = sum(
-                float(st.session_state.get(f"split_qty_{ocd_id}_{idx}", splits[idx]['qty']))
-                for idx in range(len(splits))
-            )
-            if max_qty <= 0:
-                if current_total_qty > 0:
-                    st.error(f"⚠️ No allocatable quantity available for this OC")
-            elif current_total_qty > max_qty:
-                st.error(f"⚠️ Total split qty ({current_total_qty:.0f}) exceeds max allocatable ({max_qty:.0f})")
-            elif current_total_qty > 0 and current_total_qty < max_qty:
-                st.warning(f"ℹ️ Remaining unallocated: {max_qty - current_total_qty:.0f}")
-            elif current_total_qty > 0:
-                st.success(f"✅ Total: {current_total_qty:.0f} / {max_qty:.0f}")
+        # Call fragment function - changes inside only rerun the fragment
+        render_split_allocation_fragment(split_candidates, results)
         
-        # ==================== ACTIVE SPLITS SUMMARY ====================
+        # ==================== ACTIVE SPLITS SUMMARY (SAVED ONLY) ====================
         active_splits = {k: v for k, v in st.session_state.split_allocations.items() if len(v) > 1}
         if active_splits:
             st.markdown("---")
-            st.markdown(f"**📋 Active Splits ({len(active_splits)} OCs):**")
+            st.markdown(f"**📋 Saved Splits ({len(active_splits)} OCs):**")
             st.caption("Click ✏️ to edit or 🗑️ to remove split configuration")
             
             for ocd_id, splits in active_splits.items():
@@ -1617,6 +1735,10 @@ def render_step3_commit():
                             # Set target to auto-select this OC in the selectbox
                             st.session_state.split_edit_target = ocd_id
                             st.session_state.split_expander_open = True
+                            # Copy saved to pending for editing
+                            st.session_state.pending_split_edits[ocd_id] = [
+                                {'qty': s['qty'], 'etd': s['etd']} for s in splits
+                            ]
                             st.rerun()
                     
                     with remove_col:
@@ -1624,7 +1746,11 @@ def render_step3_commit():
                                     help=f"Remove split for {oc_info['oc_number']}"):
                             # Reset to single allocation with total qty
                             default_etd = oc_info.get('oc_etd')
-                            st.session_state.split_allocations[ocd_id] = [{'qty': total_qty, 'etd': default_etd}]
+                            # Remove from saved splits
+                            del st.session_state.split_allocations[ocd_id]
+                            # Also clear pending if exists
+                            if ocd_id in st.session_state.pending_split_edits:
+                                del st.session_state.pending_split_edits[ocd_id]
                             st.session_state.split_expander_open = True
                             st.rerun()
     
@@ -1779,6 +1905,7 @@ def render_step3_commit():
                 # Split allocation
                 splits = st.session_state.split_allocations[ocd_id]
                 split_allocation_details.append({
+                    'ocd_id': ocd_id,  # Added ocd_id
                     'oc_number': oc_number,
                     'product': product,
                     'customer': customer,
@@ -1788,6 +1915,7 @@ def render_step3_commit():
             else:
                 # Regular allocation
                 regular_allocations.append({
+                    'ocd_id': ocd_id,  # Added ocd_id
                     'oc_number': oc_number,
                     'product': product,
                     'customer': customer,
@@ -1802,18 +1930,18 @@ def render_step3_commit():
         conf_col3.metric("✂️ Split Allocations", len(split_allocation_details))
         conf_col4.metric("❌ Excluded OCs", excluded_count)
         
-        # Regular allocations table
+        # Regular allocations table - with ocd_id column
         if regular_allocations:
             with st.expander(f"📦 Regular Allocations ({len(regular_allocations)} OCs)", expanded=True):
                 reg_df = pd.DataFrame(regular_allocations)
-                reg_df.columns = ['OC Number', 'Product', 'Customer', 'Qty', 'ETD']
+                reg_df.columns = ['ID', 'OC Number', 'Product', 'Customer', 'Qty', 'ETD']
                 st.dataframe(reg_df, use_container_width=True, hide_index=True)
         
-        # Split allocations detail
+        # Split allocations detail - with ocd_id
         if split_allocation_details:
             with st.expander(f"✂️ Split Allocations ({len(split_allocation_details)} OCs)", expanded=True):
                 for detail in split_allocation_details:
-                    st.markdown(f"**{detail['oc_number']}** - {detail['product']}")
+                    st.markdown(f"**[ID:{detail['ocd_id']}] {detail['oc_number']}** - {detail['product']}")
                     st.caption(f"Customer: {detail['customer']} | Total: {detail['total_qty']:.0f}")
                     
                     split_rows = []
@@ -1934,9 +2062,9 @@ def render_step3_commit():
                 keys_to_delete = [
                     'commit_result', 'is_committing',
                     'simulation_results', 'demands_df', 'supply_df',
-                    'adjusted_allocations', 'split_allocations',
+                    'adjusted_allocations', 'split_allocations', 'pending_split_edits',
                     'allocation_include_states', 'split_expander_open', 'split_save_success',
-                    'show_commit_confirmation',
+                    'show_commit_confirmation', 'split_current_ocd_id',
                 ]
                 for key in keys_to_delete:
                     if key in st.session_state:
@@ -1957,12 +2085,15 @@ def render_step3_commit():
                 st.session_state.supply_df = None
                 st.session_state.adjusted_allocations = {}
                 st.session_state.split_allocations = {}
+                st.session_state.pending_split_edits = {}
                 if 'allocation_include_states' in st.session_state:
                     del st.session_state['allocation_include_states']
                 if 'bulk_allocation_editor' in st.session_state:
                     del st.session_state['bulk_allocation_editor']
                 if 'split_expander_open' in st.session_state:
                     del st.session_state['split_expander_open']
+                if 'split_current_ocd_id' in st.session_state:
+                    del st.session_state['split_current_ocd_id']
                 if 'show_commit_confirmation' in st.session_state:
                     del st.session_state['show_commit_confirmation']
                 st.session_state.bulk_step = 2
@@ -1977,12 +2108,15 @@ def render_step3_commit():
                 st.session_state.supply_df = None
                 st.session_state.adjusted_allocations = {}
                 st.session_state.split_allocations = {}
+                st.session_state.pending_split_edits = {}
                 if 'allocation_include_states' in st.session_state:
                     del st.session_state['allocation_include_states']
                 if 'bulk_allocation_editor' in st.session_state:
                     del st.session_state['bulk_allocation_editor']
                 if 'split_expander_open' in st.session_state:
                     del st.session_state['split_expander_open']
+                if 'split_current_ocd_id' in st.session_state:
+                    del st.session_state['split_current_ocd_id']
                 if 'show_commit_confirmation' in st.session_state:
                     del st.session_state['show_commit_confirmation']
                 st.session_state.bulk_step = 1
@@ -2112,9 +2246,9 @@ def commit_bulk_allocation(edited_df: pd.DataFrame, original_df: pd.DataFrame, n
                     keys_to_delete = [
                         'commit_result', 'is_committing',
                         'simulation_results', 'demands_df', 'supply_df',
-                        'adjusted_allocations', 'split_allocations',
+                        'adjusted_allocations', 'split_allocations', 'pending_split_edits',
                         'allocation_include_states', 'split_expander_open', 'split_save_success',
-                        'show_commit_confirmation',
+                        'show_commit_confirmation', 'split_current_ocd_id',
                     ]
                     for key in keys_to_delete:
                         if key in st.session_state:
