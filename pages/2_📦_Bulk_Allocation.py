@@ -312,6 +312,9 @@ def clear_simulation():
     # Clear include states to reset checkboxes for new simulation
     if 'allocation_include_states' in st.session_state:
         del st.session_state['allocation_include_states']
+    # Clear split expander state
+    if 'split_expander_open' in st.session_state:
+        del st.session_state['split_expander_open']
 
 # ==================== PAGE HEADER ====================
 
@@ -1392,7 +1395,10 @@ def render_step3_commit():
     if active_split_count > 0:
         split_header += f" — **{active_split_count} configured**"
     
-    with st.expander(split_header, expanded=False):
+    # Track expander state - keep open after add/remove/save actions
+    split_expander_open = st.session_state.get('split_expander_open', False)
+    
+    with st.expander(split_header, expanded=split_expander_open):
         st.caption("Split one OC into multiple allocation records with different delivery dates")
         
         # Get OCs with allocation > 0 for split options
@@ -1502,6 +1508,7 @@ def render_step3_commit():
                 valid_splits = [s for s in form_splits if s['qty'] > 0]
                 st.session_state.split_allocations[ocd_id] = valid_splits if valid_splits else [{'qty': 0, 'etd': default_etd}]
                 st.session_state.split_save_success = ocd_id  # Flag for success message
+                st.session_state.split_expander_open = True  # Keep expander open
                 st.rerun()
             
             # Show persistent success message
@@ -1513,10 +1520,12 @@ def render_step3_commit():
                 total_so_far = sum(s['qty'] for s in form_splits)
                 remaining = max(0, max_qty - total_so_far)
                 st.session_state.split_allocations[ocd_id] = form_splits + [{'qty': remaining, 'etd': default_etd}]
+                st.session_state.split_expander_open = True  # Keep expander open
                 st.rerun()
             
             if remove_clicked and len(splits) > 1:
                 st.session_state.split_allocations[ocd_id] = form_splits[:-1] if len(form_splits) > 1 else [form_splits[0]]
+                st.session_state.split_expander_open = True  # Keep expander open
                 st.rerun()
             
             # Total validation with visual feedback
@@ -1771,13 +1780,13 @@ def render_step3_commit():
                     'commit_result', 'is_committing',
                     'simulation_results', 'demands_df', 'supply_df',
                     'adjusted_allocations', 'split_allocations',
-                    'allocation_include_states',
+                    'allocation_include_states', 'split_expander_open', 'split_save_success',
                 ]
                 for key in keys_to_delete:
                     if key in st.session_state:
                         del st.session_state[key]
                 for key in list(st.session_state.keys()):
-                    if key.startswith('bulk_') or key.startswith('scope_') or key.startswith('strategy_') or key.startswith('force_'):
+                    if key.startswith('bulk_') or key.startswith('scope_') or key.startswith('strategy_') or key.startswith('force_') or key.startswith('split_'):
                         del st.session_state[key]
                 st.session_state.bulk_step = 1  # Explicitly set step to 1
                 init_session_state()
@@ -1796,6 +1805,8 @@ def render_step3_commit():
                     del st.session_state['allocation_include_states']
                 if 'bulk_allocation_editor' in st.session_state:
                     del st.session_state['bulk_allocation_editor']
+                if 'split_expander_open' in st.session_state:
+                    del st.session_state['split_expander_open']
                 st.session_state.bulk_step = 2
                 st.rerun()
         
@@ -1812,6 +1823,8 @@ def render_step3_commit():
                     del st.session_state['allocation_include_states']
                 if 'bulk_allocation_editor' in st.session_state:
                     del st.session_state['bulk_allocation_editor']
+                if 'split_expander_open' in st.session_state:
+                    del st.session_state['split_expander_open']
                 st.session_state.bulk_step = 1
                 st.rerun()
 
@@ -1940,13 +1953,13 @@ def commit_bulk_allocation(edited_df: pd.DataFrame, original_df: pd.DataFrame, n
                         'commit_result', 'is_committing',
                         'simulation_results', 'demands_df', 'supply_df',
                         'adjusted_allocations', 'split_allocations',
-                        'allocation_include_states',
+                        'allocation_include_states', 'split_expander_open', 'split_save_success',
                     ]
                     for key in keys_to_delete:
                         if key in st.session_state:
                             del st.session_state[key]
                     for key in list(st.session_state.keys()):
-                        if key.startswith('bulk_') or key.startswith('scope_') or key.startswith('strategy_') or key.startswith('force_'):
+                        if key.startswith('bulk_') or key.startswith('scope_') or key.startswith('strategy_') or key.startswith('force_') or key.startswith('split_'):
                             del st.session_state[key]
                     st.session_state.bulk_step = 1  # Explicitly set step to 1
                     init_session_state()
