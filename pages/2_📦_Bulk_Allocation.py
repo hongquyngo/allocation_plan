@@ -1735,6 +1735,7 @@ def render_step3_commit():
                 for key in list(st.session_state.keys()):
                     if key.startswith('bulk_') or key.startswith('scope_') or key.startswith('strategy_') or key.startswith('force_'):
                         del st.session_state[key]
+                st.session_state.bulk_step = 1  # Explicitly set step to 1
                 init_session_state()
                 st.rerun()
         
@@ -1903,6 +1904,7 @@ def commit_bulk_allocation(edited_df: pd.DataFrame, original_df: pd.DataFrame, n
                     for key in list(st.session_state.keys()):
                         if key.startswith('bulk_') or key.startswith('scope_') or key.startswith('strategy_') or key.startswith('force_'):
                             del st.session_state[key]
+                    st.session_state.bulk_step = 1  # Explicitly set step to 1
                     init_session_state()
                     st.rerun()
 
