@@ -1,7 +1,11 @@
 """
-Allocation Email Service - REFACTORED v2.0
+Allocation Email Service - REFACTORED v2.1
 ============================================
 Simplified email notifications for allocation operations.
+
+CHANGES from v2.0:
+- FIXED: Now uses OUTBOUND_EMAIL_CONFIG from config.py for both local and cloud
+- Previous version used os.getenv() directly which doesn't work on Streamlit Cloud
 
 CHANGES from v1.0:
 - Removed get_oc_creator_info() - Now uses oc_info dict passed directly from UI
@@ -27,8 +31,10 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime
 import logging
-import os
 from typing import Dict, List, Tuple, Optional
+
+# FIXED: Import email config from centralized config (works on both local and cloud)
+from utils.config import OUTBOUND_EMAIL_CONFIG
 
 logger = logging.getLogger(__name__)
 
@@ -42,10 +48,12 @@ class AllocationEmailService:
     """
     
     def __init__(self):
-        self.smtp_host = os.getenv("SMTP_HOST", "smtp.gmail.com")
-        self.smtp_port = int(os.getenv("SMTP_PORT", "587"))
-        self.sender_email = os.getenv("OUTBOUND_EMAIL_SENDER", os.getenv("EMAIL_SENDER", "outbound@prostech.vn"))
-        self.sender_password = os.getenv("OUTBOUND_EMAIL_PASSWORD", os.getenv("EMAIL_PASSWORD", ""))
+        # FIXED: Use centralized config instead of os.getenv() directly
+        # This ensures it works on both local (.env) and Streamlit Cloud (st.secrets)
+        self.smtp_host = OUTBOUND_EMAIL_CONFIG.get("host", "smtp.gmail.com")
+        self.smtp_port = int(OUTBOUND_EMAIL_CONFIG.get("port", 587))
+        self.sender_email = OUTBOUND_EMAIL_CONFIG.get("sender", "outbound@prostech.vn")
+        self.sender_password = OUTBOUND_EMAIL_CONFIG.get("password", "")
         self.allocation_cc = "allocation@prostech.vn"
     
     # ============== HELPER METHODS ==============
