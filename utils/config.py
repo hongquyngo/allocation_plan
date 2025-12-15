@@ -79,7 +79,7 @@ class Config:
             "app_prefix": aws_config.get("APP_PREFIX", "streamlit-app")
         }
         
-        logger.info("☁️ Running in STREAMLIT CLOUD")
+        logger.info("☁️  Running in STREAMLIT CLOUD")
         self._log_config_status()
         
     def _load_local_config(self):
@@ -171,14 +171,143 @@ class Config:
         }
         
     def _log_config_status(self):
-        """Log configuration status for debugging"""
-        logger.info(f"✅ Database: {self.db_config.get('host', 'N/A')} / {self.db_config.get('database', 'N/A')}")
-        logger.info(f"✅ Exchange API Key: {'Configured' if self.api_keys.get('exchange_rate') else 'Missing'}")
-        logger.info(f"✅ Google Service Account: {'Loaded' if self.google_service_account else 'Missing'}")
-        logger.info(f"✅ AWS S3 Bucket: {self.aws_config.get('bucket_name', 'Not configured')}")
-        logger.info(f"✅ AWS Access Key: {'Configured' if self.aws_config.get('access_key_id') else 'Missing'}")
-        logger.info(f"✅ Inbound Email: {self.email_config['inbound']['sender'] or 'Not configured'}")
-        logger.info(f"✅ Outbound Email: {self.email_config['outbound']['sender'] or 'Not configured'}")
+        """Log configuration status for debugging with detailed validation"""
+        
+        issues = []  # Track issues for summary
+        
+        # ═══════════════════════════════════════════════════════════════
+        # DATABASE
+        # ═══════════════════════════════════════════════════════════════
+        logger.info("─" * 55)
+        logger.info("📊 DATABASE CONFIGURATION")
+        
+        db_host = self.db_config.get('host')
+        db_user = self.db_config.get('user')
+        db_pass = self.db_config.get('password')
+        db_name = self.db_config.get('database')
+        db_port = self.db_config.get('port', 3306)
+        
+        if all([db_host, db_user, db_pass, db_name]):
+            logger.info(f"   ✅ Host: {db_host}:{db_port}")
+            logger.info(f"   ✅ Database: {db_name}")
+            logger.info(f"   ✅ User: {db_user}")
+            logger.info(f"   ✅ Password: {'*' * 8} (configured)")
+        else:
+            missing = []
+            if not db_host: missing.append('host')
+            if not db_user: missing.append('user')
+            if not db_pass: missing.append('password')
+            if not db_name: missing.append('database')
+            logger.error(f"   ❌ Missing: {', '.join(missing)}")
+            issues.append(f"Database: missing {', '.join(missing)}")
+        
+        # ═══════════════════════════════════════════════════════════════
+        # EMAIL - OUTBOUND
+        # ═══════════════════════════════════════════════════════════════
+        logger.info("─" * 55)
+        logger.info("📧 EMAIL CONFIGURATION")
+        
+        # Outbound (CRITICAL - used for sending)
+        out_sender = self.email_config.get('outbound', {}).get('sender')
+        out_pass = self.email_config.get('outbound', {}).get('password')
+        
+        if out_sender and out_pass:
+            logger.info(f"   ✅ Outbound Sender: {out_sender}")
+            logger.info(f"   ✅ Outbound Password: {'*' * 8} (configured)")
+        elif out_sender and not out_pass:
+            logger.warning(f"   ⚠️  Outbound Sender: {out_sender}")
+            logger.error(f"   ❌ Outbound Password: MISSING - emails will FAIL!")
+            issues.append("Outbound email: password missing")
+        else:
+            logger.error(f"   ❌ Outbound Email: Not configured")
+            issues.append("Outbound email: not configured")
+        
+        # Inbound (optional)
+        in_sender = self.email_config.get('inbound', {}).get('sender')
+        in_pass = self.email_config.get('inbound', {}).get('password')
+        
+        if in_sender and in_pass:
+            logger.info(f"   ✅ Inbound Sender: {in_sender}")
+            logger.info(f"   ✅ Inbound Password: {'*' * 8} (configured)")
+        elif in_sender and not in_pass:
+            logger.warning(f"   ⚠️  Inbound Sender: {in_sender}")
+            logger.warning(f"   ⚠️  Inbound Password: MISSING")
+        else:
+            logger.info(f"   ℹ️  Inbound Email: Not configured (optional)")
+        
+        # SMTP
+        smtp_host = self.email_config.get('smtp', {}).get('host', 'smtp.gmail.com')
+        smtp_port = self.email_config.get('smtp', {}).get('port', 587)
+        logger.info(f"   ✅ SMTP Server: {smtp_host}:{smtp_port}")
+        
+        # ═══════════════════════════════════════════════════════════════
+        # AWS S3
+        # ═══════════════════════════════════════════════════════════════
+        logger.info("─" * 55)
+        logger.info("☁️  AWS S3 CONFIGURATION")
+        
+        aws_key = self.aws_config.get('access_key_id')
+        aws_secret = self.aws_config.get('secret_access_key')
+        aws_bucket = self.aws_config.get('bucket_name')
+        aws_region = self.aws_config.get('region', 'ap-southeast-1')
+        
+        if all([aws_key, aws_secret, aws_bucket]):
+            logger.info(f"   ✅ Bucket: {aws_bucket}")
+            logger.info(f"   ✅ Region: {aws_region}")
+            # Show partial key for verification
+            key_preview = f"{aws_key[:8]}...{aws_key[-4:]}" if len(str(aws_key)) > 12 else "configured"
+            logger.info(f"   ✅ Access Key: {key_preview}")
+            logger.info(f"   ✅ Secret Key: {'*' * 8} (configured)")
+        elif aws_bucket:
+            logger.warning(f"   ⚠️  Bucket: {aws_bucket}")
+            if not aws_key:
+                logger.error(f"   ❌ Access Key: MISSING")
+                issues.append("AWS S3: access key missing")
+            if not aws_secret:
+                logger.error(f"   ❌ Secret Key: MISSING")
+                issues.append("AWS S3: secret key missing")
+        else:
+            logger.info(f"   ℹ️  AWS S3: Not configured (optional)")
+        
+        # ═══════════════════════════════════════════════════════════════
+        # API KEYS
+        # ═══════════════════════════════════════════════════════════════
+        logger.info("─" * 55)
+        logger.info("🔑 API KEYS")
+        
+        exchange_key = self.api_keys.get('exchange_rate')
+        if exchange_key:
+            key_preview = f"{exchange_key[:6]}...{exchange_key[-4:]}" if len(str(exchange_key)) > 10 else "configured"
+            logger.info(f"   ✅ Exchange Rate API: {key_preview}")
+        else:
+            logger.info(f"   ℹ️  Exchange Rate API: Not configured (optional)")
+        
+        # ═══════════════════════════════════════════════════════════════
+        # GOOGLE CLOUD
+        # ═══════════════════════════════════════════════════════════════
+        logger.info("─" * 55)
+        logger.info("🔐 GOOGLE CLOUD")
+        
+        if self.google_service_account:
+            gcp_project = self.google_service_account.get('project_id', 'Unknown')
+            gcp_email = self.google_service_account.get('client_email', 'Unknown')
+            logger.info(f"   ✅ Project: {gcp_project}")
+            logger.info(f"   ✅ Service Account: {gcp_email}")
+        else:
+            logger.info(f"   ℹ️  Google Service Account: Not configured (optional)")
+        
+        # ═══════════════════════════════════════════════════════════════
+        # SUMMARY
+        # ═══════════════════════════════════════════════════════════════
+        logger.info("─" * 55)
+        if issues:
+            logger.warning(f"⚠️  CONFIGURATION ISSUES FOUND ({len(issues)}):")
+            for issue in issues:
+                logger.warning(f"   • {issue}")
+            logger.info("─" * 55)
+        else:
+            logger.info("✅ ALL REQUIRED CONFIGURATIONS LOADED SUCCESSFULLY")
+            logger.info("─" * 55)
         
     def get_db_config(self) -> Dict[str, Any]:
         """Get database configuration"""
