@@ -3,6 +3,10 @@ Bulk Allocation Validator
 =========================
 Validation rules for bulk allocation operations.
 Ensures data integrity and business rule compliance.
+
+REFACTORED v3.0: 2024-12 - Simplified validation using allocatable_qty from view
+    - Primary constraint: final_qty <= allocatable_qty
+    - Clear error messages identifying which rule was violated
 """
 import logging
 from typing import Dict, List, Any, Tuple, Optional
@@ -139,7 +143,10 @@ class BulkAllocationValidator:
     def validate_allocation_row(self, row_data: Dict, oc_info: Dict, 
                                 supply_available: float) -> Tuple[bool, List[str]]:
         """
-        Validate a single allocation row
+        Validate a single allocation row.
+        
+        Uses allocatable_qty from view as primary constraint.
+        Additional checks for minimum qty and supply availability.
         
         Args:
             row_data: Dict with keys: ocd_id, product_id, final_qty
@@ -150,52 +157,84 @@ class BulkAllocationValidator:
             Tuple of (is_valid, list of error messages)
         """
         errors = []
+        warnings = []
         
         final_qty = float(row_data.get('final_qty', 0))
+        standard_uom = oc_info.get('standard_uom', '')
         
         # Skip if no allocation
         if final_qty <= 0:
             return True, []
         
-        # Check minimum allocation
+        # ===== CHECK 1: Minimum allocation quantity =====
         if final_qty < self.MIN_ALLOCATION_QTY:
-            errors.append(f"Minimum allocation is {self.MIN_ALLOCATION_QTY}")
+            errors.append(f"Minimum allocation is {self.MIN_ALLOCATION_QTY} {standard_uom}")
         
-        # Get OC quantities
-        effective_qty = float(oc_info.get('effective_qty', 0) or oc_info.get('standard_quantity', 0))
-        pending_qty = float(oc_info.get('pending_qty', 0) or oc_info.get('pending_standard_delivery_quantity', 0))
-        current_allocated = float(oc_info.get('allocated_qty', 0) or oc_info.get('total_effective_allocated_qty_standard', 0))
-        undelivered = float(oc_info.get('undelivered_allocated', 0) or oc_info.get('undelivered_allocated_qty_standard', 0))
+        # ===== CHECK 2: Primary constraint - allocatable_qty from view =====
+        # This field already incorporates both rules:
+        # - Rule 1: effective_qty - total_effective_allocated (OC quota)
+        # - Rule 2: pending_qty - undelivered_allocated (delivery need)
+        allocatable_qty = float(oc_info.get('allocatable_qty', 0))
         
-        standard_uom = oc_info.get('standard_uom', '')
+        if final_qty > allocatable_qty:
+            # Determine which constraint is violated for better error message
+            effective_qty = float(oc_info.get('effective_qty', 0) or oc_info.get('standard_quantity', 0))
+            total_effective_allocated = float(oc_info.get('total_effective_allocated', 0) or 
+                                             oc_info.get('total_effective_allocated_qty_standard', 0))
+            pending_qty = float(oc_info.get('pending_qty', 0) or 
+                               oc_info.get('pending_standard_delivery_quantity', 0))
+            undelivered = float(oc_info.get('undelivered_allocated', 0) or 
+                               oc_info.get('undelivered_allocated_qty_standard', 0))
+            
+            # Calculate individual constraints
+            oc_quota_remaining = effective_qty - total_effective_allocated
+            pending_remaining = pending_qty - undelivered
+            
+            if oc_quota_remaining <= 0:
+                errors.append(
+                    f"Over-commitment: OC quota exhausted. "
+                    f"Total allocated ({total_effective_allocated:.0f}) = OC quantity ({effective_qty:.0f}) {standard_uom}. "
+                    f"Max allocatable: {allocatable_qty:.0f} {standard_uom}"
+                )
+            elif pending_remaining <= 0:
+                errors.append(
+                    f"Pending over-allocation: Delivery need fully covered. "
+                    f"Undelivered ({undelivered:.0f}) >= Pending ({pending_qty:.0f}) {standard_uom}. "
+                    f"Max allocatable: {allocatable_qty:.0f} {standard_uom}"
+                )
+            elif final_qty > oc_quota_remaining and oc_quota_remaining <= pending_remaining:
+                # OC quota is the tighter constraint
+                errors.append(
+                    f"Over-commitment: Allocating {final_qty:.0f} {standard_uom} would exceed OC quota. "
+                    f"Total would be {total_effective_allocated + final_qty:.0f} vs "
+                    f"OC quantity {effective_qty:.0f} {standard_uom}. "
+                    f"Max allocatable: {allocatable_qty:.0f} {standard_uom}"
+                )
+            elif final_qty > pending_remaining:
+                # Pending delivery is the tighter constraint
+                errors.append(
+                    f"Pending over-allocation: Allocating {final_qty:.0f} {standard_uom} would exceed delivery need. "
+                    f"Undelivered would be {undelivered + final_qty:.0f} vs "
+                    f"pending {pending_qty:.0f} {standard_uom}. "
+                    f"Max allocatable: {allocatable_qty:.0f} {standard_uom}"
+                )
+            else:
+                # Generic error
+                errors.append(
+                    f"Exceeds allocatable quantity: {final_qty:.0f} > {allocatable_qty:.0f} {standard_uom}"
+                )
         
-        # Check 1: Total commitment vs effective OC quantity
-        new_total_effective = current_allocated + final_qty
-        max_allowed = effective_qty * (self.MAX_OVER_ALLOCATION_PERCENT / 100)
-        
-        if new_total_effective > max_allowed:
-            errors.append(
-                f"Over-commitment: {new_total_effective:.0f} {standard_uom} exceeds max {max_allowed:.0f} {standard_uom} "
-                f"(100% of effective OC qty)"
-            )
-        
-        # Check 2: Pending over-allocation
-        new_undelivered = undelivered + final_qty
-        if new_undelivered > pending_qty:
-            errors.append(
-                f"Pending over-allocation: undelivered would be {new_undelivered:.0f} {standard_uom}, "
-                f"but only {pending_qty:.0f} {standard_uom} pending delivery"
-            )
-        
-        # Check 3: Supply availability (WARNING only - checked at product level)
-        # Individual OC can request up to full supply; total is checked elsewhere
-        if final_qty > supply_available * 1.5:  # Only warn if requesting > 150% of total supply
-            errors.append(
+        # ===== CHECK 3: Supply availability (WARNING only) =====
+        if final_qty > supply_available * 1.5:
+            warnings.append(
                 f"Large allocation: requesting {final_qty:.0f} {standard_uom} "
                 f"(total product supply: {supply_available:.0f} {standard_uom})"
             )
         
-        return len(errors) == 0, errors
+        # Combine errors and warnings
+        all_messages = errors + [f"⚠️ {w}" for w in warnings]
+        
+        return len(errors) == 0, all_messages
     
     # ==================== Bulk Validation ====================
     

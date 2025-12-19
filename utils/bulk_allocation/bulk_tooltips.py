@@ -292,12 +292,45 @@ REVIEW_TOOLTIPS = {
 Pending delivery quantity for this OC.
 
 ```
+= pending_standard_delivery_quantity
 = standard_quantity - delivered_quantity
 ```
 
 This is the quantity the customer is waiting to receive.
 """,
     
+    # RENAMED v3.0: current_allocated -> undelivered_allocated
+    'undelivered_allocated': """
+**Undelivered Allocated**
+
+Quantity previously allocated but not yet delivered.
+
+```
+= undelivered_allocated_qty_standard
+= allocated_qty - cancelled_qty - delivered_qty
+```
+
+This quantity has goods "committed" and will be delivered when shipment occurs.
+""",
+    
+    # NEW v3.0: allocatable_qty tooltip
+    'allocatable_qty': """
+**Allocatable Qty**
+
+Maximum quantity that can be allocated for this OC.
+
+```
+= allocatable_qty_standard
+= MIN(
+    Demand - Undelivered,    ← Rule 2: Delivery need
+    OC Qty - Total Allocated  ← Rule 1: OC quota
+)
+```
+
+This is the upper limit for Final Qty to prevent over-allocation.
+""",
+    
+    # Legacy support
     'current_allocated': """
 **Already Allocated**
 
@@ -315,6 +348,10 @@ This quantity has goods "committed" and will be delivered when shipment occurs.
 
 Quantity the system suggests to allocate based on selected strategy.
 
+```
+= MIN(allocatable_qty, available_supply_share)
+```
+
 Can be adjusted in the **Final Qty** column if needed.
 """,
     
@@ -325,7 +362,7 @@ Quantity that will be allocated after commit.
 
 ⚠️ **Editable** - fine-tune before committing.
 
-Note: Generally shouldn't exceed suggested qty unless there's a special reason.
+**Constraint**: Cannot exceed **Allocatable Qty** to prevent over-allocation.
 """,
     
     'coverage_pct': """

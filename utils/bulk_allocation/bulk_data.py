@@ -18,6 +18,12 @@ FEATURE: 2024-12 - Implemented STOCK AVAILABLE FILTER that was missing (lines 64
                    Now filters OCs to only show products with available supply
 
 FEATURE: 2024-12 - Added get_supply_details_by_product() method for Supply Context UI
+
+REFACTORED v3.0: 2024-12 - Simplified allocation logic using allocatable_qty_standard from view
+    - Use allocatable_qty_standard directly from view (single source of truth)
+    - Clear field naming: total_effective_allocated, undelivered_allocated, allocatable_qty
+    - allocation_status from view with OVER_ALLOCATED state
+    - Simplified over-allocation filter using over_allocation_type
 """
 import pandas as pd
 import logging
@@ -138,19 +144,10 @@ class BulkAllocationData:
                         ocpd.standard_quantity as effective_qty,
                         COALESCE(ocpd.total_effective_allocated_qty_standard, 0) as total_allocated,
                         COALESCE(ocpd.undelivered_allocated_qty_standard, 0) as undelivered_allocated,
-                        -- Max allocatable = pending qty - undelivered allocation
-                        GREATEST(0, 
-                            ocpd.pending_standard_delivery_quantity - COALESCE(ocpd.undelivered_allocated_qty_standard, 0)
-                        ) as max_allocatable,
-                        -- Allocation status based on undelivered vs pending
-                        CASE 
-                            WHEN COALESCE(ocpd.undelivered_allocated_qty_standard, 0) = 0 
-                            THEN 'NOT_ALLOCATED'
-                            WHEN COALESCE(ocpd.undelivered_allocated_qty_standard, 0) >= 
-                                 ocpd.pending_standard_delivery_quantity
-                            THEN 'FULLY_ALLOCATED'
-                            ELSE 'PARTIALLY_ALLOCATED'
-                        END as allocation_status
+                        -- Use allocatable_qty_standard directly from view (single source of truth)
+                        COALESCE(ocpd.allocatable_qty_standard, 0) as allocatable_qty,
+                        -- Use allocation_status directly from view
+                        ocpd.allocation_status
                     FROM outbound_oc_pending_delivery_view ocpd
                     INNER JOIN products p ON p.id = ocpd.product_id
                     LEFT JOIN brands b ON p.brand_id = b.id
@@ -206,10 +203,11 @@ class BulkAllocationData:
                         SUM(CASE WHEN allocation_status = 'NOT_ALLOCATED' THEN 1 ELSE 0 END) as not_allocated_count,
                         SUM(CASE WHEN allocation_status = 'PARTIALLY_ALLOCATED' THEN 1 ELSE 0 END) as partially_allocated_count,
                         SUM(CASE WHEN allocation_status = 'FULLY_ALLOCATED' THEN 1 ELSE 0 END) as fully_allocated_count,
-                        SUM(CASE WHEN max_allocatable > 0 THEN 1 ELSE 0 END) as need_allocation_count,
+                        SUM(CASE WHEN allocation_status = 'OVER_ALLOCATED' THEN 1 ELSE 0 END) as over_allocated_count,
+                        SUM(CASE WHEN allocatable_qty > 0 THEN 1 ELSE 0 END) as need_allocation_count,
                         COALESCE(SUM(pending_qty), 0) as total_demand,
-                        COALESCE(SUM(CASE WHEN max_allocatable > 0 THEN pending_qty ELSE 0 END), 0) as need_allocation_demand,
-                        COALESCE(SUM(max_allocatable), 0) as total_allocatable,
+                        COALESCE(SUM(CASE WHEN allocatable_qty > 0 THEN pending_qty ELSE 0 END), 0) as need_allocation_demand,
+                        COALESCE(SUM(allocatable_qty), 0) as total_allocatable,
                         COALESCE(SUM(undelivered_allocated), 0) as total_undelivered_allocated
                     FROM scope_ocs
                 )
@@ -274,15 +272,20 @@ class BulkAllocationData:
         Returns DataFrame with columns needed for allocation:
         - ocd_id, oc_number, oc_date, customer_code, customer, legal_entity
         - product_id, pt_code, product_name, brand_id, brand_name
-        - etd, pending_qty, effective_qty, allocated_qty, undelivered_allocated
+        - etd, pending_qty, effective_qty
+        - total_effective_allocated (for OC quota check)
+        - undelivered_allocated (committed but not shipped)
+        - allocatable_qty (max can allocate - from view)
+        - allocation_status, over_allocation_type (from view)
         - standard_uom, selling_uom, uom_conversion
         - outstanding_amount_usd (for revenue priority)
-        - allocation_status, max_allocatable
         
         NEW: OC Creator info for email notifications:
         - oc_created_by (keycloak_id)
         - oc_creator_email
         - oc_creator_name
+        
+        REFACTORED v3.0: Use allocatable_qty_standard directly from view
         """
         try:
             where_conditions, params = self._build_scope_conditions(scope)
@@ -312,46 +315,35 @@ class BulkAllocationData:
                     p.brand_id,
                     ocpd.brand as brand_name,
                     ocpd.etd,
+                    
+                    -- ===== QUANTITY FIELDS (Clear naming) =====
                     ocpd.pending_standard_delivery_quantity as pending_qty,
                     ocpd.standard_quantity as effective_qty,
-                    -- For display: show total ever allocated (historical)
-                    COALESCE(ocpd.total_effective_allocated_qty_standard, 0) as total_allocated_qty,
-                    -- For allocation logic: use undelivered allocation (current pending)
-                    COALESCE(ocpd.undelivered_allocated_qty_standard, 0) as allocated_qty,
+                    
+                    -- Total effective allocated (for OC quota validation)
+                    COALESCE(ocpd.total_effective_allocated_qty_standard, 0) as total_effective_allocated,
+                    
+                    -- Undelivered allocated (committed but not shipped)
                     COALESCE(ocpd.undelivered_allocated_qty_standard, 0) as undelivered_allocated,
+                    
+                    -- NEW v3.0: Direct allocatable quantity from view (single source of truth)
+                    -- Formula: MIN(pending - undelivered, effective - total_effective_allocated)
+                    COALESCE(ocpd.allocatable_qty_standard, 0) as allocatable_qty,
+                    
+                    -- ===== STATUS FIELDS (from view) =====
+                    ocpd.allocation_status,
+                    ocpd.over_allocation_type,
+                    
+                    -- ===== UOM & AMOUNTS =====
                     ocpd.standard_uom,
                     ocpd.selling_uom,
                     COALESCE(ocpd.uom_conversion, 1) as uom_conversion,
                     COALESCE(ocpd.outstanding_amount_usd, 0) as outstanding_amount_usd,
-                    ocpd.over_allocation_type,
                     
-                    -- ===== NEW: OC Creator Info for Email Notifications =====
+                    -- ===== OC Creator Info for Email Notifications =====
                     ocpd.oc_created_by,
                     ocpd.oc_creator_email,
-                    ocpd.oc_creator_name,
-                    
-                    -- Calculate max allocatable based on PENDING needs vs UNDELIVERED allocation
-                    GREATEST(0, 
-                        ocpd.pending_standard_delivery_quantity - COALESCE(ocpd.undelivered_allocated_qty_standard, 0)
-                    ) as max_allocatable,
-                    
-                    -- Allocation status based on UNDELIVERED allocation vs PENDING qty
-                    CASE 
-                        WHEN COALESCE(ocpd.undelivered_allocated_qty_standard, 0) = 0 
-                        THEN 'NOT_ALLOCATED'
-                        WHEN COALESCE(ocpd.undelivered_allocated_qty_standard, 0) >= 
-                             ocpd.pending_standard_delivery_quantity
-                        THEN 'FULLY_ALLOCATED'
-                        ELSE 'PARTIALLY_ALLOCATED'
-                    END as allocation_status,
-                    
-                    -- Legacy columns for compatibility
-                    GREATEST(0, 
-                        ocpd.standard_quantity - COALESCE(ocpd.total_effective_allocated_qty_standard, 0)
-                    ) as remaining_allocatable,
-                    GREATEST(0,
-                        ocpd.pending_standard_delivery_quantity - COALESCE(ocpd.undelivered_allocated_qty_standard, 0)
-                    ) as topup_needed
+                    ocpd.oc_creator_name
                     
                 FROM outbound_oc_pending_delivery_view ocpd
                 INNER JOIN products p ON p.id = ocpd.product_id
@@ -848,15 +840,11 @@ class BulkAllocationData:
             """)
         
         # ========== OVER-ALLOCATION EXCLUSION ==========
-        # Exclude OCs where undelivered allocation exceeds pending needs
+        # Use over_allocation_type from view (single source of truth)
         if scope.get('exclude_over_allocated', True):
-            conditions.append("""
-                COALESCE(ocpd.undelivered_allocated_qty_standard, 0) <= 
-                ocpd.pending_standard_delivery_quantity
-            """)
+            conditions.append("ocpd.over_allocation_type = 'Normal'")
         
         # ========== OTHER FILTERS ==========
-        if scope.get('exclude_over_committed', False):
-            conditions.append("ocpd.over_allocation_type IS NULL OR ocpd.over_allocation_type = 'Normal'")
+        # Note: exclude_over_committed is now handled by over_allocation_type above
         
         return conditions, params

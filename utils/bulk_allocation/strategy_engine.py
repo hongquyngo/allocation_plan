@@ -9,6 +9,11 @@ Implements allocation strategies:
 - HYBRID: Multi-phase allocation combining strategies
 
 REFACTORED: 2024-12 - Fixed Hybrid strategy proportional phase over-allocation bug
+
+REFACTORED v3.0: 2024-12 - Simplified allocation logic
+    - Use allocatable_qty directly from view (single source of truth)
+    - Clear field naming: total_effective_allocated, undelivered_allocated
+    - AllocationResult with explicit fields for validation
 """
 import logging
 from typing import Dict, List, Any, Optional
@@ -54,14 +59,16 @@ class AllocationResult:
     ocd_id: int
     product_id: int
     customer_code: str
-    demand_qty: float  # pending_qty from OC
-    effective_qty: float  # effective OC qty
-    current_allocated: float  # already allocated
-    suggested_qty: float  # suggested allocation
-    final_qty: float  # after fine-tuning
+    demand_qty: float          # pending_standard_delivery_quantity
+    effective_qty: float       # standard_quantity (OC qty after cancellation)
+    current_allocated: float   # total_effective_allocated (for OC quota check)
+    undelivered_allocated: float  # undelivered_allocated (for display)
+    allocatable_qty: float     # max allocatable from view
+    suggested_qty: float       # algorithm suggestion
+    final_qty: float           # after fine-tuning
     coverage_percent: float
     priority_score: float
-    strategy_source: str  # which strategy/phase allocated this
+    strategy_source: str       # which strategy/phase allocated this
     warnings: List[str] = field(default_factory=list)
 
 
@@ -90,19 +97,39 @@ class AllocationStrategy(ABC):
         pass
     
     def _calculate_max_allocatable(self, row: pd.Series, config: StrategyConfig) -> float:
-        """Calculate maximum allocatable quantity for an OC"""
-        effective_qty = float(row.get('effective_qty', 0))
-        current_allocated = float(row.get('allocated_qty', 0))
-        pending_qty = float(row.get('pending_qty', 0))
-        undelivered = float(row.get('undelivered_allocated', 0))
+        """
+        Get maximum allocatable quantity for an OC.
         
-        # Rule 1: Cannot exceed effective OC qty
-        max_by_oc = effective_qty * (config.max_allocation_percent / 100) - current_allocated
+        Uses pre-calculated allocatable_qty from view which already applies:
+        - Rule 1: Cannot exceed OC quota (effective_qty - total_effective_allocated)
+        - Rule 2: Cannot exceed pending delivery needs (pending_qty - undelivered_allocated)
         
-        # Rule 2: Cannot exceed pending delivery needs
-        max_by_pending = pending_qty - undelivered
+        Args:
+            row: DataFrame row with OC data
+            config: Strategy configuration (max_allocation_percent reserved for future use)
         
-        return max(0, min(max_by_oc, max_by_pending))
+        Returns:
+            Maximum quantity that can be allocated (>= 0)
+        """
+        # Primary source: pre-calculated from view (single source of truth)
+        allocatable_qty = float(row.get('allocatable_qty', 0))
+        
+        # Fallback calculation if view field not available (backward compatibility)
+        if allocatable_qty == 0 and row.get('allocatable_qty') is None:
+            effective_qty = float(row.get('effective_qty', 0))
+            total_effective_allocated = float(row.get('total_effective_allocated', 0))
+            pending_qty = float(row.get('pending_qty', 0))
+            undelivered = float(row.get('undelivered_allocated', 0))
+            
+            # Rule 1: Cannot exceed OC quota
+            max_by_oc = effective_qty * (config.max_allocation_percent / 100) - total_effective_allocated
+            
+            # Rule 2: Cannot exceed pending delivery needs
+            max_by_pending = pending_qty - undelivered
+            
+            allocatable_qty = max(0, min(max_by_oc, max_by_pending))
+        
+        return allocatable_qty
 
 
 class FCFSStrategy(AllocationStrategy):
@@ -147,7 +174,9 @@ class FCFSStrategy(AllocationStrategy):
                 customer_code=row['customer_code'],
                 demand_qty=float(row['pending_qty']),
                 effective_qty=float(row['effective_qty']),
-                current_allocated=float(row.get('allocated_qty', 0)),
+                current_allocated=float(row.get('total_effective_allocated', 0)),
+                undelivered_allocated=float(row.get('undelivered_allocated', 0)),
+                allocatable_qty=float(row.get('allocatable_qty', max_allocatable)),
                 suggested_qty=suggested_qty,
                 final_qty=suggested_qty,
                 coverage_percent=(suggested_qty / float(row['pending_qty']) * 100) if row['pending_qty'] > 0 else 0,
@@ -198,7 +227,9 @@ class ETDPriorityStrategy(AllocationStrategy):
                 customer_code=row['customer_code'],
                 demand_qty=float(row['pending_qty']),
                 effective_qty=float(row['effective_qty']),
-                current_allocated=float(row.get('allocated_qty', 0)),
+                current_allocated=float(row.get('total_effective_allocated', 0)),
+                undelivered_allocated=float(row.get('undelivered_allocated', 0)),
+                allocatable_qty=float(row.get('allocatable_qty', max_allocatable)),
                 suggested_qty=suggested_qty,
                 final_qty=suggested_qty,
                 coverage_percent=(suggested_qty / float(row['pending_qty']) * 100) if row['pending_qty'] > 0 else 0,
@@ -255,7 +286,9 @@ class ProportionalStrategy(AllocationStrategy):
                     customer_code=row['customer_code'],
                     demand_qty=demand,
                     effective_qty=float(row['effective_qty']),
-                    current_allocated=float(row.get('allocated_qty', 0)),
+                    current_allocated=float(row.get('total_effective_allocated', 0)),
+                    undelivered_allocated=float(row.get('undelivered_allocated', 0)),
+                    allocatable_qty=float(row.get('allocatable_qty', max_alloc)),
                     suggested_qty=suggested_qty,
                     final_qty=suggested_qty,
                     coverage_percent=(suggested_qty / demand * 100) if demand > 0 else 0,
@@ -272,7 +305,9 @@ class ProportionalStrategy(AllocationStrategy):
                         customer_code=row['customer_code'],
                         demand_qty=float(row['pending_qty']),
                         effective_qty=float(row['effective_qty']),
-                        current_allocated=float(row.get('allocated_qty', 0)),
+                        current_allocated=float(row.get('total_effective_allocated', 0)),
+                        undelivered_allocated=float(row.get('undelivered_allocated', 0)),
+                        allocatable_qty=float(row.get('allocatable_qty', 0)),
                         suggested_qty=0,
                         final_qty=0,
                         coverage_percent=0,
@@ -320,7 +355,9 @@ class RevenuePriorityStrategy(AllocationStrategy):
                 customer_code=row['customer_code'],
                 demand_qty=float(row['pending_qty']),
                 effective_qty=float(row['effective_qty']),
-                current_allocated=float(row.get('allocated_qty', 0)),
+                current_allocated=float(row.get('total_effective_allocated', 0)),
+                undelivered_allocated=float(row.get('undelivered_allocated', 0)),
+                allocatable_qty=float(row.get('allocatable_qty', max_allocatable)),
                 suggested_qty=suggested_qty,
                 final_qty=suggested_qty,
                 coverage_percent=(suggested_qty / float(row['pending_qty']) * 100) if row['pending_qty'] > 0 else 0,
@@ -472,18 +509,22 @@ class HybridStrategy(AllocationStrategy):
                     # Update remaining supply after proportional distribution
                     remaining_supply[int(product_id)] = available - spent
         
-        # FINAL CAP: Ensure no allocation exceeds max_alloc
+        # FINAL CAP: Ensure no allocation exceeds allocatable_qty from view
         for _, row in demands.iterrows():
             ocd_id = int(row['ocd_id'])
-            max_alloc = self._calculate_max_allocatable(row, config)
-            if accumulated.get(ocd_id, 0) > max_alloc:
-                accumulated[ocd_id] = max_alloc
+            allocatable = float(row.get('allocatable_qty', 0))
+            # Fallback to calculated max_alloc if allocatable_qty not available
+            if allocatable == 0 and row.get('allocatable_qty') is None:
+                allocatable = self._calculate_max_allocatable(row, config)
+            if accumulated.get(ocd_id, 0) > allocatable:
+                accumulated[ocd_id] = allocatable
         
         # Build final results
         for _, row in demands.iterrows():
             ocd_id = int(row['ocd_id'])
             suggested = accumulated.get(ocd_id, 0)
             demand = float(row['pending_qty'])
+            allocatable = float(row.get('allocatable_qty', 0))
             
             results_dict[ocd_id] = AllocationResult(
                 ocd_id=ocd_id,
@@ -491,7 +532,9 @@ class HybridStrategy(AllocationStrategy):
                 customer_code=row['customer_code'],
                 demand_qty=demand,
                 effective_qty=float(row['effective_qty']),
-                current_allocated=float(row.get('allocated_qty', 0)),
+                current_allocated=float(row.get('total_effective_allocated', 0)),
+                undelivered_allocated=float(row.get('undelivered_allocated', 0)),
+                allocatable_qty=allocatable,
                 suggested_qty=suggested,
                 final_qty=suggested,
                 coverage_percent=(suggested / demand * 100) if demand > 0 else 0,

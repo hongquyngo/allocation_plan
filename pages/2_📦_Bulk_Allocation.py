@@ -1302,8 +1302,16 @@ def render_step3_commit():
             'allocation_status': oc_info.get('allocation_status', ''),
             'oc_etd': oc_etd,
             'allocated_etd': first_split_etd,  # Use first split ETD if has splits
-            'demand_qty': r.demand_qty,
-            'current_allocated': r.current_allocated,
+            
+            # ===== QUANTITY COLUMNS (Refactored v3.0) =====
+            'demand_qty': r.demand_qty,  # pending_standard_delivery_quantity
+            
+            # Undelivered allocated (committed but not shipped)
+            'undelivered_allocated': r.undelivered_allocated,  # RENAMED for clarity
+            
+            # NEW: Allocatable quantity (max can allocate from view)
+            'allocatable_qty': r.allocatable_qty,  # NEW COLUMN
+            
             'suggested_qty': r.suggested_qty,
             'final_qty': split_total_qty,  # Sync from saved splits if exists
             'coverage_pct': coverage_pct,
@@ -1363,11 +1371,12 @@ def render_step3_commit():
                                       help="Show available supply column")
     
     # Build display columns - Added ocd_id for reference when selecting split, split_info for split indicator
+    # REFACTORED v3.0: Added allocatable_qty, renamed current_allocated to undelivered_allocated
     display_columns = ['include', 'ocd_id', 'oc_number', 'customer_display', 'product_display']
     if show_supply_col:
         display_columns.append('available_supply')
-    display_columns.extend(['allocation_status', 'oc_etd', 'demand_qty', 'current_allocated', 
-                           'suggested_qty', 'final_qty', 'split_info', 'allocated_etd', 'coverage_pct'])
+    display_columns.extend(['allocation_status', 'oc_etd', 'demand_qty', 'undelivered_allocated', 
+                           'allocatable_qty', 'suggested_qty', 'final_qty', 'split_info', 'allocated_etd', 'coverage_pct'])
     
     # Build column config
     column_config = {
@@ -1381,17 +1390,26 @@ def render_step3_commit():
         'product_display': st.column_config.TextColumn('Product', disabled=True, width="large", 
             help="PT Code | Product Name | Package Size"),
         'allocation_status': st.column_config.TextColumn('Status', disabled=True, width="small",
-            help="Current allocation status"),
+            help="Allocation status: NOT_ALLOCATED / PARTIALLY_ALLOCATED / FULLY_ALLOCATED / OVER_ALLOCATED"),
         'oc_etd': st.column_config.DateColumn('OC ETD', disabled=True, width="small",
             help="Original ETD from OC"),
         'demand_qty': st.column_config.NumberColumn('Demand', disabled=True, format="%.0f", width="small",
             help=REVIEW_TOOLTIPS['demand_qty']),
-        'current_allocated': st.column_config.NumberColumn('Already Alloc', disabled=True, format="%.0f", width="small",
-            help=REVIEW_TOOLTIPS['current_allocated']),
+        # RENAMED: current_allocated -> undelivered_allocated
+        'undelivered_allocated': st.column_config.NumberColumn('Undeliv Alloc', disabled=True, format="%.0f", width="small",
+            help="= undelivered_allocated_qty_standard\n\n"
+                 "Quantity previously allocated but not yet delivered.\n"
+                 "This quantity has goods 'committed' and will be delivered when shipment occurs."),
+        # NEW: allocatable_qty column
+        'allocatable_qty': st.column_config.NumberColumn('Allocatable', disabled=True, format="%.0f", width="small",
+            help="= allocatable_qty_standard\n\n"
+                 "Maximum quantity that can be allocated.\n"
+                 "Formula: MIN(Demand - Undelivered, OC Quota Remaining)"),
         'suggested_qty': st.column_config.NumberColumn('Suggested', disabled=True, format="%.0f", width="small",
             help=REVIEW_TOOLTIPS['suggested_qty']),
         'final_qty': st.column_config.NumberColumn('Final Qty ✏️', format="%.0f", width="small",
-            help=REVIEW_TOOLTIPS['final_qty']),
+            help="Final allocation quantity (editable).\n"
+                 "Cannot exceed Allocatable quantity."),
         'split_info': st.column_config.TextColumn('Split ETDs', disabled=True, width="medium",
             help="✂️ Split allocation info: ETD (qty) for each split.\nEmpty = regular allocation (single ETD).\nEdit splits in the Split Allocation section below."),
         'allocated_etd': st.column_config.DateColumn('Alloc ETD ✏️', width="small",
@@ -1420,6 +1438,23 @@ def render_step3_commit():
         num_rows="fixed",
         key="bulk_allocation_editor"
     )
+    
+    # ==================== NEW v3.0: OVER-ALLOCATION VALIDATION ====================
+    # Validate that final_qty does not exceed allocatable_qty
+    if 'allocatable_qty' in edited_df.columns and 'final_qty' in edited_df.columns:
+        over_allocated_mask = edited_df['final_qty'] > edited_df['allocatable_qty']
+        over_allocated_rows = edited_df[over_allocated_mask]
+        
+        if not over_allocated_rows.empty:
+            st.error(f"⚠️ **{len(over_allocated_rows)} row(s)** have Final Qty exceeding Allocatable limit!")
+            
+            # Show details of over-allocated rows
+            for idx, row in over_allocated_rows.iterrows():
+                st.warning(
+                    f"OC **{row.get('oc_number', 'N/A')}**: "
+                    f"Final Qty ({row['final_qty']:.0f}) > "
+                    f"Allocatable ({row['allocatable_qty']:.0f})"
+                )
     
     # ==================== NEW: PRODUCT SUPPLY DETAIL EXPANDER ====================
     unique_products = base_df[['product_id', 'product_display', 'pt_code']].drop_duplicates()
