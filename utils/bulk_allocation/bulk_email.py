@@ -15,10 +15,17 @@ BUGFIX: 2024-12 - Split allocations now expanded into multiple rows in emails.
 FIXED: 2024-12 - Now uses OUTBOUND_EMAIL_CONFIG from config.py for both local and cloud.
                  Previous version used os.getenv() directly which doesn't work on Streamlit Cloud.
 
+FEATURE: 2024-12 - Added 2-level manager CC support for individual emails.
+                   Creator's direct manager (L1) and skip-level manager (L2) 
+                   are now CC'd on allocation notifications.
+                   Manager emails fetched from employees table via manager_id FK.
+
 Email flow:
 1. Summary email to allocator (contains ALL OCs)
 2. Individual emails to each OC creator (only their OCs)
-   - CC: allocator + allocation@prostech.vn
+   - TO: oc_creator_email
+   - CC: allocation@prostech.vn + allocator + L1 manager + L2 manager
+   - Reply-To: allocator_email
 """
 import smtplib
 from email.mime.text import MIMEText
@@ -151,6 +158,112 @@ class BulkEmailService:
         return None
     
     # ============================================================
+    # NEW: Get Manager Emails for Creators (2 Levels)
+    # ============================================================
+    
+    def get_managers_for_creators(self, creator_emails: List[str]) -> Dict[str, Dict]:
+        """
+        Batch query to get manager emails (2 levels) for each OC creator.
+        
+        Uses employees table with manager_id self-reference to find
+        each creator's direct manager (L1) and skip-level manager (L2).
+        
+        Args:
+            creator_emails: List of creator email addresses
+        
+        Returns:
+            Dict[creator_email] = {
+                'manager_email': str or None,      # Level 1 (direct manager)
+                'manager_name': str or None,
+                'manager_l2_email': str or None,   # Level 2 (manager's manager)
+                'manager_l2_name': str or None
+            }
+        
+        Example:
+            managers = get_managers_for_creators(['alice@prostech.vn'])
+            # Returns: {
+            #     'alice@prostech.vn': {
+            #         'manager_email': 'bob@prostech.vn',      # L1
+            #         'manager_name': 'Bob Smith',
+            #         'manager_l2_email': 'carol@prostech.vn', # L2
+            #         'manager_l2_name': 'Carol Johnson'
+            #     }
+            # }
+        """
+        result = {
+            email.lower(): {
+                'manager_email': None, 
+                'manager_name': None,
+                'manager_l2_email': None,
+                'manager_l2_name': None
+            } 
+            for email in creator_emails
+        }
+        
+        if not creator_emails:
+            return result
+        
+        try:
+            engine = get_db_engine()
+            
+            # Build parameterized query for email list
+            placeholders = ', '.join([f':email_{i}' for i in range(len(creator_emails))])
+            params = {f'email_{i}': email.lower().strip() for i, email in enumerate(creator_emails)}
+            
+            # Join 2 levels: employee -> manager (L1) -> manager's manager (L2)
+            query = text(f"""
+                SELECT 
+                    LOWER(e.email) AS creator_email,
+                    -- Level 1: Direct Manager
+                    mgr1.email AS manager_email,
+                    TRIM(CONCAT(
+                        COALESCE(mgr1.first_name, ''), 
+                        ' ', 
+                        COALESCE(mgr1.last_name, '')
+                    )) AS manager_name,
+                    -- Level 2: Manager's Manager (Skip-level)
+                    mgr2.email AS manager_l2_email,
+                    TRIM(CONCAT(
+                        COALESCE(mgr2.first_name, ''), 
+                        ' ', 
+                        COALESCE(mgr2.last_name, '')
+                    )) AS manager_l2_name
+                FROM employees e
+                -- L1: Direct manager
+                LEFT JOIN employees mgr1 ON e.manager_id = mgr1.id 
+                    AND mgr1.delete_flag = 0 
+                    AND mgr1.status = 'ACTIVE'
+                -- L2: Manager's manager
+                LEFT JOIN employees mgr2 ON mgr1.manager_id = mgr2.id 
+                    AND mgr2.delete_flag = 0 
+                    AND mgr2.status = 'ACTIVE'
+                WHERE LOWER(e.email) IN ({placeholders})
+                AND e.delete_flag = 0
+            """)
+            
+            with engine.connect() as conn:
+                rows = conn.execute(query, params)
+                for row in rows:
+                    creator_email = row.creator_email
+                    if creator_email in result:
+                        result[creator_email] = {
+                            'manager_email': row.manager_email.strip() if row.manager_email else None,
+                            'manager_name': row.manager_name.strip() if row.manager_name else None,
+                            'manager_l2_email': row.manager_l2_email.strip() if row.manager_l2_email else None,
+                            'manager_l2_name': row.manager_l2_name.strip() if row.manager_l2_name else None
+                        }
+            
+            # Log stats
+            with_l1 = sum(1 for v in result.values() if v['manager_email'])
+            with_l2 = sum(1 for v in result.values() if v['manager_l2_email'])
+            logger.info(f"Found managers for {with_l1}/{len(creator_emails)} creators (L1), {with_l2} have L2 manager")
+            
+        except Exception as e:
+            logger.error(f"Error fetching manager emails: {e}", exc_info=True)
+        
+        return result
+    
+    # ============================================================
     # Main Email Orchestration (UPDATED)
     # ============================================================
     
@@ -231,12 +344,22 @@ class BulkEmailService:
                 creators = self.group_allocations_by_creator(allocation_results, demands_dict)
                 result['individual_total'] = len(creators)
                 
+                # NEW: Fetch manager emails for all creators in one batch query
+                creator_email_list = list(creators.keys())
+                managers = self.get_managers_for_creators(creator_email_list)
+                logger.info(f"Fetched manager info for {len(managers)} creators")
+                
                 for creator_email, creator_data in creators.items():
                     # Skip if creator is the allocator (they already got summary email)
                     if allocator_email and creator_email.lower() == allocator_email.lower():
                         logger.debug(f"Skipping creator {creator_email} (same as allocator)")
                         result['individual_total'] -= 1
                         continue
+                    
+                    # Get manager emails (L1 and L2) for this creator
+                    manager_info = managers.get(creator_email.lower(), {})
+                    manager_email = manager_info.get('manager_email')
+                    manager_l2_email = manager_info.get('manager_l2_email')
                     
                     try:
                         success, msg = self.send_individual_email_to_creator(
@@ -246,7 +369,9 @@ class BulkEmailService:
                             commit_result=commit_result,
                             allocator_email=allocator_email,
                             allocator_name=allocator_name,
-                            split_allocations=split_allocations
+                            split_allocations=split_allocations,
+                            manager_email=manager_email,      # L1: Direct manager
+                            manager_l2_email=manager_l2_email  # L2: Skip-level manager
                         )
                         if success:
                             result['individual_sent'] += 1
@@ -649,12 +774,31 @@ class BulkEmailService:
     
     def send_individual_email_to_creator(
         self, creator_email: str, creator_name: str, creator_allocations: List[Dict],
-        commit_result: Dict, allocator_email: str, allocator_name: str, split_allocations: Dict = None
+        commit_result: Dict, allocator_email: str, allocator_name: str, 
+        split_allocations: Dict = None, manager_email: str = None, manager_l2_email: str = None
     ) -> Tuple[bool, str]:
         """
         Send individual email to OC creator with their allocated OCs.
         
         FIXED 2024-12: Expand split allocations into multiple rows.
+        FEATURE 2024-12: Added 2-level manager CC support.
+        
+        Args:
+            creator_email: Email of OC creator (TO)
+            creator_name: Name of OC creator
+            creator_allocations: List of allocations for this creator
+            commit_result: Result from commit operation
+            allocator_email: Email of allocator (CC)
+            allocator_name: Name of allocator
+            split_allocations: Split allocation data
+            manager_email: Email of creator's direct manager - L1 (CC)
+            manager_l2_email: Email of creator's skip-level manager - L2 (CC)
+        
+        CC List (in order):
+            1. allocation@prostech.vn (always)
+            2. allocator_email (if provided)
+            3. manager_email - L1 direct manager (if provided)
+            4. manager_l2_email - L2 skip-level manager (if provided)
         """
         if not creator_email:
             return False, "No creator email provided"
@@ -787,6 +931,20 @@ class BulkEmailService:
         cc_emails = [self.allocation_cc] if self.allocation_cc else []
         if allocator_email:
             cc_emails.append(allocator_email)
+        
+        # Helper to add email to CC avoiding duplicates
+        def add_to_cc(email: str, label: str):
+            if email and email.strip():
+                email_lower = email.lower().strip()
+                if email_lower not in [e.lower() for e in cc_emails]:
+                    cc_emails.append(email.strip())
+                    logger.debug(f"Added {label} {email} to CC for {creator_email}")
+        
+        # Add L1: Direct manager
+        add_to_cc(manager_email, "L1 manager")
+        
+        # Add L2: Skip-level manager (manager's manager)
+        add_to_cc(manager_l2_email, "L2 manager")
         
         return self._send_email(
             to_email=creator_email,
