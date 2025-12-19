@@ -143,8 +143,8 @@ def init_session_state():
         'scope_brand_ids': [],
         'scope_customer_codes': [],
         'scope_legal_entities': [],
-        'scope_etd_from': None,
-        'scope_etd_to': None,
+        'scope_etd_from': None,  # None = no lower limit
+        'scope_etd_to': None,    # None = will be set to max ETD from data on first load
         
         # ========== ALLOCATION STATUS FILTER ==========
         # Options: 'ALL_NEEDING', 'ONLY_UNALLOCATED', 'ONLY_PARTIAL', 'INCLUDE_ALL'
@@ -626,7 +626,11 @@ def render_step1_scope():
             legal_entity_names=selected_les if selected_les else None
         )
         
-        etd_col1, etd_col2 = st.columns(2)
+        # Store data range in session for reference
+        st.session_state['_etd_data_min'] = etd_range.get('min_etd')
+        st.session_state['_etd_data_max'] = etd_range.get('max_etd')
+        
+        etd_col1, etd_col2, etd_col3 = st.columns([2, 2, 1])
         with etd_col1:
             etd_from = st.date_input(
                 "From",
@@ -636,15 +640,26 @@ def render_step1_scope():
             )
             st.session_state.scope_etd_from = etd_from
         with etd_col2:
-            # Default to max ETD from data if not set
-            default_etd_to = st.session_state.scope_etd_to or etd_range.get('max_etd')
+            # Use current session value, or default to max from data
+            current_etd_to = st.session_state.scope_etd_to
             etd_to = st.date_input(
                 "To",
-                value=default_etd_to,
+                value=current_etd_to if current_etd_to else etd_range.get('max_etd'),
                 key="etd_to_input",
-                help=f"ETD end date (data range: {etd_range.get('min_etd')} to {etd_range.get('max_etd')})"
+                help=f"Data range: {etd_range.get('min_etd')} → {etd_range.get('max_etd')}"
             )
             st.session_state.scope_etd_to = etd_to
+        with etd_col3:
+            st.markdown("<div style='margin-top: 28px'></div>", unsafe_allow_html=True)
+            if st.button("↻ Reset", key="reset_etd_btn", help="Reset to full data range"):
+                st.session_state.scope_etd_from = None
+                st.session_state.scope_etd_to = etd_range.get('max_etd')
+                st.rerun()
+        
+        # Warning if ETD To is limiting data
+        max_etd = etd_range.get('max_etd')
+        if etd_to and max_etd and etd_to < max_etd:
+            st.caption(f"⚠️ ETD filter excluding data up to **{max_etd}**. Click Reset to include all.")
     
     # ========== OPTIONS SECTION (REDESIGNED) ==========
     st.markdown("##### ⚙️ Filter Options")
