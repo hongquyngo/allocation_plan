@@ -385,33 +385,50 @@ def render_allocation_status_chart(summary: Dict):
     not_alloc = summary.get('not_allocated_count', 0)
     partial = summary.get('partially_allocated_count', 0)
     fully = summary.get('fully_allocated_count', 0)
+    over_alloc = summary.get('over_allocated_count', 0)
+    alloc_delivered = summary.get('allocated_delivered_count', 0)
     
     not_alloc_pct = not_alloc / total * 100 if total > 0 else 0
     partial_pct = partial / total * 100 if total > 0 else 0
     fully_pct = fully / total * 100 if total > 0 else 0
+    over_alloc_pct = over_alloc / total * 100 if total > 0 else 0
+    alloc_delivered_pct = alloc_delivered / total * 100 if total > 0 else 0
     
-    # Display values for bar segments
-    not_alloc_display = str(not_alloc) if not_alloc_pct > 8 else ''
-    partial_display = str(partial) if partial_pct > 8 else ''
-    fully_display = str(fully) if fully_pct > 8 else ''
+    # Display values for bar segments (only show if segment is wide enough)
+    not_alloc_display = str(not_alloc) if not_alloc_pct > 6 else ''
+    partial_display = str(partial) if partial_pct > 6 else ''
+    fully_display = str(fully) if fully_pct > 6 else ''
+    over_alloc_display = str(over_alloc) if over_alloc_pct > 6 else ''
+    alloc_delivered_display = str(alloc_delivered) if alloc_delivered_pct > 6 else ''
     
     # Build HTML as compact single-line strings to avoid Streamlit rendering issues
     bar_html = (
         '<div style="margin:15px 0">'
         '<div style="display:flex;height:28px;border-radius:6px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,0.1)">'
         f'<div style="width:{not_alloc_pct}%;background:linear-gradient(135deg,#ef4444,#dc2626);display:flex;align-items:center;justify-content:center;color:white;font-size:11px;font-weight:600" title="Not Allocated: {not_alloc}">{not_alloc_display}</div>'
+        f'<div style="width:{alloc_delivered_pct}%;background:linear-gradient(135deg,#8b5cf6,#7c3aed);display:flex;align-items:center;justify-content:center;color:white;font-size:11px;font-weight:600" title="Allocated & Delivered: {alloc_delivered}">{alloc_delivered_display}</div>'
         f'<div style="width:{partial_pct}%;background:linear-gradient(135deg,#f59e0b,#d97706);display:flex;align-items:center;justify-content:center;color:white;font-size:11px;font-weight:600" title="Partially Allocated: {partial}">{partial_display}</div>'
         f'<div style="width:{fully_pct}%;background:linear-gradient(135deg,#22c55e,#16a34a);display:flex;align-items:center;justify-content:center;color:white;font-size:11px;font-weight:600" title="Fully Allocated: {fully}">{fully_display}</div>'
+        f'<div style="width:{over_alloc_pct}%;background:linear-gradient(135deg,#64748b,#475569);display:flex;align-items:center;justify-content:center;color:white;font-size:11px;font-weight:600" title="Over Allocated: {over_alloc}">{over_alloc_display}</div>'
         '</div>'
         '</div>'
     )
     st.markdown(bar_html, unsafe_allow_html=True)
     
     # Legend using columns (avoids HTML rendering issues)
+    # Show 5 statuses in 2 rows
     col1, col2, col3 = st.columns(3)
     col1.caption(f"🔴 Not Allocated: **{not_alloc}** ({not_alloc_pct:.1f}%)")
     col2.caption(f"🟡 Partial: **{partial}** ({partial_pct:.1f}%)")
     col3.caption(f"🟢 Fully Allocated: **{fully}** ({fully_pct:.1f}%)")
+    
+    # Second row for additional statuses (only if they exist)
+    if alloc_delivered > 0 or over_alloc > 0:
+        col4, col5, col6 = st.columns(3)
+        if alloc_delivered > 0:
+            col4.caption(f"🟣 Alloc & Delivered: **{alloc_delivered}** ({alloc_delivered_pct:.1f}%)")
+        if over_alloc > 0:
+            col5.caption(f"⚫ Over Allocated: **{over_alloc}** ({over_alloc_pct:.1f}%)")
 
 
 # ==================== HELP PANEL ====================
@@ -423,21 +440,25 @@ def render_help_panel():
         
         with tab1:
             st.markdown("""
-            ### Allocation Status
+            ### Allocation Status (v3.1)
             
-            | Status | Condition | Action |
-            |--------|-----------|--------|
-            | 🔴 **Not Allocated** | `undelivered_allocated = 0` | Need new allocation |
-            | 🟡 **Partially Allocated** | `0 < undelivered < pending` | Can be topped up |
-            | 🟢 **Fully Allocated** | `undelivered >= pending` | No action needed |
-            | ⚠️ **Over-Allocated** | `undelivered > pending` | Need to cancel excess |
+            | Status | Condition | Description |
+            |--------|-----------|-------------|
+            | 🔴 **Not Allocated** | `allocation_count = 0` | Never had any allocation |
+            | 🟣 **Alloc & Delivered** | `allocation_count > 0`, `undelivered = 0`, `pending > 0` | Had allocation, all delivered, but OC still needs more |
+            | 🟡 **Partially Allocated** | `undelivered > 0`, `undelivered < pending` | Has allocation but not fully covered |
+            | 🟢 **Fully Allocated** | `total_effective >= standard_qty` OR `undelivered >= pending` | OC quota filled or pending fully covered |
+            | ⚫ **Over-Allocated** | `undelivered > pending` | More allocated than pending need |
             
-            **Note**: `undelivered_allocated` = allocation that has been committed but not yet delivered.
+            **Key Terms:**
+            - `undelivered_allocated`: Allocation committed but not yet shipped
+            - `total_effective_allocated`: Total ever allocated minus cancelled (for OC quota check)
+            - `allocatable_qty`: MAX that can be allocated = MIN(pending - undelivered, OC quota remaining)
             
             ### Key Metrics
             
-            - **Need Allocation**: OCs that need allocation (Not Allocated + Partially Allocated)
-            - **Allocatable Demand**: `Σ (pending_qty - undelivered_allocated)` for OCs needing allocation
+            - **Need Allocation**: OCs with `allocatable_qty > 0`
+            - **Allocatable Demand**: `Σ allocatable_qty` for OCs needing allocation
             - **Available Supply**: Total supply minus committed quantity
             - **Committed**: `Σ MIN(pending_qty, undelivered_allocated)` - quantity locked for existing allocations
             
@@ -829,14 +850,16 @@ def render_step1_scope():
                 
                 # Get allocatable demand for context
                 allocatable_demand = summary.get('total_allocatable', 0)
+                alloc_delivered = summary.get('allocated_delivered_count', 0)
                 
                 # Allocation status message - FIXED v3.0: Include allocatable context
                 if status_filter == 'ALL_NEEDING':
-                    oc_count = not_alloc + partial
+                    # Count OCs that might need allocation (not_alloc + partial + alloc_delivered)
+                    oc_count = not_alloc + partial + alloc_delivered
                     if oc_count > 0 and allocatable_demand == 0:
-                        filter_msgs.append(f"📦 **{oc_count}** OCs (Not Allocated + Partial) — ⚠️ No allocatable qty")
+                        filter_msgs.append(f"📦 **{oc_count}** OCs (Not Alloc + Partial + Delivered) — ⚠️ No allocatable qty")
                     elif oc_count > 0:
-                        filter_msgs.append(f"📦 **{oc_count}** OCs (Not Allocated + Partial)")
+                        filter_msgs.append(f"📦 **{oc_count}** OCs (Not Alloc + Partial + Delivered)")
                     else:
                         filter_msgs.append(f"📦 **0** OCs needing allocation")
                 elif status_filter == 'ONLY_UNALLOCATED':
@@ -922,18 +945,20 @@ def render_step1_scope():
             not_alloc = summary.get('not_allocated_count', 0)
             partial = summary.get('partially_allocated_count', 0)
             fully = summary.get('fully_allocated_count', 0)
+            alloc_delivered = summary.get('allocated_delivered_count', 0)
             allocatable = summary.get('total_allocatable', 0)
             
-            if fully > 0 and not_alloc == 0 and partial == 0:
+            if fully > 0 and not_alloc == 0 and partial == 0 and alloc_delivered == 0:
                 # All OCs are truly fully allocated
                 st.warning("⚠️ All OCs are fully allocated. Nothing to allocate.")
-            elif allocatable == 0 and (not_alloc > 0 or partial > 0):
+            elif allocatable == 0 and (not_alloc > 0 or partial > 0 or alloc_delivered > 0):
                 # OCs exist but have no allocatable quantity (quota exhausted or over-committed)
+                need_attention = not_alloc + partial + alloc_delivered
                 st.warning(
-                    f"⚠️ **{not_alloc + partial}** OCs have no allocatable quantity. "
+                    f"⚠️ **{need_attention}** OCs have no allocatable quantity. "
                     f"Possible reasons:\n"
                     f"- OC quota already exhausted (total allocated = OC quantity)\n"
-                    f"- Over-committed from previous allocations\n\n"
+                    f"- Previous allocation fully delivered but OC still pending\n\n"
                     f"Check 'Include All' filter to review these OCs."
                 )
             else:
@@ -1418,7 +1443,12 @@ def render_step3_commit():
         'product_display': st.column_config.TextColumn('Product', disabled=True, width="large", 
             help="PT Code | Product Name | Package Size"),
         'allocation_status': st.column_config.TextColumn('Status', disabled=True, width="small",
-            help="Allocation status: NOT_ALLOCATED / PARTIALLY_ALLOCATED / FULLY_ALLOCATED / OVER_ALLOCATED"),
+            help="Allocation status:\n"
+                 "• NOT_ALLOCATED - Never had allocation\n"
+                 "• ALLOCATED_DELIVERED - Had allocation, all delivered\n"
+                 "• PARTIALLY_ALLOCATED - Has allocation, not fully covered\n"
+                 "• FULLY_ALLOCATED - OC quota filled or pending covered\n"
+                 "• OVER_ALLOCATED - More than pending need"),
         'oc_etd': st.column_config.DateColumn('OC ETD', disabled=True, width="small",
             help="Original ETD from OC"),
         'demand_qty': st.column_config.NumberColumn('Demand', disabled=True, format="%.0f", width="small",

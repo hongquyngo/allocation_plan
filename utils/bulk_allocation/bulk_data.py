@@ -204,6 +204,7 @@ class BulkAllocationData:
                         SUM(CASE WHEN allocation_status = 'PARTIALLY_ALLOCATED' THEN 1 ELSE 0 END) as partially_allocated_count,
                         SUM(CASE WHEN allocation_status = 'FULLY_ALLOCATED' THEN 1 ELSE 0 END) as fully_allocated_count,
                         SUM(CASE WHEN allocation_status = 'OVER_ALLOCATED' THEN 1 ELSE 0 END) as over_allocated_count,
+                        SUM(CASE WHEN allocation_status = 'ALLOCATED_DELIVERED' THEN 1 ELSE 0 END) as allocated_delivered_count,
                         SUM(CASE WHEN allocatable_qty > 0 THEN 1 ELSE 0 END) as need_allocation_count,
                         COALESCE(SUM(pending_qty), 0) as total_demand,
                         COALESCE(SUM(CASE WHEN allocatable_qty > 0 THEN pending_qty ELSE 0 END), 0) as need_allocation_demand,
