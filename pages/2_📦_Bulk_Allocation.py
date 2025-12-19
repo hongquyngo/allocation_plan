@@ -827,9 +827,18 @@ def render_step1_scope():
                 # Build filter summary messages
                 filter_msgs = []
                 
-                # Allocation status message
+                # Get allocatable demand for context
+                allocatable_demand = summary.get('total_allocatable', 0)
+                
+                # Allocation status message - FIXED v3.0: Include allocatable context
                 if status_filter == 'ALL_NEEDING':
-                    filter_msgs.append(f"📦 **{not_alloc + partial}** OCs (Not Allocated + Partial)")
+                    oc_count = not_alloc + partial
+                    if oc_count > 0 and allocatable_demand == 0:
+                        filter_msgs.append(f"📦 **{oc_count}** OCs (Not Allocated + Partial) — ⚠️ No allocatable qty")
+                    elif oc_count > 0:
+                        filter_msgs.append(f"📦 **{oc_count}** OCs (Not Allocated + Partial)")
+                    else:
+                        filter_msgs.append(f"📦 **0** OCs needing allocation")
                 elif status_filter == 'ONLY_UNALLOCATED':
                     filter_msgs.append(f"🆕 **{not_alloc}** unallocated OCs only")
                 elif status_filter == 'ONLY_PARTIAL':
@@ -908,8 +917,27 @@ def render_step1_scope():
             st.session_state.bulk_step = 2
             st.rerun()
         
+        # FIXED v3.0: More accurate message based on actual data
         if no_allocation_needed:
-            st.warning("⚠️ All OCs are fully allocated. Nothing to allocate.")
+            not_alloc = summary.get('not_allocated_count', 0)
+            partial = summary.get('partially_allocated_count', 0)
+            fully = summary.get('fully_allocated_count', 0)
+            allocatable = summary.get('total_allocatable', 0)
+            
+            if fully > 0 and not_alloc == 0 and partial == 0:
+                # All OCs are truly fully allocated
+                st.warning("⚠️ All OCs are fully allocated. Nothing to allocate.")
+            elif allocatable == 0 and (not_alloc > 0 or partial > 0):
+                # OCs exist but have no allocatable quantity (quota exhausted or over-committed)
+                st.warning(
+                    f"⚠️ **{not_alloc + partial}** OCs have no allocatable quantity. "
+                    f"Possible reasons:\n"
+                    f"- OC quota already exhausted (total allocated = OC quantity)\n"
+                    f"- Over-committed from previous allocations\n\n"
+                    f"Check 'Include All' filter to review these OCs."
+                )
+            else:
+                st.warning("⚠️ No allocatable demand in scope.")
 
 
 # ==================== STEP 2: CHOOSE STRATEGY ====================
