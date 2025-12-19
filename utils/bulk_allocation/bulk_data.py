@@ -125,6 +125,95 @@ class BulkAllocationData:
             logger.error(f"Error loading legal entity options: {e}")
             return []
     
+    @st.cache_data(ttl=300)
+    def get_etd_range(_self, brand_ids: List[int] = None, customer_codes: List[str] = None, 
+                      legal_entity_names: List[str] = None) -> Dict[str, Any]:
+        """
+        Get min and max ETD from pending delivery view.
+        Optionally filtered by brand, customer code, legal entity name.
+        
+        Returns:
+            Dict with 'min_etd', 'max_etd' as date objects
+        """
+        try:
+            conditions = ["1=1"]
+            params = []
+            
+            if brand_ids:
+                placeholders = ','.join(['%s'] * len(brand_ids))
+                conditions.append(f"p.brand_id IN ({placeholders})")
+                params.extend(brand_ids)
+            
+            if customer_codes:
+                placeholders = ','.join(['%s'] * len(customer_codes))
+                conditions.append(f"buyer.company_code IN ({placeholders})")
+                params.extend(customer_codes)
+            
+            if legal_entity_names:
+                placeholders = ','.join(['%s'] * len(legal_entity_names))
+                conditions.append(f"seller.english_name IN ({placeholders})")
+                params.extend(legal_entity_names)
+            
+            where_clause = " AND ".join(conditions)
+            
+            query = f"""
+                SELECT 
+                    MIN(DATE(COALESCE(ocd.adjust_etd, ocd.etd))) as min_etd,
+                    MAX(DATE(COALESCE(ocd.adjust_etd, ocd.etd))) as max_etd
+                FROM order_comfirmation_details ocd
+                JOIN order_confirmations oc ON ocd.order_confirmation_id = oc.id
+                JOIN products p ON ocd.product_id = p.id
+                JOIN companies buyer ON oc.buyer_id = buyer.id
+                JOIN companies seller ON oc.seller_id = seller.id
+                LEFT JOIN (
+                    SELECT 
+                        sod.oc_detail_id,
+                        SUM(sod.selling_stock_out_quantity) AS total_delivered
+                    FROM stock_out_delivery_request_details sod 
+                    WHERE sod.delete_flag = 0
+                    GROUP BY sod.oc_detail_id
+                ) d ON ocd.id = d.oc_detail_id
+                LEFT JOIN (
+                    SELECT 
+                        occd.order_confirmation_detail_id,
+                        SUM(occd.cancelled_quantity) AS total_cancelled
+                    FROM order_confirmation_cancellation_detail occd
+                    JOIN order_confirmation_cancellation occ ON occd.order_confirmation_cancellation_id = occ.id
+                    WHERE occd.delete_flag = 0 AND occ.delete_flag = 0 AND occ.status = 'APPROVED'
+                    GROUP BY occd.order_confirmation_detail_id
+                ) c ON ocd.id = c.order_confirmation_detail_id
+                WHERE oc.delete_flag = 0 
+                  AND ocd.delete_flag = 0
+                  AND oc.is_valid = 1
+                  AND IFNULL(d.total_delivered, 0) < (ocd.selling_quantity - IFNULL(c.total_cancelled, 0))
+                  AND {where_clause}
+            """
+            
+            with _self.conn.cursor() as cursor:
+                cursor.execute(query, params)
+                row = cursor.fetchone()
+                
+            if row and row[0] and row[1]:
+                return {
+                    'min_etd': row[0],
+                    'max_etd': row[1]
+                }
+            else:
+                # Default: today to today + 90 days
+                from datetime import date, timedelta
+                return {
+                    'min_etd': date.today(),
+                    'max_etd': date.today() + timedelta(days=90)
+                }
+                
+        except Exception as e:
+            logger.error(f"Error getting ETD range: {e}")
+            from datetime import date, timedelta
+            return {
+                'min_etd': date.today(),
+                'max_etd': date.today() + timedelta(days=90)
+            }
+    
     # ==================== SCOPE PREVIEW ====================
     
     def get_scope_summary(self, scope: Dict) -> Dict[str, Any]:

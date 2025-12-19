@@ -618,21 +618,31 @@ def render_step1_scope():
         st.session_state.scope_legal_entities = selected_les
         
         st.markdown("##### 📅 ETD Range")
+        
+        # Get dynamic ETD range from data based on current filters
+        etd_range = services['data'].get_etd_range(
+            brand_ids=selected_brands if selected_brands else None,
+            customer_codes=selected_customers if selected_customers else None,
+            legal_entity_names=selected_les if selected_les else None
+        )
+        
         etd_col1, etd_col2 = st.columns(2)
         with etd_col1:
             etd_from = st.date_input(
                 "From",
                 value=st.session_state.scope_etd_from,
                 key="etd_from_input",
-                help="ETD start date"
+                help="ETD start date (leave empty for no limit)"
             )
             st.session_state.scope_etd_from = etd_from
         with etd_col2:
+            # Default to max ETD from data if not set
+            default_etd_to = st.session_state.scope_etd_to or etd_range.get('max_etd')
             etd_to = st.date_input(
                 "To",
-                value=st.session_state.scope_etd_to or (date.today() + timedelta(days=30)),
+                value=default_etd_to,
                 key="etd_to_input",
-                help="ETD end date"
+                help=f"ETD end date (data range: {etd_range.get('min_etd')} to {etd_range.get('max_etd')})"
             )
             st.session_state.scope_etd_to = etd_to
     
