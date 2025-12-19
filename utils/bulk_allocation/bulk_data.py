@@ -134,49 +134,58 @@ class BulkAllocationData:
         
         Returns:
             Dict with 'min_etd', 'max_etd' as date objects
-        """
-        try:
-            conditions = ["1=1"]
-            params = []
             
+        FIXED 2024-12: Use SQLAlchemy engine.connect() instead of non-existent _self.conn
+        """
+        from datetime import date, timedelta
+        
+        try:
+            conditions = ["pending_standard_delivery_quantity > 0"]
+            params = {}
+            
+            # Build dynamic conditions with named parameters
             if brand_ids:
-                placeholders = ','.join(['%s'] * len(brand_ids))
+                placeholders = ', '.join([f':brand_{i}' for i in range(len(brand_ids))])
                 conditions.append(f"product_id IN (SELECT id FROM products WHERE brand_id IN ({placeholders}))")
-                params.extend(brand_ids)
+                for i, bid in enumerate(brand_ids):
+                    params[f'brand_{i}'] = bid
             
             if customer_codes:
-                placeholders = ','.join(['%s'] * len(customer_codes))
+                placeholders = ', '.join([f':cust_{i}' for i in range(len(customer_codes))])
                 conditions.append(f"customer_code IN ({placeholders})")
-                params.extend(customer_codes)
+                for i, code in enumerate(customer_codes):
+                    params[f'cust_{i}'] = code
             
             if legal_entity_names:
-                placeholders = ','.join(['%s'] * len(legal_entity_names))
+                placeholders = ', '.join([f':le_{i}' for i in range(len(legal_entity_names))])
                 conditions.append(f"legal_entity IN ({placeholders})")
-                params.extend(legal_entity_names)
+                for i, le in enumerate(legal_entity_names):
+                    params[f'le_{i}'] = le
             
             where_clause = " AND ".join(conditions)
             
-            # Query directly from the view - it already handles all pending delivery logic
-            query = f"""
+            # Query directly from the view
+            query = text(f"""
                 SELECT 
                     MIN(etd) as min_etd,
                     MAX(etd) as max_etd
                 FROM outbound_oc_pending_delivery_view
                 WHERE {where_clause}
-            """
+            """)
             
-            with _self.conn.cursor() as cursor:
-                cursor.execute(query, params)
-                row = cursor.fetchone()
+            # FIXED: Use engine.connect() instead of non-existent conn
+            with _self.engine.connect() as conn:
+                result = conn.execute(query, params)
+                row = result.fetchone()
                 
-            if row and row[0] and row[1]:
+            if row and row.min_etd and row.max_etd:
                 return {
-                    'min_etd': row[0],
-                    'max_etd': row[1]
+                    'min_etd': row.min_etd,
+                    'max_etd': row.max_etd
                 }
             else:
-                # Default: today to today + 90 days
-                from datetime import date, timedelta
+                # No data found - return today to today + 90 days
+                logger.warning("No ETD data found in view, using default range")
                 return {
                     'min_etd': date.today(),
                     'max_etd': date.today() + timedelta(days=90)
